@@ -3558,6 +3558,7 @@ def _build_active_models_data() -> dict:
         running_by_id = {}
         waiting_ids = set()
         waiting = []
+        activities = []
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
@@ -3610,6 +3611,10 @@ def _build_active_models_data() -> dict:
                                 running_by_id = {}
                                 waiting_ids = set()
                                 waiting = []
+            elif hasattr(entry.engine, "get_activity_snapshot"):
+                snapshot = entry.engine.get_activity_snapshot()
+                active_requests = snapshot.get("active_requests", 0)
+                activities = snapshot.get("activities", [])
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
@@ -3679,6 +3684,7 @@ def _build_active_models_data() -> dict:
             "active_requests": active_requests,
             "waiting_requests": waiting_requests,
             "waiting": waiting,
+            "activities": activities,
             "prefilling": prefilling,
             "generating": generating,
         })

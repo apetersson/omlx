@@ -225,6 +225,22 @@
                                             </template>
                                         </div>
                                     </template>
+                                    <!-- Non-streaming activity sub-rows -->
+                                    <template x-if="m.activities && m.activities.length > 0">
+                                        <div class="mt-1.5 ml-5 space-y-1.5">
+                                            <template x-for="activity in m.activities" :key="activity.request_id">
+                                                <div class="flex flex-wrap items-center gap-x-5 gap-y-1">
+                                                    <span class="text-[10px] font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
+                                                    <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
+                                                        <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
+                                                        <span class="text-[10px] text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                                    </span>
+                                                    <span x-show="formatActivityMetadata(activity)" class="text-[10px] text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
+                                                    <span x-show="activity.elapsed_seconds != null" class="text-[10px] text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
                                     <!-- Waiting sub-rows -->
                                     <template x-if="m.waiting && m.waiting.length > 0">
                                         <div class="mt-1.5 ml-5 space-y-1.5">

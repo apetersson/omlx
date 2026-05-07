@@ -2034,6 +2034,14 @@
                 return '0';
             },
 
+            formatByteCount(bytes) {
+                if (bytes == null || !Number.isFinite(bytes)) return '';
+                if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+                if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                return Math.max(0, Math.round(bytes)) + ' B';
+            },
+
             formatTokenCount(n) {
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
@@ -2054,6 +2062,18 @@
             formatActivityAge(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '';
                 return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+            },
+
+            formatActivityMetadata(activity) {
+                const parts = [];
+                if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
+                if (activity.document_count != null) parts.push(activity.document_count + ' docs');
+                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.text_length != null) parts.push(activity.text_length + ' chars');
+                if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
+                if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
+                if (activity.file_size_bytes != null && activity.file_size_bytes > 0) parts.push(this.formatByteCount(activity.file_size_bytes));
+                return parts.join(' · ');
             },
 
             activityDotClass(seconds) {
