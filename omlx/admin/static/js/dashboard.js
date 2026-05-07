@@ -2040,6 +2040,29 @@
                 return String(n);
             },
 
+            formatDurationShort(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '—';
+                if (seconds < 1) return seconds.toFixed(1) + 's';
+                if (seconds < 60) return Math.round(seconds) + 's';
+                const minutes = Math.floor(seconds / 60);
+                const rem = Math.round(seconds % 60);
+                if (minutes < 60) return minutes + 'm ' + rem + 's';
+                const hours = Math.floor(minutes / 60);
+                return hours + 'h ' + (minutes % 60) + 'm';
+            },
+
+            formatActivityAge(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return '';
+                return 'last token ' + this.formatDurationShort(seconds) + ' ago';
+            },
+
+            activityDotClass(seconds) {
+                if (seconds == null || !Number.isFinite(seconds)) return 'bg-green-400 animate-pulse';
+                if (seconds < 15) return 'bg-green-400 animate-pulse';
+                if (seconds < 30) return 'bg-amber-400 animate-pulse';
+                return 'bg-red-400';
+            },
+
             get activeModelsMemoryPercent() {
                 const am = this.stats.active_models;
                 if (!am || !am.model_memory_max) return 0;
