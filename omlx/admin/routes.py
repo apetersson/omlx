@@ -1631,6 +1631,34 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+def _admin_ds4_status(ds4_status: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return DS4 status enriched for admin/API consumers."""
+    if not isinstance(ds4_status, dict):
+        return None
+    status = dict(ds4_status)
+    if status.get("crashed"):
+        status["status"] = "crashed"
+    elif status.get("running"):
+        status["status"] = "running"
+    else:
+        status["status"] = "stopped"
+
+    rss_bytes = status.get("rss_bytes")
+    status["rss_formatted"] = (
+        format_size(rss_bytes) if isinstance(rss_bytes, int) and rss_bytes > 0 else None
+    )
+    context_tokens = status.get("context_tokens")
+    status["context_tokens_formatted"] = (
+        f"{context_tokens:,}"
+        if isinstance(context_tokens, int) and context_tokens > 0
+        else None
+    )
+    recent_logs = status.get("recent_logs")
+    if isinstance(recent_logs, str):
+        status["recent_log_lines"] = recent_logs.splitlines()[-50:]
+    return status
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
@@ -1678,6 +1706,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
 
+        ds4_status = _admin_ds4_status(model_info.get("ds4"))
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
@@ -1713,6 +1742,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatibility_reason": mtp_compat_reason,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "ds4": ds4_status,
         }
 
         # Add settings if available

@@ -13,6 +13,22 @@ from omlx.model_settings import ModelSettings
 from omlx.settings import DS4_MAX_CONTEXT_TOKENS
 
 
+class _FakeStatusDS4Engine:
+    def get_stats(self):
+        return {
+            "backend": "ds4",
+            "host": "127.0.0.1",
+            "port": 49152,
+            "pid": 12345,
+            "running": True,
+            "crashed": False,
+            "rss_bytes": 2 * 1024**3,
+            "context_tokens": 100_000,
+            "log_path": "/tmp/ds4/foo/ds4.log",
+            "recent_logs": "stdout: ready\nstderr: warning",
+        }
+
+
 class _FakeLoadedDS4Engine:
     def __init__(self, *, active: bool = False, race_active: bool = False):
         self.active = active
@@ -290,3 +306,40 @@ async def test_list_models_exposes_ds4_display_name(monkeypatch, tmp_path):
     assert result["models"][0]["id"] == "foo"
     assert result["models"][0]["engine_type"] == "ds4"
     assert result["models"][0]["display_name"] == "Foo"
+
+
+@pytest.mark.asyncio
+async def test_list_models_exposes_ds4_admin_status(monkeypatch, tmp_path):
+    """Admin model list includes DS4 lifecycle/log/context details."""
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    pool = _ds4_pool(str(gguf))
+    entry = pool.get_entry("foo")
+    entry.engine = _FakeStatusDS4Engine()
+    entry.actual_size = 2 * 1024**3
+    manager = MagicMock()
+    manager.get_all_settings.return_value = {
+        "foo": ModelSettings(ds4_context_tokens=100_000)
+    }
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: None)
+
+    result = await admin_routes.list_models(is_admin=True)
+
+    model = result["models"][0]
+    assert model["engine_type"] == "ds4"
+    assert model["actual_size_formatted"] == "2.00 GB"
+    assert model["settings"]["ds4_context_tokens"] == 100_000
+    assert model["ds4"]["status"] == "running"
+    assert model["ds4"]["running"] is True
+    assert model["ds4"]["port"] == 49152
+    assert model["ds4"]["rss_formatted"] == "2.00 GB"
+    assert model["ds4"]["context_tokens"] == 100_000
+    assert model["ds4"]["context_tokens_formatted"] == "100,000"
+    assert model["ds4"]["log_path"] == "/tmp/ds4/foo/ds4.log"
+    assert model["ds4"]["recent_log_lines"] == [
+        "stdout: ready",
+        "stderr: warning",
+    ]
