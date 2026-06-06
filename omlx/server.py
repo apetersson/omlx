@@ -182,6 +182,7 @@ from .api.markitdown import (
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .settings import DS4_THINK_MAX_CONTEXT_TOKENS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2610,6 +2611,28 @@ def _ds4_suffix_alias_for_request(
     return None
 
 
+def _ds4_request_uses_think_max_alias(
+    request_model: str,
+    resolved_model: str,
+) -> bool:
+    parsed_alias = _ds4_suffix_alias_for_request(request_model, resolved_model)
+    return parsed_alias is not None and parsed_alias[1] == "think-max"
+
+
+async def _ensure_ds4_think_max_context(
+    engine: object,
+    *,
+    request_model: str,
+    resolved_model: str,
+) -> None:
+    """Restart/raise DS4 context for Think Max aliases when needed."""
+    if not _ds4_request_uses_think_max_alias(request_model, resolved_model):
+        return
+    ensure_min_context = getattr(engine, "ensure_min_context", None)
+    if callable(ensure_min_context):
+        await ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS)
+
+
 def _apply_ds4_suffix_alias_to_body(
     body: dict,
     *,
@@ -2988,8 +3011,13 @@ async def _create_ds4_text_completion(
     """Proxy an OpenAI text completion to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
-    body = _build_ds4_completion_proxy_body(request, resolved_model)
     try:
+        await _ensure_ds4_think_max_context(
+            engine,
+            request_model=request.model,
+            resolved_model=resolved_model,
+        )
+        body = _build_ds4_completion_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_completion_stream(body)
             return _DS4StreamingResponse(
@@ -3027,8 +3055,13 @@ async def _create_ds4_response(
     """Proxy an OpenAI Responses API request to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
-    body = _build_ds4_responses_proxy_body(request, resolved_model)
     try:
+        await _ensure_ds4_think_max_context(
+            engine,
+            request_model=request.model,
+            resolved_model=resolved_model,
+        )
+        body = _build_ds4_responses_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_response_stream(body)
             return _DS4StreamingResponse(
@@ -3066,8 +3099,13 @@ async def _create_ds4_anthropic_message(
     """Proxy an Anthropic Messages API request to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
-    body = _build_ds4_anthropic_proxy_body(request, resolved_model)
     try:
+        await _ensure_ds4_think_max_context(
+            engine,
+            request_model=request.model,
+            resolved_model=resolved_model,
+        )
+        body = _build_ds4_anthropic_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_anthropic_message_stream(body)
             return _DS4StreamingResponse(
@@ -3105,8 +3143,13 @@ async def _create_ds4_chat_completion(
     """Proxy an OpenAI chat completion to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
-    body = _build_ds4_chat_proxy_body(request, resolved_model)
     try:
+        await _ensure_ds4_think_max_context(
+            engine,
+            request_model=request.model,
+            resolved_model=resolved_model,
+        )
+        body = _build_ds4_chat_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_chat_completion_stream(body)
             return _DS4StreamingResponse(

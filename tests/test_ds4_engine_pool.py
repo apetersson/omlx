@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from omlx.engine.ds4 import DS4ProcessEngine
+from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyError
 from omlx.engine_pool import EnginePool
 from omlx.server import ServerState, app
-from omlx.settings import DS4Settings
+from omlx.settings import DS4_THINK_MAX_CONTEXT_TOKENS, DS4Settings
 
 
 class FakeManagedProcess:
@@ -102,6 +103,141 @@ async def test_ds4_process_engine_starts_and_stops_fake_process(monkeypatch, tmp
 
     assert engine.is_running is False
     assert FakeManagedProcess.instances[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_raises_context_for_think_max(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    settings = DS4Settings(
+        context_default_tokens=32_768,
+        support_dir=str(tmp_path / "support" / "ds4"),
+        kv_root=str(tmp_path / "kv"),
+    )
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=settings,
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    raised = await engine.ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS)
+
+    try:
+        assert raised is True
+        assert engine.context_tokens == DS4_THINK_MAX_CONTEXT_TOKENS
+        assert settings.context_default_tokens == 32_768
+        assert len(FakeManagedProcess.instances) == 2
+        assert FakeManagedProcess.instances[0].stopped is True
+        assert FakeManagedProcess.instances[1].started is True
+        assert FakeManagedProcess.instances[1].config.context_tokens == (
+            DS4_THINK_MAX_CONTEXT_TOKENS
+        )
+        assert "--ctx" in FakeManagedProcess.instances[1].command
+        assert str(DS4_THINK_MAX_CONTEXT_TOKENS) in FakeManagedProcess.instances[1].command
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_serializes_concurrent_context_raises(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+
+    async def slow_stop(self):
+        await asyncio.sleep(0.01)
+        self.stopped = True
+        self.running = False
+
+    monkeypatch.setattr(FakeManagedProcess, "stop", slow_stop)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            context_default_tokens=32_768,
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    try:
+        results = await asyncio.gather(
+            engine.ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS),
+            engine.ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS),
+        )
+        assert results == [True, False]
+        assert len(FakeManagedProcess.instances) == 2
+        assert FakeManagedProcess.instances[0].stopped is True
+        assert FakeManagedProcess.instances[1].started is True
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_think_max_context_noops_when_already_high(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            context_default_tokens=DS4_THINK_MAX_CONTEXT_TOKENS,
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    try:
+        raised = await engine.ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS)
+        assert raised is False
+        assert len(FakeManagedProcess.instances) == 1
+        assert FakeManagedProcess.instances[0].stopped is False
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_rejects_context_raise_while_active(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            context_default_tokens=32_768,
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    engine._increment_active_requests()
+    try:
+        with pytest.raises(DS4ProxyError, match="retry when idle"):
+            await engine.ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS)
+        assert len(FakeManagedProcess.instances) == 1
+        assert FakeManagedProcess.instances[0].stopped is False
+    finally:
+        engine._decrement_active_requests()
+        await engine.stop()
 
 
 @pytest.mark.asyncio

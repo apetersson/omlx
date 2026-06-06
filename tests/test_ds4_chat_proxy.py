@@ -20,6 +20,7 @@ from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyResponse
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
 from omlx.server_metrics import get_server_metrics, reset_server_metrics
+from omlx.settings import DS4_THINK_MAX_CONTEXT_TOKENS
 
 
 class _SettingsManager:
@@ -154,6 +155,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.completion_response_body = b'{"ds4_completion":true,"choices":[]}'
         self.responses_response_body = b'{"ds4_response":true,"output":[]}'
         self.anthropic_response_body = b'{"type":"message","content":[]}'
+        self.min_context_requests: list[int] = []
         self.chat_stream_chunks = [b"data: one\n\n", b"data: [DONE]\n\n"]
         self.completion_stream_chunks = [
             b"data: completion\n\n",
@@ -167,6 +169,11 @@ class _FakeDS4Engine(DS4ProcessEngine):
             b"event: content_block_delta\n",
             b"data: {}\n\n",
         ]
+
+    async def ensure_min_context(self, min_tokens: int) -> bool:
+        self.min_context_requests.append(min_tokens)
+        self.context_tokens = max(self.context_tokens or 0, min_tokens)
+        return True
 
     async def proxy_chat_completion(self, body: dict):
         self.proxy_bodies.append(body)
@@ -689,6 +696,23 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
     assert body["max_tokens"] == 123
 
 
+def test_ds4_think_max_chat_request_raises_backend_context(tmp_path):
+    engine = _FakeDS4Engine(tmp_path)
+
+    with _client_with_engine(engine) as (client, _pool):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "foo-think-max",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 201
+    assert engine.min_context_requests == [DS4_THINK_MAX_CONTEXT_TOKENS]
+    assert engine.proxy_bodies[0]["reasoning_effort"] == "max"
+
+
 def test_ds4_usage_parser_handles_openai_responses_and_anthropic_shapes():
     from omlx.server import _ds4_usage_from_body
 
@@ -929,6 +953,7 @@ def test_ds4_responses_non_streaming_proxies_raw_response_and_applies_defaults(
     assert body["max_tokens"] == 42
     assert body["max_output_tokens"] == 88
     assert body["reasoning"] == {"summary": "auto", "effort": "max"}
+    assert engine.min_context_requests == [DS4_THINK_MAX_CONTEXT_TOKENS]
     assert body["parallel_tool_calls"] is True
     assert body["ds4_extension"] == {"passthrough": True}
 
@@ -991,6 +1016,7 @@ def test_ds4_anthropic_non_streaming_proxies_raw_response_and_applies_defaults(
     assert body["top_k"] == 11
     assert body["output_config"] == {"effort": "low"}
     assert body["reasoning_effort"] == "max"
+    assert engine.min_context_requests == [DS4_THINK_MAX_CONTEXT_TOKENS]
     assert body["metadata"] == {"user_id": "u1"}
     assert body["ds4_extension"] == {"passthrough": True}
 

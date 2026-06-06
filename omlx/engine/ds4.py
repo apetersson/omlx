@@ -94,6 +94,7 @@ class DS4ProcessEngine(BaseEngine):
         self.context_tokens = context_tokens
         self.auto_enable_ssd_streaming = auto_enable_ssd_streaming
         self.process: DS4ManagedProcess | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._active_requests = 0
         self._active_requests_lock = threading.Lock()
 
@@ -153,6 +154,28 @@ class DS4ProcessEngine(BaseEngine):
         if process is not None:
             await process.stop()
         self.process = None
+
+    def effective_context_tokens(self) -> int:
+        """Return the context token count DS4 will launch with."""
+        return self.context_tokens or self.settings.get_auto_context_tokens()
+
+    async def ensure_min_context(self, min_tokens: int) -> bool:
+        """Temporarily raise DS4 context for this loaded engine if needed."""
+        async with self._lifecycle_lock:
+            if self.effective_context_tokens() >= min_tokens:
+                return False
+            if self.has_active_requests():
+                raise DS4ProxyError(
+                    "DS4 Think Max requires a backend restart with a larger context, "
+                    "but the backend is currently serving another request; retry when idle"
+                )
+            was_running = self.is_running
+            if was_running:
+                await self.stop()
+            self.context_tokens = min_tokens
+            if was_running:
+                await self.start()
+            return True
 
     def _increment_active_requests(self) -> None:
         with self._active_requests_lock:
@@ -248,14 +271,15 @@ class DS4ProcessEngine(BaseEngine):
         path: str,
         body: dict[str, Any],
     ) -> DS4ProxyResponse:
-        self._increment_active_requests()
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                self._proxy_json_response_blocking,
-                path,
-                body,
+        async with self._lifecycle_lock:
+            self._increment_active_requests()
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._proxy_json_response_blocking,
+                    path,
+                    body,
+                )
             )
-        )
         return await asyncio.shield(task)
 
     async def proxy_chat_completion(self, body: dict[str, Any]) -> DS4ProxyResponse:
@@ -279,15 +303,16 @@ class DS4ProcessEngine(BaseEngine):
         path: str,
         body: dict[str, Any],
     ) -> DS4StreamingProxyResponse:
-        self._increment_active_requests()
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                self._proxy_json_request_blocking,
-                path,
-                body,
-                stream=True,
+        async with self._lifecycle_lock:
+            self._increment_active_requests()
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._proxy_json_request_blocking,
+                    path,
+                    body,
+                    stream=True,
+                )
             )
-        )
         claimed = False
 
         def _cleanup_unclaimed(done: asyncio.Task) -> None:
@@ -372,6 +397,7 @@ class DS4ProcessEngine(BaseEngine):
             "pid": self.pid,
             "running": self.is_running,
             "rss_bytes": self.get_process_rss_bytes(),
+            "context_tokens": self.effective_context_tokens(),
             "command": command,
             "recent_logs": logs,
         }
