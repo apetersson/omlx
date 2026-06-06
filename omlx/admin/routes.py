@@ -4794,9 +4794,11 @@ async def remove_hf_task(
 @router.get("/api/hf/recommended")
 async def get_recommended_models(
     mlx_only: bool = True,
+    show_mlx: bool | None = None,
+    show_ds4_gguf: bool | None = None,
     is_admin: bool = Depends(require_admin),
 ):
-    """Get recommended models filtered by system memory."""
+    """Get recommended models filtered by system memory/backend."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
@@ -4807,7 +4809,11 @@ async def get_recommended_models(
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
+            max_memory_bytes=max_memory,
+            result_limit=50,
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
         )
         return result
     except TimeoutError:
@@ -4825,6 +4831,8 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    show_mlx: bool | None = None,
+    show_ds4_gguf: bool | None = None,
     # Filtering
     min_params: Optional[int] = None,
     max_params: Optional[int] = None,
@@ -4841,7 +4849,9 @@ async def search_hf_models(
         q: Search query string (required)
         sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
         limit: Maximum results (max 100)
-        mlx_only: Restrict to MLX library models
+        mlx_only: Legacy MLX library restriction when OR filters are omitted
+        show_mlx: Include MLX catalog results
+        show_ds4_gguf: Include DeepSeek V4 DS4-GGUF catalog results
         min_params: Minimum parameter count
         max_params: Maximum parameter count
         min_size: Minimum model size in bytes
@@ -4866,6 +4876,8 @@ async def search_hf_models(
             max_size=max_size,
             sort_by_size=sort_by_size,
             sort_ascending=sort_ascending,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
         )
         return result
     except TimeoutError:

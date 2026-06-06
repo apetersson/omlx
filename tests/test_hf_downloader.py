@@ -729,6 +729,33 @@ class TestHFDownloader:
 
             await downloader.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_download_keeps_whole_ds4_gguf_repo(self, model_dir):
+        """DS4-GGUF repos are downloaded as-is, without safetensors pruning."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download"
+        ) as mock_download:
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.safetensors = {"parameters": {"BF16": 5000}}
+            mock_info.tags = ["gguf"]
+            mock_info.siblings = [_make_mock_sibling("model.gguf", 1024)]
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            await downloader.start_download("owner/deepseek-v4-gguf")
+            await asyncio.sleep(0.5)
+
+            for call in mock_download.call_args_list:
+                assert "ignore_patterns" not in call.kwargs
+
+            await downloader.shutdown()
+
 
 # =============================================================================
 # API Routes Tests
@@ -1154,12 +1181,24 @@ class TestHFDownloaderRoutes:
 # =============================================================================
 
 
+def _make_mock_sibling(name: str, size: int):
+    sibling = MagicMock()
+    sibling.rfilename = name
+    sibling.size = size
+    return sibling
+
+
 def _make_mock_model(
     repo_id: str,
     disk_size_bytes: int = None,
     downloads: int = 0,
     likes: int = 0,
     trending_score: float = 0,
+    tags: list[str] | None = None,
+    siblings: list | None = None,
+    gguf: dict | None = None,
+    created_at: float | None = None,
+    last_modified: float | None = None,
 ):
     """Create a mock HF model with safetensors info.
 
@@ -1172,11 +1211,16 @@ def _make_mock_model(
     m.downloads = downloads
     m.likes = likes
     m.trending_score = trending_score
+    m.created_at = created_at
+    m.last_modified = last_modified
     if disk_size_bytes is not None:
         param_count = disk_size_bytes // 2
         m.safetensors = {"parameters": {"BF16": param_count}, "total": param_count}
     else:
         m.safetensors = None
+    m.tags = tags or []
+    m.siblings = siblings or []
+    m.gguf = gguf
     return m
 
 
@@ -1397,6 +1441,107 @@ class TestGetRecommendedModels:
         assert item["params"] == 7_000_000_000
         assert item["params_formatted"] == "7.0B"
 
+    @pytest.mark.asyncio
+    async def test_recommended_show_mlx_uses_library_filter(self):
+        """New OR-filter mode uses the HF MLX library filter, not author-only."""
+        model = _make_mock_model(
+            "some-org/mlx-library-model",
+            disk_size_bytes=4_000_000_000,
+            downloads=500,
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3,
+                show_mlx=True,
+                show_ds4_gguf=False,
+            )
+
+        assert result["trending"][0]["repo_id"] == "some-org/mlx-library-model"
+        for call in mock_api.list_models.call_args_list:
+            assert call.kwargs["filter"] == "mlx"
+            assert "author" not in call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_recommended_ds4_gguf_filter_uses_deepseek_base_models(self):
+        """DS4-only recommendations use DeepSeek V4 base-model GGUF candidates."""
+        gguf = _make_mock_model(
+            "owner/deepseek-v4-flash-q4-gguf",
+            disk_size_bytes=None,
+            downloads=500,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("model-q4.gguf", 9 * 1024**3)],
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [gguf]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3,
+                show_mlx=False,
+                show_ds4_gguf=True,
+            )
+
+        item = result["trending"][0]
+        assert item["repo_id"] == "owner/deepseek-v4-flash-q4-gguf"
+        assert item["backend"] == "ds4"
+        assert item["backend_label"] == "DS4-GGUF"
+        assert item["format"] == "gguf"
+        assert item["size"] == 9 * 1024**3
+        assert item["compatibility_status"] == "unverified"
+        filters = [call.kwargs["filter"] for call in mock_api.list_models.call_args_list]
+        assert any("DeepSeek-V4-Flash" in f for f in filters)
+        assert any("DeepSeek-V4-Pro" in f for f in filters)
+
+    @pytest.mark.asyncio
+    async def test_recommended_ds4_uses_gguf_metadata_size_for_memory_filter(self):
+        """DS4 recommendations use HF GGUF size metadata when sibling sizes are absent."""
+        large_gguf = _make_mock_model(
+            "owner/deepseek-v4-flash-huge-gguf",
+            disk_size_bytes=None,
+            downloads=500,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("model-q4.gguf", None)],
+            gguf={"totalFileSize": 9 * 1024**3},
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [large_gguf]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=1 * 1024**3,
+                show_mlx=False,
+                show_ds4_gguf=True,
+            )
+
+        assert result == {"trending": [], "popular": []}
+        for call in mock_api.list_models.call_args_list:
+            assert "gguf" in call.kwargs["expand"]
+
+    @pytest.mark.asyncio
+    async def test_recommended_empty_when_no_backend_filter_selected(self):
+        """Empty OR filter selection returns no catalog items without HF calls."""
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_recommended_models(
+                max_memory_bytes=64 * 1024**3,
+                show_mlx=False,
+                show_ds4_gguf=False,
+            )
+
+        assert result == {"trending": [], "popular": []}
+        mock_api.list_models.assert_not_called()
+
 
 # =============================================================================
 # Search Models Tests
@@ -1452,6 +1597,226 @@ class TestSearchModels:
             assert call_kwargs["filter"] == "mlx"
             assert call_kwargs["search"] == "test"
             assert call_kwargs["limit"] == 50
+
+    @pytest.mark.asyncio
+    async def test_search_can_or_mlx_and_ds4_gguf_results(self):
+        """HF search can return MLX and DS4-GGUF candidates together."""
+        mlx_model = _make_mock_model(
+            "mlx-community/model-a",
+            disk_size_bytes=4_000_000_000,
+            downloads=500,
+        )
+        gguf_model = _make_mock_model(
+            "owner/deepseek-v4-pro-q4-gguf",
+            disk_size_bytes=None,
+            downloads=800,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("deepseek-v4-pro-q4.gguf", 12 * 1024**3)],
+        )
+
+        def list_models_side_effect(**kwargs):
+            return [mlx_model] if kwargs.get("filter") == "mlx" else [gguf_model]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = list_models_side_effect
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="deepseek",
+                show_mlx=True,
+                show_ds4_gguf=True,
+            )
+
+        by_repo = {item["repo_id"]: item for item in result["models"]}
+        assert by_repo["mlx-community/model-a"]["backend"] == "mlx"
+        assert by_repo["owner/deepseek-v4-pro-q4-gguf"]["backend"] == "ds4"
+        assert by_repo["owner/deepseek-v4-pro-q4-gguf"]["size"] == 12 * 1024**3
+        assert by_repo["owner/deepseek-v4-pro-q4-gguf"]["compatibility_status"] == "unverified"
+        assert result["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_search_ds4_uses_gguf_metadata_size_when_sibling_sizes_absent(self):
+        """DS4 search exposes HF GGUF totalFileSize when sibling sizes are missing."""
+        gguf_model = _make_mock_model(
+            "owner/deepseek-v4-pro-metadata-gguf",
+            disk_size_bytes=None,
+            downloads=800,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("deepseek-v4-pro-q4.gguf", None)],
+            gguf={"totalFileSize": 12 * 1024**3},
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [gguf_model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="deepseek",
+                show_mlx=False,
+                show_ds4_gguf=True,
+            )
+
+        item = result["models"][0]
+        assert item["repo_id"] == "owner/deepseek-v4-pro-metadata-gguf"
+        assert item["backend"] == "ds4"
+        assert item["size"] == 12 * 1024**3
+        assert item["size_formatted"] == "12.0 GB"
+        for call in mock_api.list_models.call_args_list:
+            assert "gguf" in call.kwargs["expand"]
+
+    @pytest.mark.asyncio
+    async def test_search_ds4_detects_gguf_metadata_without_size(self):
+        """HF GGUF metadata is enough to include DS4 candidates even without size."""
+        gguf_model = _make_mock_model(
+            "owner/deepseek-v4-pro-metadata-only-gguf",
+            disk_size_bytes=None,
+            downloads=800,
+            tags=[],
+            siblings=[],
+            gguf={"architecture": "deepseek"},
+        )
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.return_value = [gguf_model]
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="deepseek",
+                show_mlx=False,
+                show_ds4_gguf=True,
+            )
+
+        assert result["models"][0]["repo_id"] == "owner/deepseek-v4-pro-metadata-only-gguf"
+        assert result["models"][0]["backend"] == "ds4"
+        assert result["models"][0]["size"] == 0
+
+    @pytest.mark.asyncio
+    async def test_search_sorts_or_results_before_limit(self):
+        """DS4 results are not sliced off just because MLX returned limit rows."""
+        mlx_models = [
+            _make_mock_model(
+                f"mlx-community/model-{i}",
+                disk_size_bytes=1_000_000_000,
+                downloads=10 + i,
+            )
+            for i in range(5)
+        ]
+        gguf_model = _make_mock_model(
+            "owner/deepseek-v4-flash-top-gguf",
+            disk_size_bytes=None,
+            downloads=10_000,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("deepseek-v4-flash-q4.gguf", 8 * 1024**3)],
+        )
+
+        def list_models_side_effect(**kwargs):
+            return mlx_models if kwargs.get("filter") == "mlx" else [gguf_model]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = list_models_side_effect
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="deepseek",
+                sort="downloads",
+                limit=5,
+                show_mlx=True,
+                show_ds4_gguf=True,
+            )
+
+        assert len(result["models"]) == 5
+        assert result["models"][0]["repo_id"] == "owner/deepseek-v4-flash-top-gguf"
+        assert result["models"][0]["backend"] == "ds4"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sort", "timestamp_field", "expected_timestamp"),
+        [("created", "created_at", 1_000), ("updated", "updated_at", 2_000)],
+    )
+    async def test_search_sorts_created_updated_or_results_before_limit(
+        self,
+        sort: str,
+        timestamp_field: str,
+        expected_timestamp: int,
+    ):
+        """Created/updated OR results are globally sorted before limit slicing."""
+        mlx_models = [
+            _make_mock_model(
+                f"mlx-community/model-{i}",
+                disk_size_bytes=1_000_000_000,
+                created_at=100 + i,
+                last_modified=200 + i,
+            )
+            for i in range(5)
+        ]
+        gguf_model = _make_mock_model(
+            "owner/deepseek-v4-flash-new-gguf",
+            disk_size_bytes=None,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("deepseek-v4-flash-q4.gguf", 8 * 1024**3)],
+            created_at=1_000,
+            last_modified=2_000,
+        )
+
+        def list_models_side_effect(**kwargs):
+            return mlx_models if kwargs.get("filter") == "mlx" else [gguf_model]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = list_models_side_effect
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="deepseek",
+                sort=sort,
+                limit=5,
+                show_mlx=True,
+                show_ds4_gguf=True,
+            )
+
+        assert len(result["models"]) == 5
+        assert result["models"][0]["repo_id"] == "owner/deepseek-v4-flash-new-gguf"
+        assert result["models"][0][timestamp_field] == expected_timestamp
+        assert result["models"][0]["backend"] == "ds4"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sort", ["created", "updated"])
+    async def test_search_created_updated_ties_do_not_use_append_order(self, sort: str):
+        """Missing created/updated metadata still avoids MLX-first append bias."""
+        mlx_models = [
+            _make_mock_model(f"mlx-community/model-{i}", disk_size_bytes=1_000_000_000)
+            for i in range(5)
+        ]
+        gguf_model = _make_mock_model(
+            "owner/deepseek-v4-flash-tie-gguf",
+            disk_size_bytes=None,
+            tags=["gguf"],
+            siblings=[_make_mock_sibling("deepseek-v4-flash-q4.gguf", 8 * 1024**3)],
+        )
+
+        def list_models_side_effect(**kwargs):
+            return mlx_models if kwargs.get("filter") == "mlx" else [gguf_model]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls:
+            mock_api = MagicMock()
+            mock_api.list_models.side_effect = list_models_side_effect
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.search_models(
+                query="deepseek",
+                sort=sort,
+                limit=5,
+                show_mlx=True,
+                show_ds4_gguf=True,
+            )
+
+        assert len(result["models"]) == 5
+        assert result["models"][0]["repo_id"] == "owner/deepseek-v4-flash-tie-gguf"
+        assert result["models"][0]["backend"] == "ds4"
 
     @pytest.mark.asyncio
     async def test_search_result_format(self):
@@ -1702,6 +2067,35 @@ class TestGetModelInfo:
         assert "text-generation" in result["tags"]
         assert result["model_card"] == ""  # No README available
         assert result["is_adapter"] is False
+
+    @pytest.mark.asyncio
+    async def test_model_info_marks_ds4_gguf_candidates_unverified(self):
+        """Detailed HF info exposes DS4-GGUF compatibility metadata."""
+        mock_info = MagicMock()
+        mock_info.id = "owner/deepseek-v4-flash-gguf"
+        mock_info.downloads = 5000
+        mock_info.likes = 100
+        mock_info.tags = ["gguf"]
+        mock_info.pipeline_tag = "text-generation"
+        mock_info.created_at = None
+        mock_info.last_modified = None
+        mock_info.safetensors = None
+        mock_info.card_data = None
+        mock_info.siblings = [_make_mock_sibling("model-q4.gguf", 10 * 1024**3)]
+
+        with patch("omlx.admin.hf_downloader.HfApi") as mock_api_cls, \
+             patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception("no readme")):
+            mock_api = MagicMock()
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            result = await HFDownloader.get_model_info("owner/deepseek-v4-flash-gguf")
+
+        assert result["backend"] == "ds4"
+        assert result["backend_label"] == "DS4-GGUF"
+        assert result["has_gguf"] is True
+        assert result["gguf_size"] == 10 * 1024**3
+        assert result["compatibility_status"] == "unverified"
 
     @pytest.mark.asyncio
     async def test_detects_lora_adapter(self):

@@ -67,6 +67,11 @@ class TestModelSettings:
         from omlx.model_profiles import EXCLUDED_FROM_PROFILES
         assert "trust_remote_code" in EXCLUDED_FROM_PROFILES
 
+    def test_ds4_context_tokens_excluded_from_profiles(self):
+        """DS4 context restarts must remain explicit per model."""
+        from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+        assert "ds4_context_tokens" in EXCLUDED_FROM_PROFILES
+
     def test_max_context_window(self):
         """Test max_context_window field."""
         settings = ModelSettings(max_context_window=4096)

@@ -19,12 +19,10 @@ from urllib.parse import urlparse
 
 import huggingface_hub.constants as _hf_constants
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-from huggingface_hub.utils import (
-    EntryNotFoundError,
-    GatedRepoError,
-    RepositoryNotFoundError,
-)
+from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 from huggingface_hub.utils import tqdm as _hf_tqdm
+
+from . import ds4_downloader_catalog as _ds4_catalog
 
 # Force the xet download path off. hf_xet's Rust ``download_files`` invokes
 # the Python progress callback from a Rust frame and silently swallows any
@@ -211,56 +209,22 @@ class DownloadTask:
         }
 
 
-_DTYPE_BYTES = {
-    "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
-    "I64": 8, "I32": 4, "I16": 2, "I8": 1,
-    "U64": 8, "U32": 4, "U16": 2, "U8": 1,
-    "BOOL": 1,
-}
-
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
-
-def _calc_safetensors_disk_size(safetensors: dict) -> int:
-    """Calculate actual disk size in bytes from safetensors parameters.
-
-    safetensors.total is the parameter count, not bytes.
-    We need to multiply each dtype's parameter count by its byte width.
-    """
-    params = safetensors.get("parameters", {})
-    if not params:
-        return 0
-    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
-
-
-def _format_model_size(size_bytes: int) -> str:
-    """Format model size in bytes to a human-readable string."""
-    if size_bytes < 1024**2:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024**3:
-        return f"{size_bytes / 1024**2:.1f} MB"
-    else:
-        return f"{size_bytes / 1024**3:.1f} GB"
-
-
-def _format_param_count(total_params: int) -> str:
-    """Format parameter count to a human-readable string (e.g., 7.0B, 13.0B)."""
-    if total_params >= 1e12:
-        return f"{total_params / 1e12:.1f}T"
-    if total_params >= 1e9:
-        return f"{total_params / 1e9:.1f}B"
-    if total_params >= 1e6:
-        return f"{total_params / 1e6:.1f}M"
-    return str(total_params)
-
-
-def _get_param_count(safetensors: dict) -> int:
-    """Get total parameter count from safetensors metadata."""
-    params = safetensors.get("parameters", {})
-    if not params:
-        return 0
-    return sum(params.values())
+# Backward-compatible helper aliases; tests and ModelScope downloader import
+# these from this module while the DS4/GGUF catalog logic lives separately.
+_DS4_GGUF_BASE_MODEL_FILTERS = _ds4_catalog.DS4_GGUF_BASE_MODEL_FILTERS
+_calc_safetensors_disk_size = _ds4_catalog.calc_safetensors_disk_size
+_format_model_size = _ds4_catalog.format_model_size
+_format_param_count = _ds4_catalog.format_param_count
+_get_param_count = _ds4_catalog.get_param_count
+_gguf_size_from_siblings = _ds4_catalog.gguf_size_from_siblings
+_has_gguf_files = _ds4_catalog.has_gguf_files
+_hf_catalog_item = _ds4_catalog.hf_catalog_item
+_hf_tags = _ds4_catalog.hf_tags
+_merge_catalog_results = _ds4_catalog.merge_catalog_results
+_resolve_hf_catalog_filters = _ds4_catalog.resolve_hf_catalog_filters
 
 
 # HF API sort field mapping for search.
@@ -293,31 +257,46 @@ class HFDownloader:
         limit: int = 60,
         result_limit: int = 50,
         mlx_only: bool = True,
+        show_mlx: bool | None = None,
+        show_ds4_gguf: bool | None = None,
     ) -> dict:
-        """Fetch trending and popular models that fit in memory.
-
-        Queries HuggingFace Hub for models, optionally restricted to
-        mlx-community. Filtered by system memory capacity.
+        """Fetch trending/popular MLX and DS4-GGUF models that fit in memory.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
             result_limit: Maximum number of models to return per category.
-            mlx_only: If True, restrict to mlx-community author.
+            mlx_only: Legacy flag. When new OR flags are omitted, this keeps
+                the old MLX/safetensors query behavior.
+            show_mlx: Include MLX catalog results when set.
+            show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
             Dict with 'trending' and 'popular' lists.
         """
         api, _endpoint = _get_hf_api()
+        legacy_filters = show_mlx is None and show_ds4_gguf is None
+        include_mlx, include_ds4 = _resolve_hf_catalog_filters(
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
+        )
+        if not include_mlx and not include_ds4:
+            return {"trending": [], "popular": []}
 
-        async def _fetch(sort: str) -> list[dict]:
+        async def _fetch_mlx(sort: str) -> list[dict]:
+            if not include_mlx:
+                return []
             kwargs = {
                 "sort": sort,
                 "limit": limit,
                 "expand": ["safetensors", "downloads", "likes", "trendingScore"],
             }
-            if mlx_only:
-                kwargs["author"] = "mlx-community"
+            if legacy_filters:
+                if mlx_only:
+                    kwargs["author"] = "mlx-community"
+            else:
+                kwargs["filter"] = "mlx"
             models = await asyncio.wait_for(
                 asyncio.to_thread(api.list_models, **kwargs),
                 timeout=_HF_API_TIMEOUT,
@@ -332,23 +311,66 @@ class HFDownloader:
                 size = _calc_safetensors_disk_size(m.safetensors)
                 if size <= 0 or size > max_memory_bytes:
                     continue
-                params = _get_param_count(m.safetensors)
                 results.append(
-                    {
-                        "repo_id": m.id,
-                        "name": m.id.split("/")[-1],
-                        "downloads": downloads,
-                        "likes": m.likes or 0,
-                        "trending_score": m.trending_score or 0,
-                        "size": size,
-                        "size_formatted": _format_model_size(size),
-                        "params": params if params > 0 else None,
-                        "params_formatted": (
-                            _format_param_count(params) if params > 0 else None
-                        ),
-                    }
+                    _hf_catalog_item(m, backend="mlx", name=m.id.split("/")[-1])
                 )
             return results
+
+        async def _fetch_ds4(sort: str) -> list[dict]:
+            if not include_ds4:
+                return []
+            results = []
+            for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
+                kwargs = {
+                    "sort": sort,
+                    "limit": limit,
+                    "filter": base_filter,
+                    "expand": [
+                        "siblings",
+                        "gguf",
+                        "tags",
+                        "downloads",
+                        "likes",
+                        "trendingScore",
+                    ],
+                }
+                models = await asyncio.wait_for(
+                    asyncio.to_thread(api.list_models, **kwargs),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                for m in models:
+                    downloads = m.downloads or 0
+                    if downloads < _MIN_DOWNLOADS or not _has_gguf_files(m):
+                        continue
+                    size = _gguf_size_from_siblings(m)
+                    if size > 0 and size > max_memory_bytes:
+                        continue
+                    results.append(
+                        _hf_catalog_item(
+                            m,
+                            backend="ds4",
+                            name=m.id.split("/")[-1],
+                            base_model_filter=base_filter,
+                        )
+                    )
+            key = "downloads" if sort == "downloads" else "trending_score"
+            return sorted(
+                _merge_catalog_results(results),
+                key=lambda item: item.get(key, 0),
+                reverse=True,
+            )
+
+        async def _fetch(sort: str) -> list[dict]:
+            mlx_results, ds4_results = await asyncio.gather(
+                _fetch_mlx(sort),
+                _fetch_ds4(sort),
+            )
+            key = "downloads" if sort == "downloads" else "trending_score"
+            return sorted(
+                _merge_catalog_results(mlx_results + ds4_results),
+                key=lambda item: item.get(key, 0),
+                reverse=True,
+            )
 
         trending, popular = await asyncio.gather(
             _fetch("trendingScore"),
@@ -374,28 +396,37 @@ class HFDownloader:
         # Sorting options
         sort_by_size: bool = False,
         sort_ascending: bool = False,
+        show_mlx: bool | None = None,
+        show_ds4_gguf: bool | None = None,
     ) -> dict:
-        """Search HuggingFace models by query string with filtering and sorting.
-
-        When mlx_only is True, results are restricted to the MLX library
-        (same as https://huggingface.co/models?library=mlx).
+        """Search HuggingFace models by query string with OR backend filters.
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
-            mlx_only: If True, restrict to MLX library models only.
+            mlx_only: Legacy MLX-library filter used when new OR flags are omitted.
             min_params: Minimum parameter count filter.
             max_params: Maximum parameter count filter.
             min_size: Minimum model size in bytes filter.
             max_size: Maximum model size in bytes filter.
             sort_by_size: Sort results by size instead of default sort.
             sort_ascending: Sort in ascending order (for size/params sorting).
+            show_mlx: Include MLX catalog results when set.
+            show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
             Dict with 'models' list and 'total' count.
         """
         api, _endpoint = _get_hf_api()
+        legacy_filters = show_mlx is None and show_ds4_gguf is None
+        include_mlx, include_ds4 = _resolve_hf_catalog_filters(
+            mlx_only=mlx_only,
+            show_mlx=show_mlx,
+            show_ds4_gguf=show_ds4_gguf,
+        )
+        if not include_mlx and not include_ds4:
+            return {"models": [], "total": 0}
 
         # Determine base sort - for Python-side sorting, we fetch by downloads
         # which tends to return more results, then sort in Python
@@ -404,34 +435,72 @@ class HFDownloader:
         else:
             base_sort = _SORT_MAP.get(sort, "trendingScore")
 
-        kwargs = {
-            "search": query,
-            "sort": base_sort,
-            "limit": limit,
-            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
-        }
-        if mlx_only:
-            kwargs["filter"] = "mlx"
+        async def _fetch_mlx() -> list[dict]:
+            if not include_mlx:
+                return []
+            kwargs = {
+                "search": query,
+                "sort": base_sort,
+                "limit": limit,
+                "expand": [
+                    "safetensors",
+                    "downloads",
+                    "likes",
+                    "trendingScore",
+                    "createdAt",
+                    "lastModified",
+                ],
+            }
+            if (legacy_filters and mlx_only) or not legacy_filters:
+                kwargs["filter"] = "mlx"
+            models = await asyncio.wait_for(
+                asyncio.to_thread(api.list_models, **kwargs),
+                timeout=_HF_API_TIMEOUT,
+            )
+            return [_hf_catalog_item(m, backend="mlx", name=m.id) for m in models]
 
-        models = await asyncio.wait_for(
-            asyncio.to_thread(api.list_models, **kwargs),
-            timeout=_HF_API_TIMEOUT,
-        )
+        async def _fetch_ds4() -> list[dict]:
+            if not include_ds4:
+                return []
+            results = []
+            for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
+                kwargs = {
+                    "search": query,
+                    "sort": base_sort,
+                    "limit": limit,
+                    "filter": base_filter,
+                    "expand": [
+                        "siblings",
+                        "gguf",
+                        "tags",
+                        "downloads",
+                        "likes",
+                        "trendingScore",
+                        "createdAt",
+                        "lastModified",
+                    ],
+                }
+                models = await asyncio.wait_for(
+                    asyncio.to_thread(api.list_models, **kwargs),
+                    timeout=_HF_API_TIMEOUT,
+                )
+                for m in models:
+                    if _has_gguf_files(m):
+                        results.append(
+                            _hf_catalog_item(
+                                m,
+                                backend="ds4",
+                                name=m.id,
+                                base_model_filter=base_filter,
+                            )
+                        )
+            return _merge_catalog_results(results)
 
+        mlx_results, ds4_results = await asyncio.gather(_fetch_mlx(), _fetch_ds4())
         results = []
-        for m in models:
-            params = None
-            params_formatted = None
-            size = 0
-
-            if m.safetensors and m.safetensors.get("parameters"):
-                params = _get_param_count(m.safetensors)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(m.safetensors)
-                if params and params <= 0:
-                    params = None
-
-            # Apply filters
+        for item in _merge_catalog_results(mlx_results + ds4_results):
+            params = item.get("params")
+            size = item.get("size") or 0
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
@@ -440,20 +509,11 @@ class HFDownloader:
                 continue
             if max_size is not None and size > max_size:
                 continue
+            results.append(item)
 
-            results.append(
-                {
-                    "repo_id": m.id,
-                    "name": m.id,
-                    "downloads": m.downloads or 0,
-                    "likes": m.likes or 0,
-                    "trending_score": m.trending_score or 0,
-                    "size": size,
-                    "size_formatted": _format_model_size(size) if size > 0 else "",
-                    "params": params,
-                    "params_formatted": params_formatted,
-                }
-            )
+        def _ds4_or_tiebreaker(item: dict) -> int:
+            backends = item.get("backends") or []
+            return int(include_mlx and include_ds4 and "ds4" in backends)
 
         # Apply Python-side sorting
         if sort == "most_params":
@@ -466,7 +526,21 @@ class HFDownloader:
                 key=lambda x: x["size"] if x["size"] > 0 else -1,
                 reverse=(sort == "largest" or (sort_by_size and not sort_ascending)),
             )
-        # Otherwise, keep original HF API ordering (trending, downloads, created, updated)
+        elif sort == "downloads":
+            results.sort(key=lambda x: x.get("downloads", 0), reverse=True)
+        elif sort == "trending":
+            results.sort(key=lambda x: x.get("trending_score", 0), reverse=True)
+        elif sort == "created":
+            results.sort(
+                key=lambda x: (x.get("created_at", 0), _ds4_or_tiebreaker(x)),
+                reverse=True,
+            )
+        elif sort == "updated":
+            results.sort(
+                key=lambda x: (x.get("updated_at", 0), _ds4_or_tiebreaker(x)),
+                reverse=True,
+            )
+        # Otherwise, keep original HF API ordering from the single selected catalog.
 
         return {
             "models": results[:limit],
@@ -509,6 +583,8 @@ class HFDownloader:
 
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
+        gguf_size = sum(f["size"] for f in files if f["name"].lower().endswith(".gguf"))
+        has_gguf = gguf_size > 0 or any(tag.lower() == "gguf" for tag in _hf_tags(info))
 
         # Extract params and size from safetensors
         params = None
@@ -545,6 +621,13 @@ class HFDownloader:
         except Exception:
             pass  # README not available
 
+        backends = []
+        if size > 0 or not has_gguf:
+            backends.append("mlx")
+        if has_gguf:
+            backends.append("ds4")
+        backend = "mlx+ds4" if len(backends) > 1 else (backends[0] if backends else "")
+
         return {
             "repo_id": info.id,
             "name": info.id,
@@ -564,6 +647,21 @@ class HFDownloader:
                 info.last_modified.isoformat() if info.last_modified else ""
             ),
             "is_adapter": is_adapter,
+            "has_gguf": has_gguf,
+            "gguf_size": gguf_size,
+            "gguf_size_formatted": _format_model_size(gguf_size) if gguf_size > 0 else "",
+            "backend": backend,
+            "backends": backends,
+            "backend_label": "MLX + DS4-GGUF"
+            if backend == "mlx+ds4"
+            else ("DS4-GGUF" if backend == "ds4" else "MLX"),
+            "compatibility_status": "unverified" if has_gguf and size <= 0 else "verified",
+            "compatibility_note": (
+                "DeepSeek V4 GGUF candidate; compatibility is unverified and DS4 "
+                "will validate the downloaded repo at launch."
+                if has_gguf
+                else "MLX library model."
+            ),
         }
 
     def __init__(
@@ -786,12 +884,14 @@ class HFDownloader:
                             api.model_info,
                             task.repo_id,
                             token=hf_token or None,
-                            expand=["safetensors"],
+                            expand=["safetensors", "siblings", "tags"],
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )
-                    if model_info.safetensors and model_info.safetensors.get(
-                        "parameters"
+                    if (
+                        model_info.safetensors
+                        and model_info.safetensors.get("parameters")
+                        and not _has_gguf_files(model_info)
                     ):
                         ignore_patterns = [
                             "*.bin",

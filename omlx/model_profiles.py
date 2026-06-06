@@ -80,6 +80,9 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "model_type_override",
     "active_profile_name",
     "ttl_seconds",
+    # DS4 context overrides are DS4-only and restart/load-bearing; keep them
+    # explicit per model instead of propagating through generic profiles.
+    "ds4_context_tokens",
     # Security flag must be explicit per model — never propagated via profiles.
     "trust_remote_code",
 })

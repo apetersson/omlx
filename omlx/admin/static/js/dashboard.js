@@ -257,7 +257,8 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
-            hfMlxOnly: true,
+            hfShowMlx: true,
+            hfShowDs4Gguf: true,
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -496,7 +497,7 @@
                     }
                 });
 
-                this.$watch('hfMlxOnly', () => {
+                const refreshHFBackendFilters = () => {
                     this.hfRecommended = { trending: [], popular: [] };
                     this.hfRecommendedLoaded = false;
                     this.hfSearchResults = [];
@@ -505,7 +506,9 @@
                     if (this.hfSearchQuery.trim()) {
                         this.searchHFModels();
                     }
-                });
+                };
+                this.$watch('hfShowMlx', refreshHFBackendFilters);
+                this.$watch('hfShowDs4Gguf', refreshHFBackendFilters);
 
                 this.$watch('msMlxOnly', () => {
                     this.msRecommended = { trending: [], popular: [] };
@@ -4312,7 +4315,11 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
+                    const params = new URLSearchParams({
+                        show_mlx: this.hfShowMlx,
+                        show_ds4_gguf: this.hfShowDs4Gguf,
+                    });
+                    const response = await fetch(`/admin/api/hf/recommended?${params}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         // Attach original rank so the # column survives column-header re-sorts
@@ -4370,6 +4377,7 @@
             // Table sort helpers for Browse Models
             sortModels(list) {
                 const sortBy = this.hfTableSort;
+                if (sortBy === 'server') return [...list];
                 const dir = this.hfTableSortDir === 'asc' ? 1 : -1;
                 return [...list].sort((a, b) => {
                     if (sortBy === 'rank') {
@@ -4406,9 +4414,9 @@
                     most_params:  { col: 'params',    dir: 'desc' },
                     least_params: { col: 'params',    dir: 'asc'  },
                     downloads:    { col: 'downloads', dir: 'desc' },
-                    trending:     { col: 'downloads', dir: 'desc' },
-                    created:      { col: 'downloads', dir: 'desc' },
-                    updated:      { col: 'downloads', dir: 'desc' },
+                    trending:     { col: 'server',    dir: 'desc' },
+                    created:      { col: 'server',    dir: 'desc' },
+                    updated:      { col: 'server',    dir: 'desc' },
                 };
                 const m = map[this.hfSearchSort];
                 if (m) {
@@ -4459,7 +4467,8 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
-                        mlx_only: this.hfMlxOnly,
+                        show_mlx: this.hfShowMlx,
+                        show_ds4_gguf: this.hfShowDs4Gguf,
                     });
                     // Add filter parameters if set. Sizes use binary GiB to match
                     // _format_model_size on the backend.
