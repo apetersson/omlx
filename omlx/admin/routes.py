@@ -1680,6 +1680,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         model_data = {
             "id": model_id,
             "model_path": model_info.get("model_path", ""),
+            "display_name": model_info.get("display_name"),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
             "estimated_size": model_info.get("estimated_size", 0),
@@ -1928,29 +1929,39 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid model_type_override: {request.model_type_override}",
             )
-        current_settings.model_type_override = override_value
-        # Update engine pool entry type immediately
-        type_to_engine = {
-            "llm": "batched",
-            "vlm": "vlm",
-            "embedding": "embedding",
-            "reranker": "reranker",
-            "audio_stt": "audio_stt",
-            "audio_tts": "audio_tts",
-            "audio_sts": "audio_sts",
-        }
-        if override_value:
-            entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+        if engine_pool._is_ds4_entry(entry):
+            if override_value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="model_type_override is not supported for DS4 GGUF models",
+                )
+            current_settings.model_type_override = None
+            entry.model_type = "llm"
+            entry.engine_type = "ds4"
         else:
-            # Reset to auto-detected type
-            from pathlib import Path
+            current_settings.model_type_override = override_value
+            # Update engine pool entry type immediately
+            type_to_engine = {
+                "llm": "batched",
+                "vlm": "vlm",
+                "embedding": "embedding",
+                "reranker": "reranker",
+                "audio_stt": "audio_stt",
+                "audio_tts": "audio_tts",
+                "audio_sts": "audio_sts",
+            }
+            if override_value:
+                entry.model_type = override_value
+                entry.engine_type = type_to_engine.get(override_value, "batched")
+            else:
+                # Reset to auto-detected type
+                from pathlib import Path
 
-            from ..model_discovery import detect_model_type
+                from ..model_discovery import detect_model_type
 
-            detected_type = detect_model_type(Path(entry.model_path))
-            entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+                detected_type = detect_model_type(Path(entry.model_path))
+                entry.model_type = detected_type
+                entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:

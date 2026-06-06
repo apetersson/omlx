@@ -19,6 +19,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -54,8 +55,20 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: Literal[
+        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+    ]  # Model type
+    engine_type: Literal[
+        "batched",
+        "simple",
+        "embedding",
+        "reranker",
+        "vlm",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+        "ds4",
+    ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     actual_size: int | None = None  # Observed process-memory delta after load settles
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
@@ -64,6 +77,7 @@ class EngineEntry:
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"
     source_repo_id: str | None = None
+    display_name: str | None = None
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
@@ -221,6 +235,7 @@ class EnginePool:
                     model_context_length=getattr(info, "model_context_length", None),
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
+                    display_name=getattr(info, "display_name", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -255,21 +270,35 @@ class EnginePool:
         "audio_sts": "audio_sts",
     }
 
+    @staticmethod
+    def _is_ds4_entry(entry: EngineEntry) -> bool:
+        """Return True for discovered DS4 GGUF entries."""
+        if entry.engine_type == "ds4":
+            return True
+        path = Path(entry.model_path)
+        return path.suffix.lower() == ".gguf" and not path.is_dir()
+
     def apply_settings_overrides(
         self, settings_manager: "ModelSettingsManager"
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
-            if settings.model_type_override:
-                entry.model_type = settings.model_type_override
-                entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
-                    settings.model_type_override, "batched"
-                )
+            if not settings.model_type_override:
+                continue
+            if self._is_ds4_entry(entry):
                 logger.info(
-                    f"Applied model_type override for {model_id}: "
-                    f"type={entry.model_type}, engine={entry.engine_type}"
+                    f"Ignoring model_type override for DS4 GGUF model {model_id}"
                 )
+                continue
+            entry.model_type = settings.model_type_override
+            entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
+                settings.model_type_override, "batched"
+            )
+            logger.info(
+                f"Applied model_type override for {model_id}: "
+                f"type={entry.model_type}, engine={entry.engine_type}"
+            )
 
     def get_model_ids(self) -> list[str]:
         """Get list of all discovered model IDs."""
@@ -390,6 +419,12 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+
+            if self._is_ds4_entry(entry):
+                raise RuntimeError(
+                    "DS4 GGUF discovery is available, but the DS4 backend "
+                    "process adapter has not been implemented yet"
+                )
 
             # Already loaded - just update access time
             if entry.engine is not None:
@@ -1223,6 +1258,7 @@ class EnginePool:
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
+                    "display_name": e.display_name,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())

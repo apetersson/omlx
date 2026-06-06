@@ -19,6 +19,7 @@ from omlx.model_discovery import (
     estimate_model_size,
     format_size,
     model_directory_access_error,
+    normalize_ds4_gguf_model_id,
 )
 
 
@@ -689,6 +690,120 @@ class TestDiscoverModels:
         models = discover_models(tmp_path)
         assert len(models) == 1
 
+    def test_normalize_ds4_gguf_model_id(self):
+        """DS4 GGUF ids are lowercased and separator-normalized."""
+        assert (
+            normalize_ds4_gguf_model_id("DeepSeek V4 Flash Q2_K.gguf")
+            == "deepseek-v4-flash-q2-k"
+        )
+        assert normalize_ds4_gguf_model_id(" Foo---Bar..GGUF ") == "foo-bar"
+
+    def test_discover_top_level_ds4_gguf(self, tmp_path):
+        """Top-level Foo.gguf is exposed as lowercased DS4 model id foo."""
+        gguf = tmp_path / "DeepSeek V4 Flash Q2_K.gguf"
+        gguf.write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+
+        assert list(models) == ["deepseek-v4-flash-q2-k"]
+        model = models["deepseek-v4-flash-q2-k"]
+        assert model.model_type == "llm"
+        assert model.engine_type == "ds4"
+        assert model.model_path == str(gguf)
+        assert model.estimated_size == int(1000 * 1.05)
+        assert model.config_model_type == "deepseek_v4_flash_gguf"
+        assert model.display_name == "DeepSeek V4 Flash Q2_K"
+
+    def test_discover_nested_ds4_ggufs_as_separate_models(self, tmp_path):
+        """Every GGUF in a repo directory gets its own DS4 model entry."""
+        repo = tmp_path / "DeepSeek-V4-Flash-GGUF"
+        repo.mkdir()
+        (repo / "Q2_K.gguf").write_bytes(b"0" * 1000)
+        (repo / "Q4_K_M.gguf").write_bytes(b"0" * 2000)
+
+        models = discover_models(tmp_path)
+
+        assert set(models) == {
+            "deepseek-v4-flash-gguf-q2-k",
+            "deepseek-v4-flash-gguf-q4-k-m",
+        }
+        assert models["deepseek-v4-flash-gguf-q2-k"].engine_type == "ds4"
+        assert models["deepseek-v4-flash-gguf-q4-k-m"].estimated_size == int(
+            2000 * 1.05
+        )
+
+    def test_discover_mixed_mlx_and_ds4_entries(self, tmp_path):
+        """Mixed MLX+GGUF directories expose separate entries."""
+        model_dir = tmp_path / "DeepSeek-V4-Flash"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+        (model_dir / "model.gguf").write_bytes(b"0" * 2000)
+
+        models = discover_models(tmp_path)
+
+        assert "DeepSeek-V4-Flash" in models
+        assert "deepseek-v4-flash:ds4" in models
+        assert models["DeepSeek-V4-Flash"].engine_type == "batched"
+        assert models["deepseek-v4-flash:ds4"].engine_type == "ds4"
+        assert models["deepseek-v4-flash:ds4"].model_path == str(
+            model_dir / "model.gguf"
+        )
+
+    def test_direct_mixed_model_dir_uses_directory_id_for_generic_gguf(
+        self, tmp_path
+    ):
+        """Direct mixed model folders do not expose generic model.gguf ids."""
+        model_dir = tmp_path / "DeepSeek-V4-Flash"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
+        gguf = model_dir / "model.gguf"
+        gguf.write_bytes(b"0" * 2000)
+
+        models = discover_models(model_dir)
+
+        assert "DeepSeek-V4-Flash" in models
+        assert "deepseek-v4-flash:ds4" in models
+        assert "model" not in models
+        assert models["deepseek-v4-flash:ds4"].engine_type == "ds4"
+        assert models["deepseek-v4-flash:ds4"].display_name == "DeepSeek-V4-Flash"
+        assert models["deepseek-v4-flash:ds4"].model_path == str(gguf)
+
+    def test_top_level_ds4_file_does_not_get_overwritten_by_mlx_dir(self, tmp_path):
+        """Top-level GGUF keeps a :ds4 entry when an MLX dir collides later."""
+        gguf = tmp_path / "Foo.gguf"
+        gguf.write_bytes(b"0" * 1000)
+        mlx_dir = tmp_path / "foo"
+        mlx_dir.mkdir()
+        (mlx_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (mlx_dir / "model.safetensors").write_bytes(b"0" * 2000)
+
+        models = discover_models(tmp_path)
+
+        assert models["foo"].engine_type == "batched"
+        assert models["foo:ds4"].engine_type == "ds4"
+        assert models["foo:ds4"].model_path == str(gguf)
+
+    def test_multi_dir_discovery_avoids_case_insensitive_ds4_collision(
+        self, tmp_path
+    ):
+        """Merged discovery keeps MLX id and suffixes DS4 case collisions."""
+        first = tmp_path / "first"
+        first.mkdir()
+        second = tmp_path / "second"
+        second.mkdir()
+        (first / "Foo.gguf").write_bytes(b"0" * 1000)
+        mlx_dir = second / "foo"
+        mlx_dir.mkdir()
+        (mlx_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (mlx_dir / "model.safetensors").write_bytes(b"0" * 2000)
+
+        models = discover_models_from_dirs([first, second])
+
+        assert models["foo"].engine_type == "batched"
+        assert models["foo:ds4"].engine_type == "ds4"
+
     def test_nonexistent_directory_raises_error(self, tmp_path):
         """Test that nonexistent directory raises ValueError."""
         with pytest.raises(ValueError, match="does not exist"):
@@ -1287,6 +1402,24 @@ class TestHfCacheDiscovery:
             models["mlx-community--Qwen3-8B-4bit"].source_repo_id
             == "mlx-community/Qwen3-8B-4bit"
         )
+
+    def test_discover_hf_cache_gguf_uses_repo_id_for_generic_file(self, tmp_path):
+        """HF cache GGUF model.gguf uses repo-derived DS4 id/display."""
+        _, snapshot = self._make_hf_cache_entry(
+            tmp_path, "Org", "DeepSeek-V4-Flash-GGUF"
+        )
+        gguf = snapshot / "model.gguf"
+        gguf.write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+
+        assert list(models) == ["deepseek-v4-flash-gguf"]
+        model = models["deepseek-v4-flash-gguf"]
+        assert model.engine_type == "ds4"
+        assert model.model_path == str(gguf)
+        assert model.display_name == "DeepSeek-V4-Flash-GGUF"
+        assert model.source_type == "hf_cache"
+        assert model.source_repo_id == "Org/DeepSeek-V4-Flash-GGUF"
 
     def test_discover_multiple_hf_cache_models(self, tmp_path):
         """Multiple HF cache entries are all discovered."""
