@@ -1341,6 +1341,8 @@ def init_server(
     # is constructed.
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
+        global_settings=global_settings,
+        base_path=base_path,
     )
 
     # Discover models (use pinned models from settings file)

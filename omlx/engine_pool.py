@@ -44,6 +44,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
+from .settings import DEFAULT_BASE_PATH, DS4Settings
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,9 @@ class EnginePool:
     def __init__(
         self,
         scheduler_config: SchedulerConfig | None = None,
+        global_settings: object | None = None,
+        base_path: str | Path | None = None,
+        ds4_settings: DS4Settings | None = None,
     ):
         """
         Initialize the engine pool.
@@ -120,10 +124,44 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
+        self._global_settings: object | None = global_settings
+        self._base_path: Path = Path(
+            base_path
+            or getattr(global_settings, "base_path", None)
+            or DEFAULT_BASE_PATH
+        )
+        self._ds4_settings: DS4Settings | None = ds4_settings
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self.configure_hot_cache_budget()
+
+    def configure_ds4_backend(
+        self,
+        *,
+        global_settings: object | None = None,
+        base_path: str | Path | None = None,
+        ds4_settings: DS4Settings | None = None,
+    ) -> None:
+        """Configure global DS4 lifecycle settings for future process loads."""
+        if global_settings is not None:
+            self._global_settings = global_settings
+        if base_path is not None:
+            self._base_path = Path(base_path)
+        elif global_settings is not None and getattr(global_settings, "base_path", None):
+            self._base_path = Path(global_settings.base_path)
+        if ds4_settings is not None:
+            self._ds4_settings = ds4_settings
+
+    def _get_ds4_settings(self) -> DS4Settings:
+        """Return the effective global DS4 settings for process launches."""
+        if self._ds4_settings is not None:
+            return self._ds4_settings
+        global_settings = self._global_settings
+        ds4_settings = getattr(global_settings, "ds4", None) if global_settings else None
+        if isinstance(ds4_settings, DS4Settings):
+            return ds4_settings
+        return DS4Settings()
 
     @property
     def current_model_memory(self) -> int:
@@ -164,6 +202,35 @@ class EnginePool:
         wake = getattr(enforcer, "wake", None) if enforcer is not None else None
         if callable(wake):
             wake(active=active)
+
+    def _current_model_memory_by_backend(self, *, external: bool) -> int:
+        """Return loaded model memory estimates split by process boundary."""
+        total = 0
+        for entry in self._entries.values():
+            if entry.engine is None:
+                continue
+            is_external = entry.engine_type == "ds4"
+            if is_external != external:
+                continue
+            total += int(entry.actual_size or entry.estimated_size or 0)
+        return total
+
+    def _current_external_model_memory(self) -> int:
+        """Return loaded model memory not reflected in this process footprint."""
+        return self._current_model_memory_by_backend(external=True)
+
+    def _current_internal_model_memory(self) -> int:
+        """Return loaded model memory that should be reflected in parent footprint."""
+        return self._current_model_memory_by_backend(external=False)
+
+    def _current_admission_memory(self) -> int:
+        """Return parent/internal model memory plus external subprocess memory."""
+        parent_memory = max(
+            mx.get_active_memory(),
+            get_phys_footprint(),
+            self._current_internal_model_memory(),
+        )
+        return parent_memory + self._current_external_model_memory()
 
     @property
     def model_count(self) -> int:
@@ -454,11 +521,12 @@ class EnginePool:
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
 
-            if self._is_ds4_entry(entry):
-                raise RuntimeError(
-                    "DS4 GGUF discovery is available, but the DS4 backend "
-                    "process adapter has not been implemented yet"
-                )
+            if (
+                entry.engine is None
+                and entry.engine_type == "ds4"
+                and not self._get_ds4_settings().enabled
+            ):
+                raise RuntimeError("DS4 backend is disabled in settings")
 
             # Already loaded - just update access time
             if entry.engine is not None:
@@ -485,7 +553,7 @@ class EnginePool:
             ceiling = self._current_ceiling()
             if ceiling > 0:
                 while True:
-                    current = max(mx.get_active_memory(), get_phys_footprint())
+                    current = self._current_admission_memory()
                     projected = current + entry.estimated_size
                     if projected <= ceiling:
                         break
@@ -654,11 +722,7 @@ class EnginePool:
         evicted_any = False
         async with self._lock:
             while True:
-                current = max(
-                    mx.get_active_memory(),
-                    get_phys_footprint(),
-                    self._current_model_memory,
-                )
+                current = self._current_admission_memory()
                 if current + predicted <= target:
                     return evicted_any
 
@@ -703,6 +767,19 @@ class EnginePool:
         """
         entry = self._entries.get(model_id)
         if not entry or entry.engine is None:
+            return
+
+        if entry.engine_type == "ds4":
+            logger.info(f"Unloading DS4 process: {model_id}")
+            try:
+                await entry.engine.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping DS4 process for {model_id}: {e}")
+            entry.engine = None
+            entry.last_access = 0.0
+            entry.actual_size = None
+            self._current_model_memory -= entry.estimated_size
+            self._wake_process_memory_enforcer()
             return
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
@@ -882,9 +959,23 @@ class EnginePool:
             pass
 
             # Check if DFlash is enabled -- takes priority over engine type
-            # since DFlash has its own model loading pipeline
+            # since DFlash has its own model loading pipeline.  DS4 is an
+            # external-process backend and intentionally bypasses MLX/DFlash
+            # loaders while still participating in the same lifecycle pool.
             engine = None
-            if model_settings is not None:
+            if effective_type == "ds4":
+                ds4_settings = self._get_ds4_settings()
+                if not ds4_settings.enabled:
+                    raise RuntimeError("DS4 backend is disabled in settings")
+                from .engine.ds4 import DS4ProcessEngine
+
+                engine = DS4ProcessEngine(
+                    model_id=model_id,
+                    model_path=entry.model_path,
+                    settings=ds4_settings,
+                    base_path=self._base_path,
+                )
+            elif model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
                 if dflash_enabled and dflash_draft:
@@ -1186,15 +1277,21 @@ class EnginePool:
             # because mx.set_cache_limit(total_mem) prevents automatic release.
             # Without this, memory stays at ~2x model size until the first
             # inference request triggers a clear. (#429)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
-            )
+            if entry.engine_type != "ds4":
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
 
+            ds4_rss = None
+            if entry.engine_type == "ds4":
+                get_rss = getattr(engine, "get_process_rss_bytes", None)
+                if callable(get_rss):
+                    ds4_rss = get_rss()
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
-            entry.actual_size = observed_delta or entry.estimated_size
+            entry.actual_size = ds4_rss or observed_delta or entry.estimated_size
 
             logger.info(
                 f"Loaded model: {model_id} "
@@ -1259,6 +1356,21 @@ class EnginePool:
 
         logger.info("Engine pool shutdown complete")
 
+    @staticmethod
+    def _ds4_status_fields(entry: EngineEntry) -> dict:
+        """Return DS4-specific status fields for a loaded DS4 process."""
+        engine = entry.engine
+        if entry.engine_type != "ds4" or engine is None:
+            return {}
+        get_stats = getattr(engine, "get_stats", None)
+        if not callable(get_stats):
+            return {}
+        try:
+            return {"ds4": get_stats()}
+        except Exception as e:  # noqa: BLE001 - status must remain best-effort
+            logger.debug("Failed to collect DS4 status for %s: %s", entry.model_id, e)
+            return {}
+
     def get_status(self) -> dict:
         """
         Get pool status for monitoring endpoints.
@@ -1293,6 +1405,7 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "display_name": e.display_name,
+                    **self._ds4_status_fields(e),
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
                 for mid, e in sorted(self._entries.items())
