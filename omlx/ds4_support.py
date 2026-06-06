@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -19,6 +20,8 @@ from typing import Iterable
 from .settings import DEFAULT_BASE_PATH, DS4Settings
 
 DS4_SERVER_BINARY = "ds4-server"
+BUNDLED_DS4_SUPPORT_ENV = "OMLX_BUNDLED_DS4_SUPPORT_DIR"
+BUNDLED_DS4_SUPPORT_DIR_NAME = "DS4Support"
 DS4_SUPPORT_FILES: tuple[str, ...] = (
     "LICENSE",
     "README.md",
@@ -179,6 +182,66 @@ def require_ds4_support(
     if not status.ready:
         raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
     return status
+
+
+def find_bundled_ds4_support_dir(
+    *,
+    env: Mapping[str, str] | None = None,
+    module_file: str | Path | None = None,
+) -> Path | None:
+    """Locate bundled DS4 support files shipped next to the app resources.
+
+    The Swift app bundle copies Python sources into ``Contents/Resources/omlx``
+    and DS4 runtime files into ``Contents/Resources/DS4Support``.  A hidden env
+    override keeps tests and alternate packagers deterministic.
+    """
+    environment = os.environ if env is None else env
+    if bundled_override := environment.get(BUNDLED_DS4_SUPPORT_ENV):
+        return Path(bundled_override).expanduser().resolve()
+
+    module_path = Path(module_file or __file__).expanduser().resolve()
+    try:
+        resources_dir = module_path.parents[1]
+    except IndexError:
+        return None
+
+    for name in (BUNDLED_DS4_SUPPORT_DIR_NAME, "ds4"):
+        candidate = resources_dir / name
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def install_bundled_ds4_support_files(
+    settings: DS4Settings | None = None,
+    *,
+    base_path: str | Path | None = None,
+    source_dir: str | Path | None = None,
+    overwrite: bool = False,
+) -> DS4SupportCopyResult | None:
+    """Copy bundled DS4 support files into the default user support dir.
+
+    Custom ``ds4.support_dir`` values are treated as an explicit user choice and
+    are left untouched.  Returning ``None`` means no bundled source was present
+    or the user configured a custom support directory.
+    """
+    settings = settings or DS4Settings()
+    if settings.support_dir is not None:
+        return None
+
+    base = Path(base_path).expanduser().resolve() if base_path else DEFAULT_BASE_PATH
+    source = (
+        Path(source_dir).expanduser().resolve()
+        if source_dir is not None
+        else find_bundled_ds4_support_dir()
+    )
+    if source is None:
+        return None
+    return copy_ds4_support_files(
+        source,
+        settings.get_support_dir(base),
+        overwrite=overwrite,
+    )
 
 
 def copy_ds4_support_files(

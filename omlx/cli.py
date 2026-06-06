@@ -75,11 +75,12 @@ def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
     import os
+
     import uvicorn
 
     from ._version import __version__
-    from .settings import init_settings, get_settings
-    from .logging_config import configure_file_logging, AdminStatsAccessFilter
+    from .logging_config import AdminStatsAccessFilter, configure_file_logging
+    from .settings import init_settings
 
     try:
         from ._build_info import build_number
@@ -87,8 +88,8 @@ def serve_command(args):
         build_number = None
 
     # Print version banner
-    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
-    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print("\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print("\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
         print(f"\033[33m├─ Version: {__version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
@@ -135,6 +136,31 @@ def serve_command(args):
 
     # Ensure required directories exist
     settings.ensure_directories()
+
+    # In bundled app installs, seed the user support directory with the
+    # DS4 runtime files shipped in Contents/Resources/DS4Support.  Failures are
+    # logged but do not block non-DS4 server usage; DS4 launch validation still
+    # reports a concrete missing-file error if support remains unavailable.
+    try:
+        from .ds4_support import DS4SupportError, install_bundled_ds4_support_files
+
+        ds4_copy = None
+        if ds4_settings := getattr(settings, "ds4", None):
+            ds4_copy = install_bundled_ds4_support_files(
+                ds4_settings,
+                base_path=settings.base_path,
+            )
+        if ds4_copy is not None and ds4_copy.copied_files:
+            logging.getLogger("omlx.ds4_support").info(
+                "Installed bundled DS4 support files from %s to %s",
+                ds4_copy.source_dir,
+                ds4_copy.destination_dir,
+            )
+    except (DS4SupportError, OSError) as exc:
+        logging.getLogger("omlx.ds4_support").warning(
+            "Bundled DS4 support files are unavailable: %s",
+            exc,
+        )
 
     # Apply HuggingFace endpoint if configured
     if settings.huggingface.endpoint:
@@ -212,8 +238,8 @@ def serve_command(args):
 
     try:
         # Import server and config after the port is known to be available.
-        from .server import init_server
         from .config import parse_size
+        from .server import init_server
 
         model_dirs = settings.get_effective_model_dirs()
         print(f"Base path: {settings.base_path}")
@@ -641,7 +667,7 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      app.omlx")
+    print("Bundle ID:      app.omlx")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")

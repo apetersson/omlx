@@ -36,6 +36,16 @@ apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
 ```
 
+DS4/GGUF backend releases should provide a prebuilt support tree containing
+`ds4-server`, `LICENSE`, `README.md`, and `metal/*.metal` files. Point the
+bundle step at it with `OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4-support` (and set
+`OMLX_REQUIRE_DS4_BUNDLE=1` in release jobs); the build copies only the
+validated runtime files into `Contents/Resources/DS4Support`. On first server
+start from the app bundle,
+oMLX seeds the user support directory (`~/Library/Application Support/oMLX` /
+`~/.omlx` base path `support/ds4`) from that bundled resource. No DS4 build or
+network fetch happens at runtime.
+
 ## Output
 
 ```

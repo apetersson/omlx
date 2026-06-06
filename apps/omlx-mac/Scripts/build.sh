@@ -42,12 +42,15 @@
 #                                                       existing donor even if stale
 #
 # Env overrides:
-#   OMLX_DONOR_APP=/path/to/oMLX.app    # explicit donor (bypasses venvstacks)
-#   OMLX_EXPORT_DIR=/path/to/_export    # override the venvstacks export tree
-#                                       (release builds set this per macOS target)
-#   OMLX_NEXT_OUT=/path/to/output_dir   # final stage location
-#   PYTHON_BIN=/path/to/python3         # python used for venvstacks driver
-#                                       (default: PATH lookup of python3)
+#   OMLX_DONOR_APP=/path/to/oMLX.app      # explicit donor (bypasses venvstacks)
+#   OMLX_EXPORT_DIR=/path/to/_export      # override the venvstacks export tree
+#                                         (release builds set this per macOS target)
+#   OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4   # prebuilt DS4 support tree to embed
+#                                         (ds4-server, LICENSE, README.md, metal/)
+#   OMLX_REQUIRE_DS4_BUNDLE=1             # fail if no DS4 support source is found
+#   OMLX_NEXT_OUT=/path/to/output_dir     # final stage location
+#   PYTHON_BIN=/path/to/python3           # python used for venvstacks driver
+#                                         (default: PATH lookup of python3)
 
 set -euo pipefail
 
@@ -367,6 +370,39 @@ log "Writing engine commit metadata..."
     || die "failed to write engine commit metadata."
 ok "  + _engine_commits.json"
 
+# --- Embed DS4 support files ---------------------------------------------
+
+DS4_SUPPORT_SOURCE="${OMLX_DS4_BUNDLE_SOURCE:-}"
+if [ -n "$DS4_SUPPORT_SOURCE" ]; then
+    [ -d "$DS4_SUPPORT_SOURCE" ] || die "OMLX_DS4_BUNDLE_SOURCE not found: $DS4_SUPPORT_SOURCE"
+elif [ -f "$PACKAGING_DIR/DS4Support/ds4-server" ]; then
+    DS4_SUPPORT_SOURCE="$PACKAGING_DIR/DS4Support"
+elif [ -f "$REPO_ROOT/../ds4-apetersson/ds4-server" ]; then
+    DS4_SUPPORT_SOURCE="$REPO_ROOT/../ds4-apetersson"
+fi
+
+if [ -n "$DS4_SUPPORT_SOURCE" ]; then
+    log "Copying DS4 support files from $DS4_SUPPORT_SOURCE…"
+    rm -rf "$RESOURCES_DIR/DS4Support"
+    if ! PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON_BIN" - "$DS4_SUPPORT_SOURCE" "$RESOURCES_DIR/DS4Support" <<'PY'
+import sys
+from omlx.ds4_support import copy_ds4_support_files
+
+source, destination = sys.argv[1], sys.argv[2]
+result = copy_ds4_support_files(source, destination, overwrite=True)
+print(f"copied {len(result.copied_files)} DS4 support files")
+PY
+    then
+        die "failed to copy DS4 support files from $DS4_SUPPORT_SOURCE"
+    fi
+    ok "  + DS4Support"
+elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-0}" = "1" ]; then
+    die "No DS4 support source found; set OMLX_DS4_BUNDLE_SOURCE or provide packaging/DS4Support."
+else
+    warn "No DS4 support source found; bundle will rely on an existing user support directory."
+fi
+
 # --- Embed CLI wrapper ----------------------------------------------------
 
 log "Writing app-bundle CLI wrapper..."
@@ -462,6 +498,9 @@ if [ "$SKIP_EMBEDDED_SIGN" -eq 1 ]; then
 else
     log "Ad-hoc signing embedded native code…"
     _sign_embedded_mach_o_files "$PYTHON_DIR"
+    if [ -d "$RESOURCES_DIR/DS4Support" ]; then
+        _sign_embedded_mach_o_files "$RESOURCES_DIR/DS4Support"
+    fi
     codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
     ok "  + signed omlx-cli wrapper"
 fi

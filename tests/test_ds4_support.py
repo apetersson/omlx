@@ -7,11 +7,15 @@ from pathlib import Path
 import pytest
 
 from omlx.ds4_support import (
+    BUNDLED_DS4_SUPPORT_DIR_NAME,
+    BUNDLED_DS4_SUPPORT_ENV,
     DS4_METAL_FILES,
     DS4_SERVER_BINARY,
     DS4SupportError,
     copy_ds4_support_files,
+    find_bundled_ds4_support_dir,
     inspect_ds4_support,
+    install_bundled_ds4_support_files,
     is_ds4_supported_platform,
     require_ds4_support,
     required_ds4_support_relative_paths,
@@ -165,6 +169,63 @@ class TestDS4SupportInspection:
             )
 
         assert "missing DS4 binary" in str(exc_info.value)
+
+
+class TestDS4BundledSupport:
+    """Tests for bundled app-resource DS4 support discovery/install."""
+
+    def test_find_bundled_support_dir_from_env(self, tmp_path):
+        source = tmp_path / "bundle" / BUNDLED_DS4_SUPPORT_DIR_NAME
+        source.mkdir(parents=True)
+
+        found = find_bundled_ds4_support_dir(
+            env={BUNDLED_DS4_SUPPORT_ENV: str(source)},
+            module_file=tmp_path / "Resources" / "omlx" / "ds4_support.py",
+        )
+
+        assert found == source.resolve()
+
+    def test_find_bundled_support_dir_next_to_app_resources(self, tmp_path):
+        resources = tmp_path / "oMLX.app" / "Contents" / "Resources"
+        source = resources / BUNDLED_DS4_SUPPORT_DIR_NAME
+        source.mkdir(parents=True)
+        module_file = resources / "omlx" / "ds4_support.py"
+        module_file.parent.mkdir()
+        module_file.write_text("# module\n")
+
+        found = find_bundled_ds4_support_dir(env={}, module_file=module_file)
+
+        assert found == source.resolve()
+
+    def test_install_bundled_support_files_to_default_dir(self, tmp_path):
+        source = tmp_path / "Resources" / BUNDLED_DS4_SUPPORT_DIR_NAME
+        _write_complete_support_tree(source)
+        base_path = tmp_path / "base"
+
+        result = install_bundled_ds4_support_files(
+            DS4Settings(),
+            base_path=base_path,
+            source_dir=source,
+        )
+
+        assert result is not None
+        assert result.destination_dir == (base_path / "support" / "ds4").resolve()
+        assert (base_path / "support" / "ds4" / DS4_SERVER_BINARY).is_file()
+        assert (base_path / "support" / "ds4" / "metal" / "dense.metal").is_file()
+
+    def test_install_bundled_support_skips_custom_support_dir(self, tmp_path):
+        source = tmp_path / "Resources" / BUNDLED_DS4_SUPPORT_DIR_NAME
+        _write_complete_support_tree(source)
+        custom = tmp_path / "custom-support"
+
+        result = install_bundled_ds4_support_files(
+            DS4Settings(support_dir=str(custom)),
+            base_path=tmp_path / "base",
+            source_dir=source,
+        )
+
+        assert result is None
+        assert not custom.exists()
 
 
 class TestDS4SupportCopy:
