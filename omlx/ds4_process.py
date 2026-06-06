@@ -105,6 +105,11 @@ class DS4LaunchConfig:
         )
 
     @property
+    def log_path(self) -> Path:
+        """Persistent stdout/stderr capture path for this DS4 model."""
+        return self.debug_dir / "ds4.log"
+
+    @property
     def trace_path(self) -> Path:
         """Trace path for this launch when tracing is enabled."""
         timestamp = self.trace_timestamp or datetime.now(UTC).strftime(
@@ -247,6 +252,7 @@ class DS4ManagedProcess:
         self.port: int | None = None
         self.command: list[str] | None = None
         self.logs: list[DS4LogLine] = []
+        self.log_path: Path | None = None
         self.last_kv_prune_result: DS4KVPruneResult | None = None
         self._log_tasks: list[asyncio.Task[None]] = []
 
@@ -339,6 +345,8 @@ class DS4ManagedProcess:
         if self.config.settings.trace_enabled:
             self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
         self.config.debug_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.config.log_path
+        self._append_log_file_header()
 
     def _start_log_capture(self) -> None:
         if self.process is None:
@@ -358,6 +366,29 @@ class DS4ManagedProcess:
         await asyncio.gather(*self._log_tasks, return_exceptions=True)
         self._log_tasks.clear()
 
+    def _append_log_file_header(self) -> None:
+        if self.log_path is None:
+            return
+        timestamp = datetime.now(UTC).isoformat()
+        try:
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n# DS4 launch {timestamp}\n")
+                handle.write(f"model_id: {self.config.model_id}\n")
+                if self.command:
+                    handle.write(f"command: {' '.join(self.command)}\n")
+        except OSError as exc:
+            logger.warning("Failed to write DS4 log header to %s: %s", self.log_path, exc)
+
+    def _append_log_file_line(self, line: DS4LogLine) -> None:
+        if self.log_path is None:
+            return
+        timestamp = datetime.now(UTC).isoformat()
+        try:
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp} {line.stream}: {line.text}\n")
+        except OSError as exc:
+            logger.warning("Failed to write DS4 log line to %s: %s", self.log_path, exc)
+
     async def _capture_stream(
         self,
         stream: Literal["stdout", "stderr"],
@@ -368,6 +399,8 @@ class DS4ManagedProcess:
             if not line:
                 return
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            self.logs.append(DS4LogLine(stream, text, time.monotonic()))
+            log_line = DS4LogLine(stream, text, time.monotonic())
+            self.logs.append(log_line)
+            self._append_log_file_line(log_line)
             if len(self.logs) > self.max_log_lines:
                 del self.logs[: len(self.logs) - self.max_log_lines]

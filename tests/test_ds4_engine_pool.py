@@ -27,6 +27,7 @@ class FakeManagedProcess:
         self.process = None
         self.port = None
         self.command = None
+        self.log_path = None
         self.logs = []
         self.started = False
         self.stopped = False
@@ -44,6 +45,7 @@ class FakeManagedProcess:
         self.started = True
         self.port = self.config.port or 49152
         self.command = self.config.build_command(self.port)
+        self.log_path = self.config.log_path
         self.process = SimpleNamespace(pid=12345, returncode=None)
 
     async def stop(self) -> None:
@@ -105,6 +107,9 @@ async def test_ds4_process_engine_starts_and_stops_fake_process(monkeypatch, tmp
         assert stats["host"] == "127.0.0.1"
         assert stats["port"] == 49152
         assert stats["running"] is True
+        assert stats["log_path"] == str(
+            tmp_path / "logs" / "ds4-debug" / "foo" / "ds4.log"
+        )
         assert stats["recent_logs"] == "fake ds4 logs"
     finally:
         await engine.stop()

@@ -310,6 +310,10 @@ class TestDS4ManagedProcess:
             await managed.stop()
 
         assert managed.is_running is False
+        assert managed.log_path == tmp_path / "debug" / "model" / "ds4.log"
+        log_text = managed.log_path.read_text()
+        assert "model_id: model" in log_text
+        assert "stdout: fake ds4 argv" in log_text
 
     @pytest.mark.asyncio
     async def test_start_timeout_stops_process_and_reports_logs(self, tmp_path):

@@ -459,6 +459,7 @@ class DS4ProcessEngine(BaseEngine):
             self._record_crashed_process()
         command = self.process.command if self.process is not None else None
         logs = self.process.recent_log_text() if self.process is not None else ""
+        log_path = getattr(self.process, "log_path", None)
         return {
             "backend": "ds4",
             "host": DS4_HOST,
@@ -472,6 +473,7 @@ class DS4ProcessEngine(BaseEngine):
             "last_crash_exit_code": self._last_crash_exit_code,
             "last_crash_logs": self._last_crash_logs,
             "last_crash_monotonic_time": self._last_crash_monotonic_time,
+            "log_path": str(log_path) if log_path is not None else None,
             "rss_bytes": self.get_process_rss_bytes(),
             "context_tokens": self.effective_context_tokens(),
             "command": command,
