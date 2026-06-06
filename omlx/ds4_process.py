@@ -1,0 +1,300 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Managed DS4 subprocess scaffolding.
+
+This module owns launch-command construction, localhost port allocation,
+readiness probing, and stdout/stderr capture for the future DS4 engine/proxy.
+It intentionally does not implement request forwarding yet.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import socket
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
+
+from .ds4_support import DS4SupportStatus, require_ds4_support
+from .settings import DEFAULT_BASE_PATH, DS4Settings
+
+DS4_HOST = "127.0.0.1"
+_DS4_FS_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+class DS4ProcessError(RuntimeError):
+    """Raised when a managed DS4 process cannot start or become ready."""
+
+
+@dataclass(frozen=True)
+class DS4LogLine:
+    """Captured DS4 stdout/stderr line."""
+
+    stream: Literal["stdout", "stderr"]
+    text: str
+    monotonic_time: float
+
+
+@dataclass(frozen=True)
+class DS4LaunchConfig:
+    """Inputs needed to launch one DS4 subprocess."""
+
+    model_id: str
+    gguf_path: Path
+    settings: DS4Settings = field(default_factory=DS4Settings)
+    base_path: Path = field(default_factory=lambda: DEFAULT_BASE_PATH)
+    context_tokens: int | None = None
+    port: int | None = None
+    host: str = DS4_HOST
+    auto_enable_ssd_streaming: bool = False
+    trace_timestamp: str | None = None
+    platform_system: str | None = None
+    platform_machine: str | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce DS4's private localhost-only binding for managed launches."""
+        if self.host != DS4_HOST:
+            raise ValueError("Managed DS4 processes must bind to 127.0.0.1")
+
+    def support_status(self) -> DS4SupportStatus:
+        """Validate configured support files for this launch."""
+        return require_ds4_support(
+            self.settings,
+            base_path=self.base_path,
+            system=self.platform_system,
+            machine=self.platform_machine,
+        )
+
+    @property
+    def support_dir(self) -> Path:
+        """Effective support directory used as DS4 --chdir target."""
+        return self.settings.get_support_dir(self.base_path)
+
+    @property
+    def kv_dir(self) -> Path:
+        """Per-model DS4 KV directory under the shared global root."""
+        return self.settings.get_kv_root(self.base_path) / safe_ds4_fs_name(
+            self.model_id
+        )
+
+    @property
+    def debug_dir(self) -> Path:
+        """Per-model DS4 debug artifact directory."""
+        return self.settings.get_debug_dir(self.base_path) / safe_ds4_fs_name(
+            self.model_id
+        )
+
+    @property
+    def trace_path(self) -> Path:
+        """Trace path for this launch when tracing is enabled."""
+        timestamp = self.trace_timestamp or datetime.now(UTC).strftime(
+            "%Y%m%d-%H%M%S"
+        )
+        filename = f"{safe_ds4_fs_name(self.model_id)}-{timestamp}.trace"
+        return self.settings.get_trace_dir(self.base_path) / filename
+
+    def resolve_port(self) -> int:
+        """Return configured port or reserve a currently-free localhost port."""
+        if self.port is not None:
+            return self.port
+        return find_free_localhost_port()
+
+    def build_command(self, port: int) -> list[str]:
+        """Build the ds4-server argv for this launch."""
+        binary = self.settings.get_binary_path(self.base_path)
+        args = [
+            str(binary),
+            "--chdir",
+            str(self.support_dir),
+            "--model",
+            str(self.gguf_path),
+            "--host",
+            self.host,
+            "--port",
+            str(port),
+            "--power",
+            str(self.settings.power),
+        ]
+        context_tokens = self.context_tokens or self.settings.get_auto_context_tokens()
+        if context_tokens:
+            args.extend(["--ctx", str(context_tokens)])
+        if self.settings.kv_cache_enabled:
+            args.extend(
+                [
+                    "--kv-disk-dir",
+                    str(self.kv_dir),
+                    "--kv-disk-space-mb",
+                    str(self.settings.kv_disk_space_mb),
+                    "--kv-cache-continued-interval-tokens",
+                    str(self.settings.kv_cache_continued_interval_tokens),
+                ]
+            )
+        if self.should_enable_ssd_streaming():
+            args.append("--ssd-streaming")
+        if self.settings.trace_enabled:
+            args.extend(["--trace", str(self.trace_path)])
+        return args
+
+    def should_enable_ssd_streaming(self) -> bool:
+        """Resolve SSD streaming mode for this launch."""
+        if self.settings.ssd_streaming == "on":
+            return True
+        if self.settings.ssd_streaming == "off":
+            return False
+        return self.auto_enable_ssd_streaming
+
+
+def safe_ds4_fs_name(model_id: str) -> str:
+    """Return a filesystem-safe per-model DS4 artifact directory name."""
+    value = _DS4_FS_SAFE_RE.sub("-", model_id.strip()).strip("-.").lower()
+    return value or "ds4-model"
+
+
+def find_free_localhost_port() -> int:
+    """Return an available private localhost TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((DS4_HOST, 0))
+        return int(sock.getsockname()[1])
+
+
+def _readiness_probe(host: str, port: int) -> bool:
+    url = f"http://{host}:{port}/v1/models"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=0.2) as response:
+            return 200 <= int(response.status) < 300
+    except (OSError, urllib.error.URLError, TimeoutError):
+        return False
+
+
+class DS4ManagedProcess:
+    """Lifecycle wrapper for one managed ds4-server subprocess."""
+
+    def __init__(self, config: DS4LaunchConfig, *, max_log_lines: int = 500):
+        self.config = config
+        self.max_log_lines = max_log_lines
+        self.process: asyncio.subprocess.Process | None = None
+        self.port: int | None = None
+        self.command: list[str] | None = None
+        self.logs: list[DS4LogLine] = []
+        self._log_tasks: list[asyncio.Task[None]] = []
+
+    @property
+    def is_running(self) -> bool:
+        """Return True while the subprocess exists and has not exited."""
+        return self.process is not None and self.process.returncode is None
+
+    async def start(self) -> None:
+        """Launch ds4-server and wait for /v1/models readiness."""
+        if self.is_running:
+            return
+        self.config.support_status()
+        port = self.config.resolve_port()
+        self.port = port
+        self.command = self.config.build_command(port)
+        self._prepare_directories()
+
+        self.process = await asyncio.create_subprocess_exec(
+            *self.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self._start_log_capture()
+
+        try:
+            await self.wait_ready()
+        except DS4ProcessError as error:
+            await self.stop()
+            message = str(error)
+            if "logs=" in message:
+                prefix = message.split("logs=", 1)[0]
+                raise DS4ProcessError(f"{prefix}logs={self.recent_log_text()}") from error
+            raise
+        except Exception:
+            await self.stop()
+            raise
+
+    async def wait_ready(self) -> None:
+        """Wait until DS4 responds to /v1/models or timeout expires."""
+        if self.process is None or self.port is None:
+            raise DS4ProcessError("DS4 process has not been started")
+
+        deadline = time.monotonic() + (self.config.settings.ready_timeout_ms / 1000.0)
+        while time.monotonic() < deadline:
+            if self.process.returncode is not None:
+                await asyncio.sleep(0.05)
+                raise DS4ProcessError(
+                    "DS4 process exited before readiness: "
+                    f"code={self.process.returncode}; logs={self.recent_log_text()}"
+                )
+            ready = await asyncio.to_thread(
+                _readiness_probe, self.config.host, self.port
+            )
+            if ready:
+                return
+            await asyncio.sleep(0.1)
+
+        await asyncio.sleep(0.05)
+        raise DS4ProcessError(
+            "DS4 readiness timed out after "
+            f"{self.config.settings.ready_timeout_ms}ms; logs={self.recent_log_text()}"
+        )
+
+    async def stop(self, *, timeout: float = 5.0) -> None:
+        """Terminate the subprocess and stop log capture tasks."""
+        process = self.process
+        if process is not None and process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        await self._stop_log_capture()
+
+    def recent_log_text(self) -> str:
+        """Return captured stdout/stderr text for diagnostics."""
+        return "\n".join(f"{line.stream}: {line.text}" for line in self.logs)
+
+    def _prepare_directories(self) -> None:
+        if self.config.settings.kv_cache_enabled:
+            self.config.kv_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.settings.trace_enabled:
+            self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def _start_log_capture(self) -> None:
+        if self.process is None:
+            return
+        if self.process.stdout is not None:
+            self._log_tasks.append(
+                asyncio.create_task(self._capture_stream("stdout", self.process.stdout))
+            )
+        if self.process.stderr is not None:
+            self._log_tasks.append(
+                asyncio.create_task(self._capture_stream("stderr", self.process.stderr))
+            )
+
+    async def _stop_log_capture(self) -> None:
+        if not self._log_tasks:
+            return
+        await asyncio.gather(*self._log_tasks, return_exceptions=True)
+        self._log_tasks.clear()
+
+    async def _capture_stream(
+        self,
+        stream: Literal["stdout", "stderr"],
+        reader: asyncio.StreamReader,
+    ) -> None:
+        while True:
+            line = await reader.readline()
+            if not line:
+                return
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            self.logs.append(DS4LogLine(stream, text, time.monotonic()))
+            if len(self.logs) > self.max_log_lines:
+                del self.logs[: len(self.logs) - self.max_log_lines]
