@@ -10,7 +10,13 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyError, DS4ProxyResponse
+from omlx.ds4_process import DS4LogLine
+from omlx.engine.ds4 import (
+    DS4ProcessEngine,
+    DS4ProxyError,
+    DS4ProxyResponse,
+    parse_ds4_progress_log_line,
+)
 from omlx.engine_pool import EnginePool
 from omlx.server import ServerState, app
 from omlx.settings import DS4_THINK_MAX_CONTEXT_TOKENS, DS4Settings
@@ -80,6 +86,97 @@ def _pool_with_ds4(tmp_path, *, ds4_enabled: bool = True) -> EnginePool:
     pool._get_final_ceiling = lambda: 0
     pool.discover_models(str(tmp_path))
     return pool
+
+
+def test_parse_ds4_progress_log_lines():
+    """DS4 server progress logs expose phase and token-rate details."""
+    prefill = parse_ds4_progress_log_line(
+        "stderr: ds4-server: chat ctx=0..100 RESPPROTO,TOOLS prefill "
+        "chunk 250/1000 (25.0%) chunk=125.50 t/s avg=83.33 t/s 3.000s"
+    )
+    decode = parse_ds4_progress_log_line(
+        "stderr: ds4-server: completion ctx=100..104 gen=4 RESPPROTO "
+        "decoding chunk=10.00 t/s avg=8.00 t/s 0.500s"
+    )
+
+    assert prefill == {
+        "kind": "chat",
+        "phase": "prefill",
+        "phase_type": "prefill",
+        "current_tokens": 250,
+        "total_tokens": 1000,
+        "percent": 25.0,
+        "chunk_tokens_per_second": 125.5,
+        "average_tokens_per_second": 83.33,
+        "elapsed_seconds": 3.0,
+    }
+    assert decode == {
+        "kind": "completion",
+        "phase": "decoding",
+        "phase_type": "generation",
+        "generated_tokens": 4,
+        "chunk_tokens_per_second": 10.0,
+        "average_tokens_per_second": 8.0,
+        "elapsed_seconds": 0.5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_activity_snapshot_surfaces_progress(
+    monkeypatch, tmp_path
+):
+    """Active Models can show DS4 phase/TPS from captured ds4-server logs."""
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    FakeManagedProcess.instances[0].logs.append(
+        DS4LogLine(
+            "stderr",
+            "ds4-server: chat ctx=0..100 prefill chunk 250/1000 "
+            "(25.0%) chunk=125.50 t/s avg=83.33 t/s 3.000s",
+            1.0,
+        )
+    )
+    await engine.begin_proxy_request_window()
+    try:
+        with patch("omlx.engine.ds4.time.monotonic", return_value=4.5):
+            snapshot = engine.get_activity_snapshot()
+            stats = engine.get_stats()
+    finally:
+        engine.end_proxy_request_window()
+        await engine.stop()
+
+    assert snapshot["active_requests"] == 1
+    assert snapshot["activities"] == [
+        {
+            "request_id": "ds4-foo",
+            "kind": "ds4_proxy",
+            "detail": "DS4 prefill 25.0%",
+            "active_requests": 1,
+            "elapsed_seconds": 3.0,
+            "last_activity_age_seconds": 3.5,
+            "current_tokens": 250,
+            "total_tokens": 1000,
+            "token_count": 250,
+            "tokens_per_second": 83.33,
+            "chunk_tokens_per_second": 125.5,
+            "ds4_phase": "prefill",
+            "ds4_phase_type": "prefill",
+        }
+    ]
+    assert stats["active_requests"] == 1
+    assert stats["progress"]["average_tokens_per_second"] == 83.33
 
 
 @pytest.mark.asyncio

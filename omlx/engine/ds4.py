@@ -9,6 +9,7 @@ methods still raise clear errors for endpoints that are not proxied yet.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -25,6 +26,55 @@ from .base import BaseEngine, GenerationOutput
 
 class DS4ProxyError(RuntimeError):
     """Raised when OMLX cannot contact the managed DS4 backend."""
+
+
+_DS4_NUMBER_RE = r"[-+]?\d+(?:\.\d+)?"
+_DS4_PREFILL_PROGRESS_RE = re.compile(
+    rf"ds4-server: (?P<kind>chat|completion) ctx=.*? "
+    rf"(?:[A-Z_,]+ )?(?P<phase>.+?) chunk (?P<current>\d+)/(?P<total>\d+) "
+    rf"\((?P<percent>{_DS4_NUMBER_RE})%\) "
+    rf"chunk=(?P<chunk_tps>{_DS4_NUMBER_RE}) t/s "
+    rf"avg=(?P<avg_tps>{_DS4_NUMBER_RE}) t/s "
+    rf"(?P<elapsed>{_DS4_NUMBER_RE})s"
+)
+_DS4_DECODE_PROGRESS_RE = re.compile(
+    rf"ds4-server: (?P<kind>chat|completion) ctx=.*? "
+    rf"gen=(?P<generated>\d+).*? decoding "
+    rf"chunk=(?P<chunk_tps>{_DS4_NUMBER_RE}) t/s "
+    rf"avg=(?P<avg_tps>{_DS4_NUMBER_RE}) t/s "
+    rf"(?P<elapsed>{_DS4_NUMBER_RE})s"
+)
+
+
+def _ds4_progress_float(value: str) -> float:
+    return round(float(value), 3)
+
+
+def parse_ds4_progress_log_line(line: str) -> dict[str, Any] | None:
+    """Parse one DS4 server progress log line into admin/UI metrics."""
+    if match := _DS4_PREFILL_PROGRESS_RE.search(line):
+        return {
+            "kind": match.group("kind"),
+            "phase": match.group("phase").strip(),
+            "phase_type": "prefill",
+            "current_tokens": int(match.group("current")),
+            "total_tokens": int(match.group("total")),
+            "percent": _ds4_progress_float(match.group("percent")),
+            "chunk_tokens_per_second": _ds4_progress_float(match.group("chunk_tps")),
+            "average_tokens_per_second": _ds4_progress_float(match.group("avg_tps")),
+            "elapsed_seconds": _ds4_progress_float(match.group("elapsed")),
+        }
+    if match := _DS4_DECODE_PROGRESS_RE.search(line):
+        return {
+            "kind": match.group("kind"),
+            "phase": "decoding",
+            "phase_type": "generation",
+            "generated_tokens": int(match.group("generated")),
+            "chunk_tokens_per_second": _ds4_progress_float(match.group("chunk_tps")),
+            "average_tokens_per_second": _ds4_progress_float(match.group("avg_tps")),
+            "elapsed_seconds": _ds4_progress_float(match.group("elapsed")),
+        }
+    return None
 
 
 @dataclass(frozen=True)
@@ -299,10 +349,13 @@ class DS4ProcessEngine(BaseEngine):
             if self._active_requests > 0:
                 self._active_requests -= 1
 
+    def _active_request_count(self) -> int:
+        with self._active_requests_lock:
+            return self._active_requests
+
     def has_active_requests(self) -> bool:
         """Return True while OMLX is proxying requests to DS4."""
-        with self._active_requests_lock:
-            return self._active_requests > 0
+        return self._active_request_count() > 0
 
     def _backend_url(self, path: str) -> str:
         if self.port is None or not self.is_running:
@@ -501,6 +554,65 @@ class DS4ProcessEngine(BaseEngine):
         except Exception:  # noqa: BLE001 - status should be best-effort only
             return None
 
+    def _latest_progress_from_logs(self) -> dict[str, Any] | None:
+        process = self.process
+        if process is None:
+            return None
+        for log_line in reversed(getattr(process, "logs", [])):
+            progress = parse_ds4_progress_log_line(str(getattr(log_line, "text", "")))
+            if progress is None:
+                continue
+            monotonic_time = getattr(log_line, "monotonic_time", None)
+            if isinstance(monotonic_time, int | float):
+                progress["last_activity_age_seconds"] = max(
+                    0.0,
+                    time.monotonic() - float(monotonic_time),
+                )
+            return progress
+        return None
+
+    def get_activity_snapshot(self) -> dict[str, Any]:
+        """Return best-effort DS4 proxy progress for the Active Models UI."""
+        active_requests = self._active_request_count()
+        if active_requests <= 0:
+            return {"active_requests": 0, "activities": []}
+
+        progress = self._latest_progress_from_logs() or {}
+        phase = progress.get("phase") or "proxying"
+        detail = f"DS4 {phase}"
+        percent = progress.get("percent")
+        if isinstance(percent, int | float):
+            detail = f"{detail} {percent:.1f}%"
+        if active_requests > 1:
+            detail = f"{detail} · {active_requests} req"
+
+        activity: dict[str, Any] = {
+            "request_id": f"ds4-{self.model_id}",
+            "kind": "ds4_proxy",
+            "detail": detail,
+            "active_requests": active_requests,
+        }
+        if progress:
+            activity.update(
+                {
+                    "elapsed_seconds": progress.get("elapsed_seconds"),
+                    "last_activity_age_seconds": progress.get(
+                        "last_activity_age_seconds"
+                    ),
+                    "current_tokens": progress.get("current_tokens"),
+                    "total_tokens": progress.get("total_tokens"),
+                    "token_count": progress.get("generated_tokens")
+                    or progress.get("current_tokens"),
+                    "tokens_per_second": progress.get("average_tokens_per_second"),
+                    "chunk_tokens_per_second": progress.get(
+                        "chunk_tokens_per_second"
+                    ),
+                    "ds4_phase": progress.get("phase"),
+                    "ds4_phase_type": progress.get("phase_type"),
+                }
+            )
+        return {"active_requests": active_requests, "activities": [activity]}
+
     def get_stats(self) -> dict[str, Any]:
         """Return DS4 lifecycle/status fields for admin/status endpoints."""
         if self.has_crashed():
@@ -508,6 +620,8 @@ class DS4ProcessEngine(BaseEngine):
         command = self.process.command if self.process is not None else None
         logs = self.process.recent_log_text() if self.process is not None else ""
         log_path = getattr(self.process, "log_path", None)
+        active_requests = self._active_request_count()
+        progress = self._latest_progress_from_logs() if active_requests > 0 else None
         return {
             "backend": "ds4",
             "host": DS4_HOST,
@@ -524,6 +638,8 @@ class DS4ProcessEngine(BaseEngine):
             "log_path": str(log_path) if log_path is not None else None,
             "rss_bytes": self.get_process_rss_bytes(),
             "context_tokens": self.effective_context_tokens(),
+            "active_requests": active_requests,
+            "progress": progress,
             "command": command,
             "recent_logs": logs,
         }

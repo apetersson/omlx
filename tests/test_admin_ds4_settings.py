@@ -547,6 +547,18 @@ def test_dashboard_saves_ds4_context_only_for_ds4_models():
     assert "{ ds4_context_tokens: this.modelSettings.ds4_context_tokens || null }" in js
 
 
+def test_dashboard_formats_ds4_activity_phase_tps_metadata():
+    """Active Models activity rows can display DS4 phase/token-rate metadata."""
+    js = (_PROJECT_ROOT / "omlx/admin/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "activity.current_tokens" in js
+    assert "activity.total_tokens" in js
+    assert "activity.tokens_per_second" in js
+    assert "activity.chunk_tokens_per_second" in js
+
+
 def test_global_settings_ui_exposes_ds4_backend_controls():
     """Admin global settings includes DS4 backend status and launch controls."""
     template = (_PROJECT_ROOT / "omlx/admin/templates/dashboard/_settings.html").read_text(

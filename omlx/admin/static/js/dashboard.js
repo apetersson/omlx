@@ -2414,7 +2414,17 @@
                 const parts = [];
                 if (activity.input_count != null) parts.push(activity.input_count + ' inputs');
                 if (activity.document_count != null) parts.push(activity.document_count + ' docs');
-                if (activity.token_count != null) parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                if (activity.current_tokens != null && activity.total_tokens != null) {
+                    parts.push(this.formatTokenCount(activity.current_tokens) + ' / ' + this.formatTokenCount(activity.total_tokens) + ' tok');
+                } else if (activity.token_count != null) {
+                    parts.push(this.formatTokenCount(activity.token_count) + ' tok');
+                }
+                if (activity.tokens_per_second != null && Number.isFinite(activity.tokens_per_second)) {
+                    parts.push(activity.tokens_per_second.toFixed(1) + ' tok/s');
+                }
+                if (activity.chunk_tokens_per_second != null && Number.isFinite(activity.chunk_tokens_per_second)) {
+                    parts.push('chunk ' + activity.chunk_tokens_per_second.toFixed(1) + ' tok/s');
+                }
                 if (activity.text_length != null) parts.push(activity.text_length + ' chars');
                 if (activity.chunk_count != null) parts.push(activity.chunk_count + ' chunks');
                 if (activity.output_bytes != null) parts.push(this.formatByteCount(activity.output_bytes));
