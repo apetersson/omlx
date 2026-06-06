@@ -154,6 +154,19 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.completion_response_body = b'{"ds4_completion":true,"choices":[]}'
         self.responses_response_body = b'{"ds4_response":true,"output":[]}'
         self.anthropic_response_body = b'{"type":"message","content":[]}'
+        self.chat_stream_chunks = [b"data: one\n\n", b"data: [DONE]\n\n"]
+        self.completion_stream_chunks = [
+            b"data: completion\n\n",
+            b"data: [DONE]\n\n",
+        ]
+        self.responses_stream_chunks = [
+            b"event: response.output_text.delta\n",
+            b"data: {}\n\n",
+        ]
+        self.anthropic_stream_chunks = [
+            b"event: content_block_delta\n",
+            b"data: {}\n\n",
+        ]
 
     async def proxy_chat_completion(self, body: dict):
         self.proxy_bodies.append(body)
@@ -166,7 +179,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
     async def open_chat_completion_stream(self, body: dict):
         self.stream_bodies.append(body)
         return _StreamingProxy(
-            chunks=[b"data: one\n\n", b"data: [DONE]\n\n"],
+            chunks=self.chat_stream_chunks,
             headers={"Content-Type": "text/event-stream"},
         )
 
@@ -181,7 +194,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
     async def open_completion_stream(self, body: dict):
         self.completion_stream_bodies.append(body)
         return _StreamingProxy(
-            chunks=[b"data: completion\n\n", b"data: [DONE]\n\n"],
+            chunks=self.completion_stream_chunks,
             headers={"Content-Type": "text/event-stream"},
         )
 
@@ -196,7 +209,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
     async def open_response_stream(self, body: dict):
         self.response_stream_bodies.append(body)
         return _StreamingProxy(
-            chunks=[b"event: response.output_text.delta\n", b"data: {}\n\n"],
+            chunks=self.responses_stream_chunks,
             headers={"Content-Type": "text/event-stream"},
         )
 
@@ -211,7 +224,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
     async def open_anthropic_message_stream(self, body: dict):
         self.anthropic_stream_bodies.append(body)
         return _StreamingProxy(
-            chunks=[b"event: content_block_delta\n", b"data: {}\n\n"],
+            chunks=self.anthropic_stream_chunks,
             headers={"Content-Type": "text/event-stream"},
         )
 
@@ -695,6 +708,14 @@ def test_ds4_usage_parser_handles_openai_responses_and_anthropic_shapes():
         b'{"usage":{"prompt_tokens":10,"completion_tokens":4,'
         b'"cached_tokens":9,"prompt_tokens_details":{"cached_tokens":3}}}'
     ) == (10, 4, 9)
+    assert _ds4_usage_from_body(
+        b'{"response":{"usage":{"input_tokens":13,"output_tokens":7,'
+        b'"input_tokens_details":{"cached_tokens":5}}}}'
+    ) == (13, 7, 5)
+    assert _ds4_usage_from_body(
+        b'{"message":{"usage":{"input_tokens":11,"output_tokens":0,'
+        b'"cache_read_input_tokens":6}}}'
+    ) == (11, 0, 6)
     assert _ds4_usage_from_body(b"not json") == (0, 0, 0)
 
 
@@ -723,6 +744,78 @@ def test_ds4_non_streaming_proxy_records_usage_metrics(tmp_path):
         assert snapshot["total_prompt_tokens"] == 10
         assert snapshot["total_completion_tokens"] == 4
         assert snapshot["total_cached_tokens"] == 3
+    finally:
+        reset_server_metrics()
+
+
+def test_ds4_streaming_proxy_tees_usage_metrics_without_changing_bytes(tmp_path):
+    reset_server_metrics()
+    engine = _FakeDS4Engine(tmp_path)
+    engine.chat_stream_chunks = [
+        b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":10,',
+        b'"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    expected_body = b"".join(engine.chat_stream_chunks)
+
+    try:
+        with _client_with_engine(engine) as (client, _pool):
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "foo",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            ) as response:
+                body = b"".join(response.iter_bytes())
+
+        assert response.status_code == 200
+        assert body == expected_body
+        snapshot = get_server_metrics().get_snapshot(model_id="foo")
+        assert snapshot["total_requests"] == 1
+        assert snapshot["total_prompt_tokens"] == 10
+        assert snapshot["total_completion_tokens"] == 4
+        assert snapshot["total_cached_tokens"] == 3
+    finally:
+        reset_server_metrics()
+
+
+def test_ds4_streaming_proxy_merges_anthropic_usage_events(tmp_path):
+    reset_server_metrics()
+    engine = _FakeDS4Engine(tmp_path)
+    engine.anthropic_stream_chunks = [
+        b'event: message_start\ndata: {"type":"message_start","message":',
+        b'{"usage":{"input_tokens":11,"output_tokens":0,',
+        b'"cache_read_input_tokens":6}}}\n\n',
+        b'event: message_delta\ndata: {"type":"message_delta",',
+        b'"usage":{"output_tokens":5}}\n\n',
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    expected_body = b"".join(engine.anthropic_stream_chunks)
+
+    try:
+        with _client_with_engine(engine) as (client, _pool):
+            with client.stream(
+                "POST",
+                "/v1/messages",
+                json={
+                    "model": "foo",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            ) as response:
+                body = b"".join(response.iter_bytes())
+
+        assert response.status_code == 200
+        assert body == expected_body
+        snapshot = get_server_metrics().get_snapshot(model_id="foo")
+        assert snapshot["total_requests"] == 1
+        assert snapshot["total_prompt_tokens"] == 11
+        assert snapshot["total_completion_tokens"] == 5
+        assert snapshot["total_cached_tokens"] == 6
     finally:
         reset_server_metrics()
 

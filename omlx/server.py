@@ -44,6 +44,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -2804,15 +2805,17 @@ def _ds4_int_usage_value(value: object) -> int:
     return 0
 
 
-def _ds4_usage_from_body(body: bytes) -> tuple[int, int, int]:
-    """Parse DS4 non-streaming usage fields without changing response bytes."""
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
-        return 0, 0, 0
+def _ds4_usage_from_payload(payload: object) -> tuple[int, int, int]:
+    """Parse DS4 usage fields from a decoded response or SSE payload."""
     if not isinstance(payload, dict):
         return 0, 0, 0
     usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        for nested_key in ("response", "message"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict) and isinstance(nested.get("usage"), dict):
+                usage = nested["usage"]
+                break
     if not isinstance(usage, dict):
         return 0, 0, 0
 
@@ -2841,6 +2844,15 @@ def _ds4_usage_from_body(body: bytes) -> tuple[int, int, int]:
     return prompt_tokens, completion_tokens, cached_tokens
 
 
+def _ds4_usage_from_body(body: bytes) -> tuple[int, int, int]:
+    """Parse DS4 non-streaming usage fields without changing response bytes."""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+        return 0, 0, 0
+    return _ds4_usage_from_payload(payload)
+
+
 def _record_ds4_proxy_metrics(
     *,
     body: bytes,
@@ -2858,12 +2870,106 @@ def _record_ds4_proxy_metrics(
     )
 
 
+class _DS4StreamingMetricsTee:
+    """Byte-preserving DS4 SSE metrics tee for streaming proxy responses."""
+
+    def __init__(self, proxy: object, resolved_model: str):
+        self._proxy = proxy
+        self._resolved_model = resolved_model
+        self._started_at = time.perf_counter()
+        self._first_chunk_at: float | None = None
+        self._buffer = b""
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._cached_tokens = 0
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _observe_payload(self, payload: object) -> None:
+        prompt_tokens, completion_tokens, cached_tokens = _ds4_usage_from_payload(
+            payload
+        )
+        self._prompt_tokens = max(self._prompt_tokens, prompt_tokens)
+        self._completion_tokens = max(self._completion_tokens, completion_tokens)
+        self._cached_tokens = max(self._cached_tokens, cached_tokens)
+
+    def _observe_sse_data(self, data: bytes) -> None:
+        stripped = data.strip()
+        if not stripped or stripped == b"[DONE]":
+            return
+        try:
+            payload = json.loads(stripped)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+            return
+        self._observe_payload(payload)
+
+    def _observe_chunk(self, chunk: bytes) -> None:
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            if line.startswith(b"data:"):
+                self._observe_sse_data(line[5:])
+
+    def _observe_remaining_buffer(self) -> None:
+        if not self._buffer:
+            return
+        line = self._buffer.rstrip(b"\r")
+        self._buffer = b""
+        if line.startswith(b"data:"):
+            self._observe_sse_data(line[5:])
+
+    def iter_bytes(self):
+        try:
+            for chunk in self._proxy.iter_bytes():
+                if chunk and self._first_chunk_at is None:
+                    self._first_chunk_at = time.perf_counter()
+                if chunk:
+                    self._observe_chunk(chunk)
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._observe_remaining_buffer()
+            finished_at = time.perf_counter()
+            first_chunk_at = self._first_chunk_at
+            prompt_tokens = self._prompt_tokens
+            completion_tokens = self._completion_tokens
+            cached_tokens = self._cached_tokens
+        close = getattr(self._proxy, "close", None)
+        if callable(close):
+            close()
+        if first_chunk_at is None:
+            prefill_duration = max(finished_at - self._started_at, 0.0)
+            generation_duration = 0.0
+        else:
+            prefill_duration = max(first_chunk_at - self._started_at, 0.0)
+            generation_duration = max(finished_at - first_chunk_at, 0.0)
+        get_server_metrics().record_request_complete(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            prefill_duration=prefill_duration,
+            generation_duration=generation_duration,
+            model_id=self._resolved_model,
+        )
+
+
 class _DS4StreamingResponse(StreamingResponse):
     """StreamingResponse variant that always closes its DS4 upstream proxy."""
 
-    def __init__(self, proxy: object, **kwargs):
-        self._ds4_proxy = proxy
-        super().__init__(proxy.iter_bytes(), **kwargs)
+    def __init__(self, proxy: object, *, resolved_model: str | None = None, **kwargs):
+        self._ds4_proxy = (
+            _DS4StreamingMetricsTee(proxy, resolved_model)
+            if resolved_model is not None
+            else proxy
+        )
+        super().__init__(self._ds4_proxy.iter_bytes(), **kwargs)
 
     async def __call__(self, scope, receive, send) -> None:
         try:
@@ -2888,6 +2994,7 @@ async def _create_ds4_text_completion(
             proxy = await engine.open_completion_stream(body)
             return _DS4StreamingResponse(
                 proxy,
+                resolved_model=resolved_model,
                 status_code=proxy.status_code,
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
@@ -2926,6 +3033,7 @@ async def _create_ds4_response(
             proxy = await engine.open_response_stream(body)
             return _DS4StreamingResponse(
                 proxy,
+                resolved_model=resolved_model,
                 status_code=proxy.status_code,
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
@@ -2964,6 +3072,7 @@ async def _create_ds4_anthropic_message(
             proxy = await engine.open_anthropic_message_stream(body)
             return _DS4StreamingResponse(
                 proxy,
+                resolved_model=resolved_model,
                 status_code=proxy.status_code,
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
@@ -3002,6 +3111,7 @@ async def _create_ds4_chat_completion(
             proxy = await engine.open_chat_completion_stream(body)
             return _DS4StreamingResponse(
                 proxy,
+                resolved_model=resolved_model,
                 status_code=proxy.status_code,
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
