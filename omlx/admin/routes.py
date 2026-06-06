@@ -239,6 +239,18 @@ class GlobalSettingsRequest(BaseModel):
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
+    # DS4/GGUF backend settings
+    ds4_enabled: bool | None = None
+    ds4_support_dir: str | None = None
+    ds4_context_default_tokens: int | None = None
+    ds4_ready_timeout_ms: int | None = None
+    ds4_kv_cache_enabled: bool | None = None
+    ds4_kv_root: str | None = None
+    ds4_kv_disk_space_mb: int | None = None
+    ds4_kv_cache_continued_interval_tokens: int | None = None
+    ds4_ssd_streaming: str | None = None
+    ds4_power: int | None = None
+
     # MCP settings
     mcp_config: str | None = None
 
@@ -1047,6 +1059,20 @@ def set_hf_uploader(uploader):
 # =============================================================================
 
 
+def _clean_optional_setting_path(value: str | None) -> str | None:
+    """Return a stripped optional path value, treating blanks as unset."""
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _restore_settings_values(target: Any, values: dict[str, Any]) -> None:
+    """Restore a settings dataclass/dict-like object from a value snapshot."""
+    for key, value in values.items():
+        setattr(target, key, value)
+
+
 def format_size(size_bytes: int) -> str:
     """
     Format a byte size as a human-readable string.
@@ -1657,6 +1683,67 @@ def _admin_ds4_status(ds4_status: dict[str, Any] | None) -> dict[str, Any] | Non
     if isinstance(recent_logs, str):
         status["recent_log_lines"] = recent_logs.splitlines()[-50:]
     return status
+
+
+def _admin_ds4_global_status(engine_pool: Any, *, enabled: bool) -> dict[str, Any]:
+    """Summarize DS4 model lifecycle state for global settings UI."""
+    summary: dict[str, Any] = {
+        "status": "disabled" if not enabled else "no_models",
+        "available_models": 0,
+        "loaded_count": 0,
+        "running_count": 0,
+        "crashed_count": 0,
+        "loading_count": 0,
+        "loaded_models": [],
+    }
+    if engine_pool is None:
+        return summary
+    try:
+        pool_status = engine_pool.get_status()
+    except Exception as e:  # noqa: BLE001 - status UI must remain best-effort
+        logger.debug("Failed to collect DS4 global status: %s", e)
+        return summary
+
+    loaded_models: list[dict[str, Any]] = []
+    for model in pool_status.get("models", []):
+        if model.get("engine_type") != "ds4":
+            continue
+        summary["available_models"] += 1
+        if model.get("is_loading"):
+            summary["loading_count"] += 1
+        if not model.get("loaded"):
+            continue
+        summary["loaded_count"] += 1
+        ds4_status = _admin_ds4_status(model.get("ds4"))
+        lifecycle = ds4_status.get("status") if ds4_status else "loaded"
+        if ds4_status and ds4_status.get("running"):
+            summary["running_count"] += 1
+        if ds4_status and ds4_status.get("crashed"):
+            summary["crashed_count"] += 1
+        loaded_models.append(
+            {
+                "id": model.get("id"),
+                "status": lifecycle,
+                "context_tokens": (ds4_status or {}).get("context_tokens"),
+                "rss_formatted": (ds4_status or {}).get("rss_formatted"),
+                "log_path": (ds4_status or {}).get("log_path"),
+            }
+        )
+
+    if not enabled:
+        summary["status"] = "disabled"
+    elif summary["crashed_count"]:
+        summary["status"] = "crashed"
+    elif summary["running_count"]:
+        summary["status"] = "running"
+    elif summary["loading_count"]:
+        summary["status"] = "loading"
+    elif summary["loaded_count"]:
+        summary["status"] = "loaded"
+    elif summary["available_models"]:
+        summary["status"] = "idle"
+    summary["loaded_models"] = loaded_models[:10]
+    return summary
 
 
 @router.get("/api/models")
@@ -2939,6 +3026,15 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
     )
     disk_info = get_ssd_disk_info(cache_dir)
 
+    ds4_auto_context = global_settings.ds4.get_auto_context_tokens(
+        memory_info["total_bytes"] or None
+    )
+    engine_pool = _get_engine_pool() if callable(_get_engine_pool) else None
+    ds4_global_status = _admin_ds4_global_status(
+        engine_pool,
+        enabled=global_settings.ds4.enabled,
+    )
+
     return {
         "base_path": str(global_settings.base_path),
         "server": {
@@ -2984,6 +3080,35 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
+        },
+        "ds4": {
+            "enabled": global_settings.ds4.enabled,
+            "support_dir": str(
+                global_settings.ds4.get_support_dir(global_settings.base_path)
+            ),
+            "context_default_tokens": global_settings.ds4.context_default_tokens,
+            "auto_context_tokens": ds4_auto_context,
+            "auto_context_tokens_formatted": f"{ds4_auto_context:,}",
+            "ready_timeout_ms": global_settings.ds4.ready_timeout_ms,
+            "kv_cache_enabled": global_settings.ds4.kv_cache_enabled,
+            "kv_root": str(global_settings.ds4.get_kv_root(global_settings.base_path)),
+            "kv_disk_space_mb": global_settings.ds4.kv_disk_space_mb,
+            "kv_disk_space_formatted": format_size(
+                global_settings.ds4.kv_disk_space_mb * 1024 * 1024
+            ),
+            "kv_cache_continued_interval_tokens": (
+                global_settings.ds4.kv_cache_continued_interval_tokens
+            ),
+            "ssd_streaming": global_settings.ds4.ssd_streaming,
+            "power": global_settings.ds4.power,
+            "trace_enabled": global_settings.ds4.trace_enabled,
+            "trace_dir": str(
+                global_settings.ds4.get_trace_dir(global_settings.base_path)
+            ),
+            "debug_dir": str(
+                global_settings.ds4.get_debug_dir(global_settings.base_path)
+            ),
+            **ds4_global_status,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -3094,6 +3219,7 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    previous_ds4_settings: dict[str, Any] | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -3588,6 +3714,53 @@ async def update_global_settings(
         )
         runtime_applied.append("skip_api_key_verification")
 
+    # Apply DS4/GGUF backend settings after earlier request-specific validation.
+    # Final global validation/save failures still roll this in-memory object back.
+    ds4_changed = False
+    if any(field.startswith("ds4_") for field in request.model_fields_set):
+        previous_ds4_settings = global_settings.ds4.to_dict()
+    if request.ds4_enabled is not None:
+        global_settings.ds4.enabled = request.ds4_enabled
+        ds4_changed = True
+    if "ds4_support_dir" in request.model_fields_set:
+        global_settings.ds4.support_dir = _clean_optional_setting_path(
+            request.ds4_support_dir
+        )
+        ds4_changed = True
+    if "ds4_context_default_tokens" in request.model_fields_set:
+        value = request.ds4_context_default_tokens
+        global_settings.ds4.context_default_tokens = (
+            None if value in (None, 0) else value
+        )
+        ds4_changed = True
+    if request.ds4_ready_timeout_ms is not None:
+        global_settings.ds4.ready_timeout_ms = request.ds4_ready_timeout_ms
+        ds4_changed = True
+    if request.ds4_kv_cache_enabled is not None:
+        global_settings.ds4.kv_cache_enabled = request.ds4_kv_cache_enabled
+        ds4_changed = True
+    if "ds4_kv_root" in request.model_fields_set:
+        global_settings.ds4.kv_root = _clean_optional_setting_path(request.ds4_kv_root)
+        ds4_changed = True
+    if request.ds4_kv_disk_space_mb is not None:
+        global_settings.ds4.kv_disk_space_mb = request.ds4_kv_disk_space_mb
+        ds4_changed = True
+    if request.ds4_kv_cache_continued_interval_tokens is not None:
+        global_settings.ds4.kv_cache_continued_interval_tokens = (
+            request.ds4_kv_cache_continued_interval_tokens
+        )
+        ds4_changed = True
+    if request.ds4_ssd_streaming is not None:
+        global_settings.ds4.ssd_streaming = request.ds4_ssd_streaming
+        ds4_changed = True
+    if request.ds4_power is not None:
+        global_settings.ds4.power = request.ds4_power
+        ds4_changed = True
+
+    if ds4_changed:
+        runtime_applied.append("ds4")
+        logger.info("DS4 backend settings updated")
+
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
@@ -3599,6 +3772,8 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_ds4_settings is not None:
+            _restore_settings_values(global_settings.ds4, previous_ds4_settings)
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -3609,6 +3784,8 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_ds4_settings is not None:
+            _restore_settings_values(global_settings.ds4, previous_ds4_settings)
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
     if pending_embedding_batch_size is not None:

@@ -12,7 +12,7 @@ from omlx.admin import routes as admin_routes
 from omlx.engine.ds4 import DS4ProxyError
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.model_settings import ModelSettings
-from omlx.settings import DS4_MAX_CONTEXT_TOKENS
+from omlx.settings import DS4_MAX_CONTEXT_TOKENS, GlobalSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -62,6 +62,177 @@ def _ds4_pool(model_path: str = "/models/Foo.gguf") -> EnginePool:
         estimated_size=1000,
     )
     return pool
+
+
+def _memory_info(total_bytes: int) -> dict[str, int | str]:
+    return {
+        "total_bytes": total_bytes,
+        "total_formatted": "128.00 GB",
+        "auto_limit_formatted": "102.40 GB",
+        "available_bytes": 0,
+        "omlx_phys_footprint_bytes": 0,
+        "free_memory_bytes": 0,
+        "inactive_memory_bytes": 0,
+        "active_memory_bytes": 0,
+        "iogpu_wired_limit_bytes": 0,
+        "omlx_wired_limit_request_bytes": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_global_settings_exposes_ds4_backend_controls(monkeypatch, tmp_path):
+    """Global settings API includes DS4 defaults, paths, and lifecycle status."""
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.cache.ssd_cache_max_size = "1GB"
+    settings.ds4.kv_disk_space_mb = 1234
+    settings.ds4.kv_cache_continued_interval_tokens = 4096
+    settings.ds4.ssd_streaming = "on"
+    settings.ds4.power = 77
+    pool = _ds4_pool()
+    pool.get_entry("foo").engine = _FakeStatusDS4Engine()
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(
+        admin_routes,
+        "get_system_memory_info",
+        lambda: _memory_info(128 * 1024**3),
+    )
+    monkeypatch.setattr(
+        admin_routes,
+        "get_ssd_disk_info",
+        lambda _path: {"total_bytes": 10**12, "total_formatted": "1.00 TB"},
+    )
+
+    result = await admin_routes.get_global_settings(is_admin=True)
+
+    ds4 = result["ds4"]
+    assert ds4["enabled"] is True
+    assert ds4["support_dir"] == str(tmp_path / "support" / "ds4")
+    assert ds4["context_default_tokens"] is None
+    assert ds4["auto_context_tokens"] == 100_000
+    assert ds4["auto_context_tokens_formatted"] == "100,000"
+    assert ds4["kv_cache_enabled"] is True
+    assert ds4["kv_root"] == str(tmp_path / "ds4-kv")
+    assert ds4["kv_disk_space_mb"] == 1234
+    assert ds4["kv_cache_continued_interval_tokens"] == 4096
+    assert ds4["ssd_streaming"] == "on"
+    assert ds4["power"] == 77
+    assert ds4["status"] == "running"
+    assert ds4["available_models"] == 1
+    assert ds4["loaded_count"] == 1
+    assert ds4["running_count"] == 1
+    assert ds4["loaded_models"][0]["id"] == "foo"
+
+
+@pytest.mark.asyncio
+async def test_update_global_settings_saves_ds4_backend_controls(monkeypatch, tmp_path):
+    """Global settings save path persists DS4 launch controls."""
+    settings = GlobalSettings(base_path=tmp_path)
+    save = MagicMock()
+    monkeypatch.setattr(settings, "save", save)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    result = await admin_routes.update_global_settings(
+        admin_routes.GlobalSettingsRequest(
+            ds4_enabled=False,
+            ds4_support_dir="  /tmp/ds4-support  ",
+            ds4_context_default_tokens=100_000,
+            ds4_ready_timeout_ms=42,
+            ds4_kv_cache_enabled=False,
+            ds4_kv_root="  /tmp/ds4-kv  ",
+            ds4_kv_disk_space_mb=1234,
+            ds4_kv_cache_continued_interval_tokens=4096,
+            ds4_ssd_streaming="on",
+            ds4_power=77,
+        ),
+        is_admin=True,
+    )
+
+    assert result["success"] is True
+    assert "ds4" in result["runtime_applied"]
+    assert settings.ds4.enabled is False
+    assert settings.ds4.support_dir == "/tmp/ds4-support"
+    assert settings.ds4.context_default_tokens == 100_000
+    assert settings.ds4.ready_timeout_ms == 42
+    assert settings.ds4.kv_cache_enabled is False
+    assert settings.ds4.kv_root == "/tmp/ds4-kv"
+    assert settings.ds4.kv_disk_space_mb == 1234
+    assert settings.ds4.kv_cache_continued_interval_tokens == 4096
+    assert settings.ds4.ssd_streaming == "on"
+    assert settings.ds4.power == 77
+    save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_global_settings_clears_ds4_context_to_auto(
+    monkeypatch,
+    tmp_path,
+):
+    """Global DS4 context default supports returning to adaptive auto mode."""
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.ds4.context_default_tokens = 100_000
+    save = MagicMock()
+    monkeypatch.setattr(settings, "save", save)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    await admin_routes.update_global_settings(
+        admin_routes.GlobalSettingsRequest(ds4_context_default_tokens=0),
+        is_admin=True,
+    )
+
+    assert settings.ds4.context_default_tokens is None
+    save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_global_settings_rejects_invalid_ds4_controls(
+    monkeypatch,
+    tmp_path,
+):
+    """DS4 global settings still flow through central validation."""
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.ds4.power = 77
+    save = MagicMock()
+    monkeypatch.setattr(settings, "save", save)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_routes.update_global_settings(
+            admin_routes.GlobalSettingsRequest(ds4_power=101),
+            is_admin=True,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "ds4.power" in str(exc_info.value.detail)
+    assert settings.ds4.power == 77
+    save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_global_settings_does_not_mutate_ds4_on_other_rejections(
+    monkeypatch,
+    tmp_path,
+):
+    """Rejected non-DS4 fields do not leak paired DS4 changes into memory."""
+    settings = GlobalSettings(base_path=tmp_path)
+    settings.ds4.power = 77
+    save = MagicMock()
+    monkeypatch.setattr(settings, "save", save)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_routes.update_global_settings(
+            admin_routes.GlobalSettingsRequest(
+                ds4_power=66,
+                markitdown_max_file_size_mb=0,
+            ),
+            is_admin=True,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "markitdown_max_file_size_mb" in exc_info.value.detail
+    assert settings.ds4.power == 77
+    save.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -376,6 +547,41 @@ def test_dashboard_saves_ds4_context_only_for_ds4_models():
     assert "{ ds4_context_tokens: this.modelSettings.ds4_context_tokens || null }" in js
 
 
+def test_global_settings_ui_exposes_ds4_backend_controls():
+    """Admin global settings includes DS4 backend status and launch controls."""
+    template = (_PROJECT_ROOT / "omlx/admin/templates/dashboard/_settings.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "settings.ds4.section_label" in template
+    assert "globalSettings.ds4.status" in template
+    assert "globalSettings.ds4.enabled" in template
+    assert "globalSettings.ds4.support_dir" in template
+    assert "globalSettings.ds4.context_default_tokens" in template
+    assert "globalSettings.ds4.kv_cache_enabled" in template
+    assert "globalSettings.ds4.kv_root" in template
+    assert "globalSettings.ds4.kv_disk_space_mb" in template
+    assert "globalSettings.ds4.ssd_streaming" in template
+    assert "globalSettings.ds4.power" in template
+
+
+def test_dashboard_saves_ds4_global_settings():
+    """Frontend payload persists DS4 global backend settings."""
+    js = (_PROJECT_ROOT / "omlx/admin/static/js/dashboard.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ds4: { ...this.globalSettings.ds4, ...data.ds4 }" in js
+    assert "ds4_enabled: this.globalSettings.ds4.enabled" in js
+    assert "ds4_support_dir: this.globalSettings.ds4.support_dir" in js
+    assert "ds4_context_default_tokens: this.globalSettings.ds4.context_default_tokens || null" in js
+    assert "ds4_kv_cache_enabled: this.globalSettings.ds4.kv_cache_enabled" in js
+    assert "ds4_kv_root: this.globalSettings.ds4.kv_root" in js
+    assert "ds4_kv_disk_space_mb: this.globalSettings.ds4.kv_disk_space_mb" in js
+    assert "ds4_ssd_streaming: this.globalSettings.ds4.ssd_streaming" in js
+    assert "ds4_power: this.globalSettings.ds4.power" in js
+
+
 def test_ds4_context_ui_strings_are_localized():
     """All admin locales include the DS4 context-control strings."""
     required_keys = {
@@ -387,6 +593,18 @@ def test_ds4_context_ui_strings_are_localized():
         "modal.model_settings.ds4_status_context",
         "modal.model_settings.ds4_status_rss",
         "modal.model_settings.ds4_status_log",
+        "settings.ds4.section_label",
+        "settings.ds4.status_label",
+        "settings.ds4.enabled",
+        "settings.ds4.support_dir",
+        "settings.ds4.context_default",
+        "settings.ds4.context_auto",
+        "settings.ds4.kv_cache_enabled",
+        "settings.ds4.kv_root",
+        "settings.ds4.kv_disk_space",
+        "settings.ds4.ssd_streaming",
+        "settings.ds4.power",
+        "settings.ds4.next_launch_badge",
     }
     for path in (_PROJECT_ROOT / "omlx/admin/i18n").glob("*.json"):
         data = json.loads(path.read_text(encoding="utf-8"))
