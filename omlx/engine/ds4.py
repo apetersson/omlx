@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """EnginePool adapter for OMLX-managed DS4 subprocesses.
 
-This adapter intentionally stops at lifecycle management.  Protocol-specific
-request forwarding is implemented in a later slice, so generation methods raise
-clear errors while load/unload/status can already exercise the managed backend.
+This adapter owns DS4 lifecycle management and byte-preserving proxy helpers for
+protocol endpoints that have been wired through OMLX.  BaseEngine generation
+methods still raise clear errors for endpoints that are not proxied yet.
 """
 
 from __future__ import annotations
@@ -243,27 +243,39 @@ class DS4ProcessEngine(BaseEngine):
         finally:
             self._decrement_active_requests()
 
-    async def proxy_chat_completion(self, body: dict[str, Any]) -> DS4ProxyResponse:
-        """Forward one non-streaming OpenAI chat completion request to DS4."""
+    async def _proxy_json_endpoint(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> DS4ProxyResponse:
         self._increment_active_requests()
         task = asyncio.create_task(
             asyncio.to_thread(
                 self._proxy_json_response_blocking,
-                "/v1/chat/completions",
+                path,
                 body,
             )
         )
         return await asyncio.shield(task)
 
-    async def open_chat_completion_stream(
-        self, body: dict[str, Any]
+    async def proxy_chat_completion(self, body: dict[str, Any]) -> DS4ProxyResponse:
+        """Forward one non-streaming OpenAI chat completion request to DS4."""
+        return await self._proxy_json_endpoint("/v1/chat/completions", body)
+
+    async def proxy_completion(self, body: dict[str, Any]) -> DS4ProxyResponse:
+        """Forward one non-streaming OpenAI text completion request to DS4."""
+        return await self._proxy_json_endpoint("/v1/completions", body)
+
+    async def _open_json_stream(
+        self,
+        path: str,
+        body: dict[str, Any],
     ) -> DS4StreamingProxyResponse:
-        """Open a streaming OpenAI chat completion request to DS4."""
         self._increment_active_requests()
         task = asyncio.create_task(
             asyncio.to_thread(
                 self._proxy_json_request_blocking,
-                "/v1/chat/completions",
+                path,
                 body,
                 stream=True,
             )
@@ -305,6 +317,18 @@ class DS4ProcessEngine(BaseEngine):
             session=session,
         )
 
+    async def open_chat_completion_stream(
+        self, body: dict[str, Any]
+    ) -> DS4StreamingProxyResponse:
+        """Open a streaming OpenAI chat completion request to DS4."""
+        return await self._open_json_stream("/v1/chat/completions", body)
+
+    async def open_completion_stream(
+        self, body: dict[str, Any]
+    ) -> DS4StreamingProxyResponse:
+        """Open a streaming OpenAI text completion request to DS4."""
+        return await self._open_json_stream("/v1/completions", body)
+
     def get_process_rss_bytes(self) -> int | None:
         """Return the DS4 subprocess RSS when psutil can observe it."""
         pid = self.pid
@@ -343,11 +367,11 @@ class DS4ProcessEngine(BaseEngine):
         )
 
     async def generate(self, *args, **kwargs) -> GenerationOutput:
-        """Text completions are forwarded in a later DS4 protocol slice."""
+        """Text completions are proxied through the server route."""
         raise self._protocol_not_implemented()
 
     async def stream_generate(self, *args, **kwargs) -> AsyncIterator[GenerationOutput]:
-        """Streaming completions are forwarded in a later DS4 protocol slice."""
+        """Streaming completions are proxied through the server route."""
         raise self._protocol_not_implemented()
         yield  # pragma: no cover - keeps this method an async iterator
 

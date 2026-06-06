@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from omlx.api.openai_models import ChatCompletionRequest, Message
+from omlx.api.openai_models import ChatCompletionRequest, CompletionRequest, Message
 from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyResponse
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
@@ -141,6 +141,8 @@ class _FakeDS4Engine(DS4ProcessEngine):
         super().__init__(model_id="foo", model_path=gguf, base_path=tmp_path)
         self.proxy_bodies: list[dict] = []
         self.stream_bodies: list[dict] = []
+        self.completion_bodies: list[dict] = []
+        self.completion_stream_bodies: list[dict] = []
 
     async def proxy_chat_completion(self, body: dict):
         self.proxy_bodies.append(body)
@@ -154,6 +156,21 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.stream_bodies.append(body)
         return _StreamingProxy(
             chunks=[b"data: one\n\n", b"data: [DONE]\n\n"],
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    async def proxy_completion(self, body: dict):
+        self.completion_bodies.append(body)
+        return DS4ProxyResponse(
+            status_code=202,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            body=b'{"ds4_completion":true,"choices":[]}',
+        )
+
+    async def open_completion_stream(self, body: dict):
+        self.completion_stream_bodies.append(body)
+        return _StreamingProxy(
+            chunks=[b"data: completion\n\n", b"data: [DONE]\n\n"],
             headers={"Content-Type": "text/event-stream"},
         )
 
@@ -203,6 +220,35 @@ async def test_ds4_process_engine_proxies_non_streaming_chat(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_ds4_process_engine_proxies_non_streaming_completion(monkeypatch, tmp_path):
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=tmp_path / "Foo.gguf",
+        base_path=tmp_path,
+    )
+    engine.process = SimpleNamespace(
+        is_running=True,
+        port=49152,
+        process=SimpleNamespace(pid=123),
+        command=[],
+        recent_log_text=lambda: "",
+    )
+    _FakeRequestsSession.instances = []
+    _FakeRequestsSession.next_response = _RequestsResponse(content=b'{"text":"ok"}')
+    monkeypatch.setattr("omlx.engine.ds4.requests.Session", _FakeRequestsSession)
+
+    response = await engine.proxy_completion({"model": "foo", "prompt": "hello"})
+
+    session = _FakeRequestsSession.instances[0]
+    captured = session.calls[0]
+    assert captured["url"] == "http://127.0.0.1:49152/v1/completions"
+    assert captured["json"] == {"model": "foo", "prompt": "hello"}
+    assert captured["stream"] is True
+    assert response.body == b'{"text":"ok"}'
+    assert engine.has_active_requests() is False
+
+
+@pytest.mark.asyncio
 async def test_ds4_process_engine_stream_tracks_active_until_consumed(
     monkeypatch, tmp_path
 ):
@@ -231,6 +277,36 @@ async def test_ds4_process_engine_stream_tracks_active_until_consumed(
     assert session.calls[0]["stream"] is True
     assert backend_response.closed is True
     assert session.closed is True
+    assert engine.has_active_requests() is False
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_completion_stream_uses_completions_endpoint(
+    monkeypatch, tmp_path
+):
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=tmp_path / "Foo.gguf",
+        base_path=tmp_path,
+    )
+    engine.process = SimpleNamespace(
+        is_running=True,
+        port=49152,
+        process=SimpleNamespace(pid=123),
+        command=[],
+        recent_log_text=lambda: "",
+    )
+    backend_response = _RequestsResponse(chunks=[b"data: completion\n\n"])
+    _FakeRequestsSession.instances = []
+    _FakeRequestsSession.next_response = backend_response
+    monkeypatch.setattr("omlx.engine.ds4.requests.Session", _FakeRequestsSession)
+
+    response = await engine.open_completion_stream({"model": "foo", "prompt": "hello"})
+
+    assert list(response.iter_bytes()) == [b"data: completion\n\n"]
+    assert _FakeRequestsSession.instances[0].calls[0]["url"] == (
+        "http://127.0.0.1:49152/v1/completions"
+    )
     assert engine.has_active_requests() is False
 
 
@@ -435,6 +511,79 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
     assert body["max_tokens"] == 123
 
 
+def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(
+    tmp_path,
+):
+    engine = _FakeDS4Engine(tmp_path)
+    settings = ModelSettings(
+        temperature=0.3,
+        top_p=0.6,
+        top_k=9,
+        repetition_penalty=1.1,
+        presence_penalty=0.2,
+        max_tokens=77,
+        force_sampling=True,
+    )
+
+    with _client_with_engine(engine, settings) as (client, pool):
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "foo-chat",
+                "prompt": "complete this",
+                "temperature": 0.95,
+                "top_p": 0.85,
+                "echo": True,
+                "logprobs": 2,
+                "suffix": " after",
+                "best_of": 3,
+                "logit_bias": {"42": -1},
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.content == b'{"ds4_completion":true,"choices":[]}'
+    assert pool.requested_model_ids == ["foo"]
+    body = engine.completion_bodies[0]
+    assert body["model"] == "deepseek-chat"
+    assert body["prompt"] == "complete this"
+    assert body["echo"] is True
+    assert body["logprobs"] == 2
+    assert body["suffix"] == " after"
+    assert body["best_of"] == 3
+    assert body["logit_bias"] == {"42": -1}
+    assert body["temperature"] == 0.95
+    assert body["top_p"] == 0.85
+    assert body["top_k"] == 9
+    assert body["repetition_penalty"] == 1.1
+    assert body["presence_penalty"] == 0.2
+    assert body["frequency_penalty"] == 0.0
+    assert body["xtc_probability"] == 0.0
+    assert body["xtc_threshold"] == 0.1
+    assert body["max_tokens"] == 77
+
+
+def test_ds4_completion_streaming_preserves_backend_sse_bytes(tmp_path):
+    engine = _FakeDS4Engine(tmp_path)
+
+    with _client_with_engine(engine) as (client, _pool):
+        with client.stream(
+            "POST",
+            "/v1/completions",
+            json={
+                "model": "foo-reasoner",
+                "prompt": "complete this",
+                "stream": True,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes())
+
+    assert response.status_code == 200
+    assert body == b"data: completion\n\ndata: [DONE]\n\n"
+    assert engine.completion_stream_bodies[0]["model"] == "deepseek-reasoner"
+    assert engine.completion_stream_bodies[0]["stream"] is True
+
+
 @pytest.mark.asyncio
 async def test_ds4_streaming_response_closes_proxy_when_send_start_fails():
     from omlx.server import _DS4StreamingResponse
@@ -567,3 +716,33 @@ def test_ds4_think_max_alias_injects_reasoning_effort_with_user_alias(tmp_path):
 
     assert body["model"] == "gpt-4o"
     assert body["reasoning_effort"] == "max"
+
+
+def test_ds4_completion_proxy_body_preserves_reasoning_effort_and_aliases(tmp_path):
+    from omlx.server import _build_ds4_completion_proxy_body
+
+    engine = _FakeDS4Engine(tmp_path)
+    state = ServerState()
+    state.engine_pool = _Pool(engine)
+    state.settings_manager = _SettingsManager(ModelSettings(model_alias="gpt-4o"))
+    request = CompletionRequest(
+        model="gpt-4o-think-max",
+        prompt="complete this",
+        reasoning_effort="low",
+    )
+
+    with patch("omlx.server._server_state", state):
+        body = _build_ds4_completion_proxy_body(request, "foo")
+
+    assert body["model"] == "gpt-4o"
+    assert body["prompt"] == "complete this"
+    assert body["reasoning_effort"] == "max"
+
+    request = CompletionRequest(
+        model="FOO-CHAT",
+        prompt="complete this",
+    )
+    with patch("omlx.server._server_state", state):
+        body = _build_ds4_completion_proxy_body(request, "foo-chat")
+
+    assert body["model"] == "FOO-CHAT"

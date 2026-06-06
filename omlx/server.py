@@ -2379,6 +2379,12 @@ async def create_completion(
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
+    # Resolve alias to real model ID for settings lookups
+    resolved_model = resolve_model_id(request.model) or request.model
+
+    if _is_ds4_completion_proxy_engine(engine):
+        return await _create_ds4_text_completion(engine, request, resolved_model)
+
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
@@ -2486,6 +2492,15 @@ def _is_ds4_chat_proxy_engine(engine: object) -> bool:
     )
 
 
+def _is_ds4_completion_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy text completions to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_completion", None))
+        and callable(getattr(engine, "open_completion_stream", None))
+    )
+
+
 def _ds4_request_uses_suffix_alias(
     request_model: str,
     resolved_model: str,
@@ -2506,10 +2521,12 @@ def _ds4_request_uses_suffix_alias(
         model_alias = getattr(settings, "model_alias", None)
         if model_alias in {request_model, stripped_model}:
             return False
-    return parse_ds4_alias_id(request_model) is not None
+    return parse_ds4_alias_id(stripped_model) is not None
 
 
-def _ds4_sampling_params_without_force(request: ChatCompletionRequest) -> dict:
+def _ds4_sampling_params_without_force(
+    request: ChatCompletionRequest | CompletionRequest,
+) -> dict:
     """Resolve DS4 sampling values without overriding client-supplied fields."""
     global_sampling = _server_state.sampling
     model_settings = None
@@ -2554,28 +2571,27 @@ def _ds4_sampling_params_without_force(request: ChatCompletionRequest) -> dict:
     }
 
 
-def _build_ds4_chat_proxy_body(
-    request: ChatCompletionRequest,
+def _apply_ds4_suffix_alias_to_body(
+    body: dict,
+    *,
+    request_model: str,
     resolved_model: str,
 ) -> dict:
-    """Build the JSON body sent to DS4 for OpenAI chat completions."""
+    """Apply DS4 per-model suffix alias request mutations in-place."""
     from .ds4_aliases import (
         ds4_model_for_alias_kind,
         ds4_reasoning_effort_for_alias_kind,
         parse_ds4_alias_id,
     )
 
-    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
-    body.update(_ds4_sampling_params_without_force(request))
-
     alias_source = (
-        request.model.split("/", 1)[1]
-        if "/" in request.model
-        else request.model
+        request_model.split("/", 1)[1]
+        if "/" in request_model
+        else request_model
     )
     parsed_alias = parse_ds4_alias_id(alias_source)
     if parsed_alias is not None and _ds4_request_uses_suffix_alias(
-        request.model, resolved_model
+        request_model, resolved_model
     ):
         alias_base, alias_kind = parsed_alias
         ds4_model = ds4_model_for_alias_kind(alias_kind)
@@ -2583,8 +2599,35 @@ def _build_ds4_chat_proxy_body(
         reasoning_effort = ds4_reasoning_effort_for_alias_kind(alias_kind)
         if reasoning_effort is not None:
             body["reasoning_effort"] = reasoning_effort
-
     return body
+
+
+def _build_ds4_chat_proxy_body(
+    request: ChatCompletionRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for OpenAI chat completions."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_sampling_params_without_force(request))
+    return _apply_ds4_suffix_alias_to_body(
+        body,
+        request_model=request.model,
+        resolved_model=resolved_model,
+    )
+
+
+def _build_ds4_completion_proxy_body(
+    request: CompletionRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for OpenAI text completions."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_sampling_params_without_force(request))
+    return _apply_ds4_suffix_alias_to_body(
+        body,
+        request_model=request.model,
+        resolved_model=resolved_model,
+    )
 
 
 def _proxy_response_media_type(headers: dict[str, str], fallback: str) -> str:
@@ -2613,6 +2656,38 @@ class _DS4StreamingResponse(StreamingResponse):
             close = getattr(self._ds4_proxy, "close", None)
             if callable(close):
                 close()
+
+
+async def _create_ds4_text_completion(
+    engine: object,
+    request: CompletionRequest,
+    resolved_model: str,
+):
+    """Proxy an OpenAI text completion to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    body = _build_ds4_completion_proxy_body(request, resolved_model)
+    try:
+        if request.stream:
+            proxy = await engine.open_completion_stream(body)
+            return _DS4StreamingResponse(
+                proxy,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_response_headers(proxy.headers),
+            )
+
+        proxy = await engine.proxy_completion(body)
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 async def _create_ds4_chat_completion(

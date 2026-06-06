@@ -378,6 +378,8 @@ class ChatCompletionResponse(BaseModel):
 class CompletionRequest(BaseModel):
     """Request for text completion."""
 
+    model_config = {"extra": "allow"}
+
     model: str
     prompt: Union[str, List[str]]
     temperature: float | None = None
@@ -393,6 +395,8 @@ class CompletionRequest(BaseModel):
     xtc_threshold: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Thinking effort for DS4/OpenAI reasoning-compatible backends
+    reasoning_effort: Optional[str] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
 
