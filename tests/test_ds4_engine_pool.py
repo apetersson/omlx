@@ -157,6 +157,88 @@ async def test_ds4_process_engine_raises_context_for_think_max(
 
 
 @pytest.mark.asyncio
+async def test_ds4_process_engine_restarts_with_configured_context(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            context_default_tokens=32_768,
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    restarted = await engine.restart_with_context(100_000)
+
+    try:
+        assert restarted is True
+        assert engine.context_tokens == 100_000
+        assert len(FakeManagedProcess.instances) == 2
+        assert FakeManagedProcess.instances[0].stopped is True
+        assert FakeManagedProcess.instances[1].config.context_tokens == 100_000
+        assert "100000" in FakeManagedProcess.instances[1].command
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_rejects_context_restart_if_request_starts(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    stop_started = asyncio.Event()
+    continue_stop = asyncio.Event()
+
+    async def slow_stop(self):
+        stop_started.set()
+        await continue_stop.wait()
+        self.stopped = True
+        if self.process is not None:
+            self.process.returncode = 0
+
+    monkeypatch.setattr(FakeManagedProcess, "stop", slow_stop)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            context_default_tokens=32_768,
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    restart_task = asyncio.create_task(engine.restart_with_context(100_000))
+    await stop_started.wait()
+    begin_task = asyncio.create_task(engine.begin_proxy_request_window())
+    await asyncio.sleep(0)
+    assert engine.has_active_requests() is True
+    continue_stop.set()
+
+    with pytest.raises(DS4ProxyError, match="retry when idle"):
+        await restart_task
+    await begin_task
+    try:
+        assert engine.context_tokens is None
+        assert engine.has_active_requests() is True
+        assert len(FakeManagedProcess.instances) == 2
+        assert FakeManagedProcess.instances[1].config.context_tokens is None
+    finally:
+        engine.end_proxy_request_window()
+        await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_ds4_process_engine_serializes_concurrent_context_raises(
     monkeypatch, tmp_path
 ):
@@ -378,6 +460,28 @@ async def test_engine_pool_loads_and_unloads_ds4_entries(monkeypatch, tmp_path):
     assert entry.engine is None
     assert pool.get_loaded_model_ids() == []
     assert FakeManagedProcess.instances[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_loads_ds4_with_per_model_context(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    pool = _pool_with_ds4(tmp_path)
+
+    class SettingsManager:
+        def get_settings(self, model_id):
+            from omlx.model_settings import ModelSettings
+
+            return ModelSettings(ds4_context_tokens=100_000)
+
+    pool._settings_manager = SettingsManager()
+
+    await pool.get_engine("foo")
+
+    assert FakeManagedProcess.instances[0].config.context_tokens == 100_000
+    assert "--ctx" in FakeManagedProcess.instances[0].command
+    assert "100000" in FakeManagedProcess.instances[0].command
 
 
 @pytest.mark.asyncio

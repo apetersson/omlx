@@ -5,8 +5,6 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 
 
@@ -25,6 +23,7 @@ class TestModelSettings:
         assert settings.force_sampling is False
         assert settings.is_pinned is False
         assert settings.is_default is False
+        assert settings.ds4_context_tokens is None
         # Issue #926: opt-in per model. Default off.
         assert settings.trust_remote_code is False
 
@@ -35,6 +34,14 @@ class TestModelSettings:
         assert d["trust_remote_code"] is True
         restored = ModelSettings.from_dict(d)
         assert restored.trust_remote_code is True
+
+    def test_ds4_context_tokens_roundtrip(self):
+        """DS4 per-model context override persists like other model settings."""
+        original = ModelSettings(ds4_context_tokens=100_000)
+        d = original.to_dict()
+        assert d["ds4_context_tokens"] == 100_000
+        restored = ModelSettings.from_dict(d)
+        assert restored.ds4_context_tokens == 100_000
 
     def test_guided_grammar_defaults(self):
         """Test guided grammar defaults to disabled."""

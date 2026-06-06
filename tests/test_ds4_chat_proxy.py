@@ -156,6 +156,8 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.responses_response_body = b'{"ds4_response":true,"output":[]}'
         self.anthropic_response_body = b'{"type":"message","content":[]}'
         self.min_context_requests: list[int] = []
+        self.active_during_ensure_min_context: list[bool] = []
+        self.active_during_chat_proxy: list[bool] = []
         self.chat_stream_chunks = [b"data: one\n\n", b"data: [DONE]\n\n"]
         self.completion_stream_chunks = [
             b"data: completion\n\n",
@@ -172,10 +174,12 @@ class _FakeDS4Engine(DS4ProcessEngine):
 
     async def ensure_min_context(self, min_tokens: int) -> bool:
         self.min_context_requests.append(min_tokens)
+        self.active_during_ensure_min_context.append(self.has_active_requests())
         self.context_tokens = max(self.context_tokens or 0, min_tokens)
         return True
 
     async def proxy_chat_completion(self, body: dict):
+        self.active_during_chat_proxy.append(self.has_active_requests())
         self.proxy_bodies.append(body)
         return DS4ProxyResponse(
             status_code=201,
@@ -711,6 +715,24 @@ def test_ds4_think_max_chat_request_raises_backend_context(tmp_path):
     assert response.status_code == 201
     assert engine.min_context_requests == [DS4_THINK_MAX_CONTEXT_TOKENS]
     assert engine.proxy_bodies[0]["reasoning_effort"] == "max"
+
+
+def test_ds4_think_max_request_reserves_active_window_after_context_raise(tmp_path):
+    engine = _FakeDS4Engine(tmp_path)
+
+    with _client_with_engine(engine) as (client, _pool):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "foo-think-max",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 201
+    assert engine.active_during_ensure_min_context == [False]
+    assert engine.active_during_chat_proxy == [True]
+    assert engine.has_active_requests() is False
 
 
 def test_ds4_usage_parser_handles_openai_responses_and_anthropic_shapes():

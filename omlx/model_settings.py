@@ -9,15 +9,15 @@ import copy
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .model_profiles import (
     filter_profile_fields,
     filter_universal_fields,
-    validate_profile_name,
     utcnow,
+    validate_profile_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ class ModelSettings:
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
         active_profile_name: Name of the currently-applied profile (None = no profile).
+        ds4_context_tokens: Per-model DS4 launch context override (None = DS4 auto/global default).
     """
 
     # Sampling parameters (None means use global default)
@@ -184,6 +185,9 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
+
+    # DS4-specific launch settings
+    ds4_context_tokens: Optional[int] = None  # None = DS4 auto/global context default
 
     def __post_init__(self) -> None:
         # Native MTP is mutually exclusive with DFlash (also speculative) and

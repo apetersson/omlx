@@ -193,6 +193,40 @@ class DS4ProcessEngine(BaseEngine):
                 await self.start()
             return True
 
+    async def restart_with_context(self, context_tokens: int | None) -> bool:
+        """Restart this loaded DS4 engine with a new per-engine context override."""
+        async with self._lifecycle_lock:
+            if self.context_tokens == context_tokens and self.is_running:
+                return False
+            if self.has_active_requests():
+                raise DS4ProxyError(
+                    "DS4 context change requires a backend restart, but the backend "
+                    "is currently serving another request; retry when idle"
+                )
+            old_context_tokens = self.context_tokens
+            was_loaded = self.process is not None
+            if was_loaded:
+                await self.stop()
+                if self.has_active_requests():
+                    self.context_tokens = old_context_tokens
+                    await self.start()
+                    raise DS4ProxyError(
+                        "DS4 context change requires a backend restart, but the "
+                        "backend is currently serving another request; retry when idle"
+                    )
+            self.context_tokens = context_tokens
+            if was_loaded:
+                await self.start()
+                if self.has_active_requests():
+                    await self.stop()
+                    self.context_tokens = old_context_tokens
+                    await self.start()
+                    raise DS4ProxyError(
+                        "DS4 context change requires a backend restart, but the "
+                        "backend is currently serving another request; retry when idle"
+                    )
+            return was_loaded
+
     def _record_crashed_process(self) -> None:
         process = self.process
         process_obj = process.process if process is not None else None
@@ -245,6 +279,20 @@ class DS4ProcessEngine(BaseEngine):
     def _increment_active_requests(self) -> None:
         with self._active_requests_lock:
             self._active_requests += 1
+
+    async def begin_proxy_request_window(self) -> None:
+        """Mark a DS4 request active before endpoint-specific proxy startup."""
+        self._increment_active_requests()
+        try:
+            async with self._lifecycle_lock:
+                pass
+        except BaseException:
+            self._decrement_active_requests()
+            raise
+
+    def end_proxy_request_window(self) -> None:
+        """Release a request-start activity marker."""
+        self._decrement_active_requests()
 
     def _decrement_active_requests(self) -> None:
         with self._active_requests_lock:

@@ -2633,6 +2633,16 @@ async def _ensure_ds4_think_max_context(
         await ensure_min_context(DS4_THINK_MAX_CONTEXT_TOKENS)
 
 
+async def _reserve_ds4_proxy_request_window(engine: object):
+    """Mark DS4 active between context checks and endpoint proxy startup."""
+    begin = getattr(engine, "begin_proxy_request_window", None)
+    end = getattr(engine, "end_proxy_request_window", None)
+    if not callable(begin) or not callable(end):
+        return None
+    await begin()
+    return end
+
+
 def _apply_ds4_suffix_alias_to_body(
     body: dict,
     *,
@@ -3011,15 +3021,20 @@ async def _create_ds4_text_completion(
     """Proxy an OpenAI text completion to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
+    release_ds4_request = None
     try:
         await _ensure_ds4_think_max_context(
             engine,
             request_model=request.model,
             resolved_model=resolved_model,
         )
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_completion_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_completion_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
             return _DS4StreamingResponse(
                 proxy,
                 resolved_model=resolved_model,
@@ -3045,6 +3060,9 @@ async def _create_ds4_text_completion(
         )
     except DS4ProxyError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
 
 
 async def _create_ds4_response(
@@ -3055,15 +3073,20 @@ async def _create_ds4_response(
     """Proxy an OpenAI Responses API request to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
+    release_ds4_request = None
     try:
         await _ensure_ds4_think_max_context(
             engine,
             request_model=request.model,
             resolved_model=resolved_model,
         )
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_responses_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_response_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
             return _DS4StreamingResponse(
                 proxy,
                 resolved_model=resolved_model,
@@ -3089,6 +3112,9 @@ async def _create_ds4_response(
         )
     except DS4ProxyError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
 
 
 async def _create_ds4_anthropic_message(
@@ -3099,15 +3125,20 @@ async def _create_ds4_anthropic_message(
     """Proxy an Anthropic Messages API request to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
+    release_ds4_request = None
     try:
         await _ensure_ds4_think_max_context(
             engine,
             request_model=request.model,
             resolved_model=resolved_model,
         )
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_anthropic_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_anthropic_message_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
             return _DS4StreamingResponse(
                 proxy,
                 resolved_model=resolved_model,
@@ -3133,6 +3164,9 @@ async def _create_ds4_anthropic_message(
         )
     except DS4ProxyError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
 
 
 async def _create_ds4_chat_completion(
@@ -3143,15 +3177,20 @@ async def _create_ds4_chat_completion(
     """Proxy an OpenAI chat completion to the managed DS4 backend."""
     from .engine.ds4 import DS4ProxyError
 
+    release_ds4_request = None
     try:
         await _ensure_ds4_think_max_context(
             engine,
             request_model=request.model,
             resolved_model=resolved_model,
         )
+        release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_chat_proxy_body(request, resolved_model)
         if request.stream:
             proxy = await engine.open_chat_completion_stream(body)
+            if release_ds4_request is not None:
+                release_ds4_request()
+                release_ds4_request = None
             return _DS4StreamingResponse(
                 proxy,
                 resolved_model=resolved_model,
@@ -3177,6 +3216,9 @@ async def _create_ds4_chat_completion(
         )
     except DS4ProxyError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if release_ds4_request is not None:
+            release_ds4_request()
 
 
 @app.post("/v1/chat/completions")

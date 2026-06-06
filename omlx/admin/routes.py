@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..settings import SubKeyEntry
+from ..settings import DS4_MAX_CONTEXT_TOKENS, SubKeyEntry
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -105,6 +105,7 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
+    ds4_context_tokens: int | None = None
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -1888,6 +1889,9 @@ async def update_model_settings(
 
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
+    previous_ds4_context_tokens = getattr(
+        current_settings, "ds4_context_tokens", None
+    )
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -1964,6 +1968,27 @@ async def update_model_settings(
                 entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
+    if "ds4_context_tokens" in sent:
+        if not engine_pool._is_ds4_entry(entry):
+            raise HTTPException(
+                status_code=400,
+                detail="ds4_context_tokens is only supported for DS4 GGUF models",
+            )
+        ds4_context_tokens = request.ds4_context_tokens
+        if ds4_context_tokens is not None and ds4_context_tokens <= 0:
+            ds4_context_tokens = None
+        if (
+            ds4_context_tokens is not None
+            and ds4_context_tokens > DS4_MAX_CONTEXT_TOKENS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ds4_context_tokens must be <= "
+                    f"{DS4_MAX_CONTEXT_TOKENS}"
+                ),
+            )
+        current_settings.ds4_context_tokens = ds4_context_tokens
     if "max_tokens" in sent:
         current_settings.max_tokens = request.max_tokens
     if "temperature" in sent:
@@ -2317,7 +2342,42 @@ async def update_model_settings(
                         settings=profile_settings,
                     )
 
-    # Persist settings
+    ds4_context_restarted = False
+    ds4_context_requires_restart = (
+        "ds4_context_tokens" in sent
+        and current_settings.ds4_context_tokens != previous_ds4_context_tokens
+        and entry.engine is not None
+        and engine_pool._is_ds4_entry(entry)
+    )
+    if ds4_context_requires_restart and entry.engine.has_active_requests():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "DS4 context change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            ),
+        )
+
+    if ds4_context_requires_restart:
+        restart_with_context = getattr(entry.engine, "restart_with_context", None)
+        if callable(restart_with_context):
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_context_restarted = bool(
+                    await restart_with_context(current_settings.ds4_context_tokens)
+                )
+                if ds4_context_restarted:
+                    get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+                    if callable(get_rss):
+                        entry.actual_size = get_rss() or entry.actual_size
+            except DS4ProxyError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+    # Persist settings only after DS4 restart admission has succeeded, so a
+    # racing active request cannot save a context that was not applied.
     settings_manager.set_settings(model_id, current_settings)
 
     # Auto-unload (and re-load if pinned) when a setting that only takes
@@ -2367,9 +2427,10 @@ async def update_model_settings(
         "settings": current_settings.to_dict(),
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
-        "requires_reload": requires_reload,
+        "requires_reload": requires_reload or ds4_context_requires_restart,
         "auto_unloaded": auto_unloaded,
-        "auto_reloaded": auto_reloaded,
+        "auto_reloaded": auto_reloaded or ds4_context_restarted,
+        "ds4_context_restarted": ds4_context_restarted,
     }
 
 

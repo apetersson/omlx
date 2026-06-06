@@ -974,6 +974,9 @@ class EnginePool:
                     model_path=entry.model_path,
                     settings=ds4_settings,
                     base_path=self._base_path,
+                    context_tokens=getattr(
+                        model_settings, "ds4_context_tokens", None
+                    ),
                 )
             elif model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
