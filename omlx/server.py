@@ -2510,6 +2510,15 @@ def _is_ds4_response_proxy_engine(engine: object) -> bool:
     )
 
 
+def _is_ds4_anthropic_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy Anthropic Messages requests to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_anthropic_message", None))
+        and callable(getattr(engine, "open_anthropic_message_stream", None))
+    )
+
+
 def _ds4_request_uses_suffix_alias(
     request_model: str,
     resolved_model: str,
@@ -2729,6 +2738,51 @@ def _build_ds4_responses_proxy_body(
     )
 
 
+def _ds4_anthropic_sampling_params_without_force(
+    request: AnthropicMessagesRequest,
+) -> dict:
+    """Resolve Anthropic Messages DS4 sampling defaults without forcing clients."""
+    global_sampling = _server_state.sampling
+    model_settings = None
+    model_id = resolve_model_id(request.model)
+    if model_id and _server_state.settings_manager:
+        model_settings = _server_state.settings_manager.get_settings(model_id)
+
+    def choose(request_value, setting_name: str, default):
+        if request_value is not None:
+            return request_value
+        if model_settings is not None:
+            model_value = getattr(model_settings, setting_name, None)
+            if model_value is not None:
+                return model_value
+        return default
+
+    return {
+        "temperature": choose(
+            request.temperature, "temperature", global_sampling.temperature
+        ),
+        "top_p": choose(request.top_p, "top_p", global_sampling.top_p),
+        "top_k": choose(request.top_k, "top_k", global_sampling.top_k),
+        "max_tokens": choose(
+            request.max_tokens, "max_tokens", global_sampling.max_tokens
+        ),
+    }
+
+
+def _build_ds4_anthropic_proxy_body(
+    request: AnthropicMessagesRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for Anthropic Messages requests."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_anthropic_sampling_params_without_force(request))
+    return _apply_ds4_suffix_alias_to_body(
+        body,
+        request_model=request.model,
+        resolved_model=resolved_model,
+    )
+
+
 def _proxy_response_media_type(headers: dict[str, str], fallback: str) -> str:
     for key, value in headers.items():
         if key.lower() == "content-type" and value:
@@ -2811,6 +2865,38 @@ async def _create_ds4_response(
             )
 
         proxy = await engine.proxy_response(body)
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _create_ds4_anthropic_message(
+    engine: object,
+    request: AnthropicMessagesRequest,
+    resolved_model: str,
+):
+    """Proxy an Anthropic Messages API request to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    body = _build_ds4_anthropic_proxy_body(request, resolved_model)
+    try:
+        if request.stream:
+            proxy = await engine.open_anthropic_message_stream(body)
+            return _DS4StreamingResponse(
+                proxy,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_response_headers(proxy.headers),
+            )
+
+        proxy = await engine.proxy_anthropic_message(body)
         return Response(
             content=proxy.body,
             status_code=proxy.status_code,
@@ -4329,6 +4415,9 @@ async def create_anthropic_message(
 
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
+
+    if _is_ds4_anthropic_proxy_engine(engine):
+        return await _create_ds4_anthropic_message(engine, request, resolved_model)
 
     # Get per-model settings
     max_tool_result_tokens = None

@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
 from omlx.api.openai_models import ChatCompletionRequest, CompletionRequest, Message
 from omlx.api.responses_models import ResponsesRequest
 from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyResponse
@@ -146,6 +147,8 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.completion_stream_bodies: list[dict] = []
         self.response_bodies: list[dict] = []
         self.response_stream_bodies: list[dict] = []
+        self.anthropic_bodies: list[dict] = []
+        self.anthropic_stream_bodies: list[dict] = []
 
     async def proxy_chat_completion(self, body: dict):
         self.proxy_bodies.append(body)
@@ -189,6 +192,21 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.response_stream_bodies.append(body)
         return _StreamingProxy(
             chunks=[b"event: response.output_text.delta\n", b"data: {}\n\n"],
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    async def proxy_anthropic_message(self, body: dict):
+        self.anthropic_bodies.append(body)
+        return DS4ProxyResponse(
+            status_code=204,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            body=b'{"type":"message","content":[]}',
+        )
+
+    async def open_anthropic_message_stream(self, body: dict):
+        self.anthropic_stream_bodies.append(body)
+        return _StreamingProxy(
+            chunks=[b"event: content_block_delta\n", b"data: {}\n\n"],
             headers={"Content-Type": "text/event-stream"},
         )
 
@@ -296,6 +314,39 @@ async def test_ds4_process_engine_proxies_non_streaming_response(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_ds4_process_engine_proxies_non_streaming_anthropic_message(
+    monkeypatch, tmp_path
+):
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=tmp_path / "Foo.gguf",
+        base_path=tmp_path,
+    )
+    engine.process = SimpleNamespace(
+        is_running=True,
+        port=49152,
+        process=SimpleNamespace(pid=123),
+        command=[],
+        recent_log_text=lambda: "",
+    )
+    _FakeRequestsSession.instances = []
+    _FakeRequestsSession.next_response = _RequestsResponse(content=b'{"content":[]}')
+    monkeypatch.setattr("omlx.engine.ds4.requests.Session", _FakeRequestsSession)
+
+    response = await engine.proxy_anthropic_message(
+        {"model": "foo", "messages": [], "max_tokens": 1}
+    )
+
+    session = _FakeRequestsSession.instances[0]
+    captured = session.calls[0]
+    assert captured["url"] == "http://127.0.0.1:49152/v1/messages"
+    assert captured["json"] == {"model": "foo", "messages": [], "max_tokens": 1}
+    assert captured["stream"] is True
+    assert response.body == b'{"content":[]}'
+    assert engine.has_active_requests() is False
+
+
+@pytest.mark.asyncio
 async def test_ds4_process_engine_stream_tracks_active_until_consumed(
     monkeypatch, tmp_path
 ):
@@ -383,6 +434,38 @@ async def test_ds4_process_engine_response_stream_uses_responses_endpoint(
     assert list(response.iter_bytes()) == [b"event: response.done\n\n"]
     assert _FakeRequestsSession.instances[0].calls[0]["url"] == (
         "http://127.0.0.1:49152/v1/responses"
+    )
+    assert engine.has_active_requests() is False
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_anthropic_stream_uses_messages_endpoint(
+    monkeypatch, tmp_path
+):
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=tmp_path / "Foo.gguf",
+        base_path=tmp_path,
+    )
+    engine.process = SimpleNamespace(
+        is_running=True,
+        port=49152,
+        process=SimpleNamespace(pid=123),
+        command=[],
+        recent_log_text=lambda: "",
+    )
+    backend_response = _RequestsResponse(chunks=[b"event: message_stop\n\n"])
+    _FakeRequestsSession.instances = []
+    _FakeRequestsSession.next_response = backend_response
+    monkeypatch.setattr("omlx.engine.ds4.requests.Session", _FakeRequestsSession)
+
+    response = await engine.open_anthropic_message_stream(
+        {"model": "foo", "messages": [], "max_tokens": 1}
+    )
+
+    assert list(response.iter_bytes()) == [b"event: message_stop\n\n"]
+    assert _FakeRequestsSession.instances[0].calls[0]["url"] == (
+        "http://127.0.0.1:49152/v1/messages"
     )
     assert engine.has_active_requests() is False
 
@@ -722,6 +805,69 @@ def test_ds4_responses_streaming_preserves_backend_sse_bytes(tmp_path):
     assert engine.response_stream_bodies[0]["stream"] is True
 
 
+def test_ds4_anthropic_non_streaming_proxies_raw_response_and_applies_defaults(
+    tmp_path,
+):
+    engine = _FakeDS4Engine(tmp_path)
+    settings = ModelSettings(
+        temperature=0.45,
+        top_p=0.75,
+        top_k=11,
+        max_tokens=66,
+        force_sampling=True,
+    )
+
+    with _client_with_engine(engine, settings) as (client, pool):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "foo-think-max",
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0.91,
+                "output_config": {"effort": "low"},
+                "metadata": {"user_id": "u1"},
+                "ds4_extension": {"passthrough": True},
+            },
+        )
+
+    assert response.status_code == 204
+    assert response.content == b'{"type":"message","content":[]}'
+    assert pool.requested_model_ids == ["foo"]
+    body = engine.anthropic_bodies[0]
+    assert body["model"] == "foo"
+    assert body["max_tokens"] == 66
+    assert body["messages"] == [{"role": "user", "content": "hello"}]
+    assert body["temperature"] == 0.91
+    assert body["top_p"] == 0.75
+    assert body["top_k"] == 11
+    assert body["output_config"] == {"effort": "low"}
+    assert body["reasoning_effort"] == "max"
+    assert body["metadata"] == {"user_id": "u1"}
+    assert body["ds4_extension"] == {"passthrough": True}
+
+
+def test_ds4_anthropic_streaming_preserves_backend_sse_bytes(tmp_path):
+    engine = _FakeDS4Engine(tmp_path)
+
+    with _client_with_engine(engine) as (client, _pool):
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            json={
+                "model": "foo-reasoner",
+                "max_tokens": 12,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        ) as response:
+            body = b"".join(response.iter_bytes())
+
+    assert response.status_code == 200
+    assert body == b"event: content_block_delta\ndata: {}\n\n"
+    assert engine.anthropic_stream_bodies[0]["model"] == "deepseek-reasoner"
+    assert engine.anthropic_stream_bodies[0]["stream"] is True
+
+
 @pytest.mark.asyncio
 async def test_ds4_streaming_response_closes_proxy_when_send_start_fails():
     from omlx.server import _DS4StreamingResponse
@@ -912,5 +1058,41 @@ def test_ds4_responses_proxy_body_uses_responses_reasoning_effort(tmp_path):
     )
     with patch("omlx.server._server_state", state):
         body = _build_ds4_responses_proxy_body(request, "foo-chat")
+
+    assert body["model"] == "FOO-CHAT"
+
+
+def test_ds4_anthropic_proxy_body_preserves_extra_fields_and_aliases(tmp_path):
+    from omlx.server import _build_ds4_anthropic_proxy_body
+
+    engine = _FakeDS4Engine(tmp_path)
+    state = ServerState()
+    state.engine_pool = _Pool(engine)
+    state.settings_manager = _SettingsManager(ModelSettings(model_alias="gpt-4o"))
+    request = AnthropicMessagesRequest(
+        model="omlx/gpt-4o-think-max",
+        max_tokens=12,
+        messages=[{"role": "user", "content": "hello"}],
+        output_config={"effort": "low"},
+        ds4_extension={"passthrough": True},
+    )
+
+    with patch("omlx.server._server_state", state):
+        body = _build_ds4_anthropic_proxy_body(request, "foo")
+
+    assert body["model"] == "gpt-4o"
+    assert body["max_tokens"] == 12
+    assert body["messages"] == [{"role": "user", "content": "hello"}]
+    assert body["output_config"] == {"effort": "low"}
+    assert body["reasoning_effort"] == "max"
+    assert body["ds4_extension"] == {"passthrough": True}
+
+    request = AnthropicMessagesRequest(
+        model="FOO-CHAT",
+        max_tokens=12,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    with patch("omlx.server._server_state", state):
+        body = _build_ds4_anthropic_proxy_body(request, "foo-chat")
 
     assert body["model"] == "FOO-CHAT"
