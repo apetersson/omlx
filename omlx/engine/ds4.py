@@ -8,13 +8,70 @@ clear errors while load/unload/status can already exercise the managed backend.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+import threading
+from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from ..ds4_process import DS4_HOST, DS4LaunchConfig, DS4ManagedProcess
 from ..settings import DEFAULT_BASE_PATH, DS4Settings
 from .base import BaseEngine, GenerationOutput
+
+
+class DS4ProxyError(RuntimeError):
+    """Raised when OMLX cannot contact the managed DS4 backend."""
+
+
+@dataclass(frozen=True)
+class DS4ProxyResponse:
+    """Raw non-streaming DS4 HTTP response."""
+
+    status_code: int
+    headers: dict[str, str]
+    body: bytes
+
+
+@dataclass
+class DS4StreamingProxyResponse:
+    """Raw streaming DS4 HTTP response with close-time cleanup."""
+
+    status_code: int
+    headers: dict[str, str]
+    response: requests.Response
+    on_close: Callable[[], None]
+    session: requests.Session | None = None
+    closed: bool = False
+
+    def close(self) -> None:
+        """Close the upstream response and run cleanup exactly once."""
+        if self.closed:
+            return
+        self.closed = True
+        self.response.close()
+        if self.session is not None:
+            self.session.close()
+        self.on_close()
+
+    def iter_bytes(self) -> Iterator[bytes]:
+        """Yield DS4 response bytes without parsing or reformatting them."""
+        if self.closed:
+            return
+        try:
+            raw = getattr(self.response, "raw", None)
+            if raw is not None and hasattr(raw, "stream"):
+                for chunk in raw.stream(65536, decode_content=False):
+                    if chunk:
+                        yield chunk
+            else:
+                for chunk in self.response.iter_content(chunk_size=None):
+                    if chunk:
+                        yield chunk
+        finally:
+            self.close()
 
 
 class DS4ProcessEngine(BaseEngine):
@@ -37,6 +94,8 @@ class DS4ProcessEngine(BaseEngine):
         self.context_tokens = context_tokens
         self.auto_enable_ssd_streaming = auto_enable_ssd_streaming
         self.process: DS4ManagedProcess | None = None
+        self._active_requests = 0
+        self._active_requests_lock = threading.Lock()
 
     @property
     def model_name(self) -> str:
@@ -95,9 +154,156 @@ class DS4ProcessEngine(BaseEngine):
             await process.stop()
         self.process = None
 
+    def _increment_active_requests(self) -> None:
+        with self._active_requests_lock:
+            self._active_requests += 1
+
+    def _decrement_active_requests(self) -> None:
+        with self._active_requests_lock:
+            if self._active_requests > 0:
+                self._active_requests -= 1
+
     def has_active_requests(self) -> bool:
-        """Protocol forwarding is not wired yet, so no requests run here."""
-        return False
+        """Return True while OMLX is proxying requests to DS4."""
+        with self._active_requests_lock:
+            return self._active_requests > 0
+
+    def _backend_url(self, path: str) -> str:
+        if self.port is None or not self.is_running:
+            raise DS4ProxyError("DS4 backend process is not running")
+        return f"http://{DS4_HOST}:{self.port}{path}"
+
+    @staticmethod
+    def _response_headers(response: requests.Response) -> dict[str, str]:
+        """Return response headers that are safe to reflect through OMLX."""
+        excluded = {"connection", "transfer-encoding"}
+        return {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in excluded
+        }
+
+    def _proxy_json_request_blocking(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        stream: bool,
+    ) -> tuple[requests.Session, requests.Response]:
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.post(
+                self._backend_url(path),
+                json=body,
+                stream=stream,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept-Encoding": "identity",
+                },
+            )
+        except requests.RequestException as exc:
+            session.close()
+            raise DS4ProxyError(f"DS4 backend request failed: {exc}") from exc
+        return session, response
+
+    @staticmethod
+    def _raw_body(response: requests.Response) -> bytes:
+        raw = getattr(response, "raw", None)
+        if raw is not None and hasattr(raw, "read"):
+            return raw.read(decode_content=False)
+        return response.content
+
+    def _proxy_json_response_blocking(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> DS4ProxyResponse:
+        try:
+            session, response = self._proxy_json_request_blocking(
+                path,
+                body,
+                stream=True,
+            )
+            try:
+                try:
+                    raw_body = self._raw_body(response)
+                except Exception as exc:  # noqa: BLE001 - normalize backend I/O failures
+                    raise DS4ProxyError(
+                        f"DS4 backend response read failed: {exc}"
+                    ) from exc
+                return DS4ProxyResponse(
+                    status_code=response.status_code,
+                    headers=self._response_headers(response),
+                    body=raw_body,
+                )
+            finally:
+                response.close()
+                session.close()
+        finally:
+            self._decrement_active_requests()
+
+    async def proxy_chat_completion(self, body: dict[str, Any]) -> DS4ProxyResponse:
+        """Forward one non-streaming OpenAI chat completion request to DS4."""
+        self._increment_active_requests()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._proxy_json_response_blocking,
+                "/v1/chat/completions",
+                body,
+            )
+        )
+        return await asyncio.shield(task)
+
+    async def open_chat_completion_stream(
+        self, body: dict[str, Any]
+    ) -> DS4StreamingProxyResponse:
+        """Open a streaming OpenAI chat completion request to DS4."""
+        self._increment_active_requests()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._proxy_json_request_blocking,
+                "/v1/chat/completions",
+                body,
+                stream=True,
+            )
+        )
+        claimed = False
+
+        def _cleanup_unclaimed(done: asyncio.Task) -> None:
+            nonlocal claimed
+            if claimed:
+                return
+            try:
+                session, response = done.result()
+            except Exception:
+                self._decrement_active_requests()
+                return
+            response.close()
+            session.close()
+            self._decrement_active_requests()
+
+        try:
+            session, response = await asyncio.shield(task)
+            claimed = True
+        except asyncio.CancelledError:
+            task.add_done_callback(_cleanup_unclaimed)
+            raise
+        except Exception:
+            claimed = True
+            self._decrement_active_requests()
+            raise
+
+        def _decrement_active() -> None:
+            self._decrement_active_requests()
+
+        return DS4StreamingProxyResponse(
+            status_code=response.status_code,
+            headers=self._response_headers(response),
+            response=response,
+            on_close=_decrement_active,
+            session=session,
+        )
 
     def get_process_rss_bytes(self) -> int | None:
         """Return the DS4 subprocess RSS when psutil can observe it."""

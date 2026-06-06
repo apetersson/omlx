@@ -295,6 +295,8 @@ class ChatCompletionRequest(BaseModel):
     guided_grammar: Optional[str] = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Thinking effort for DS4/OpenAI reasoning-compatible backends
+    reasoning_effort: Optional[str] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = None
     # SpecPrefill: per-request enable/disable (None = use model setting)
