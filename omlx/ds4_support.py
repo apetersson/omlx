@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Support-file checks for the managed DS4/GGUF backend.
+
+The DS4 process backend is launched from a user support directory rather than
+built or fetched at runtime.  This module owns the small, testable pieces that
+validate/copy those support files before later process-launch code consumes
+those paths.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from .settings import DEFAULT_BASE_PATH, DS4Settings
+
+DS4_SERVER_BINARY = "ds4-server"
+DS4_SUPPORT_FILES: tuple[str, ...] = (
+    "LICENSE",
+    "README.md",
+)
+DS4_METAL_FILES: tuple[str, ...] = (
+    "flash_attn.metal",
+    "dense.metal",
+    "moe.metal",
+    "dsv4_hc.metal",
+    "unary.metal",
+    "dsv4_kv.metal",
+    "dsv4_rope.metal",
+    "dsv4_misc.metal",
+    "argsort.metal",
+    "cpy.metal",
+    "concat.metal",
+    "get_rows.metal",
+    "sum_rows.metal",
+    "softmax.metal",
+    "repeat.metal",
+    "glu.metal",
+    "norm.metal",
+    "bin.metal",
+    "set_rows.metal",
+)
+
+
+class DS4SupportError(RuntimeError):
+    """Raised when DS4 support files are unavailable or incomplete."""
+
+
+@dataclass(frozen=True)
+class DS4SupportStatus:
+    """Result of inspecting the configured DS4 support directory."""
+
+    support_dir: Path
+    binary_path: Path
+    missing_files: tuple[str, ...]
+    binary_missing: bool
+    binary_not_executable: bool
+    unsupported_platform: bool
+    platform_name: str
+
+    @property
+    def ready(self) -> bool:
+        """True when all required support files are present and launchable."""
+        return not (
+            self.missing_files
+            or self.binary_missing
+            or self.binary_not_executable
+            or self.unsupported_platform
+        )
+
+    def error_message(self) -> str | None:
+        """Return a clear user-facing error, or ``None`` when ready."""
+        problems: list[str] = []
+        if self.unsupported_platform:
+            problems.append(
+                "DS4 backend is supported only on macOS Apple Silicon "
+                f"(detected {self.platform_name})"
+            )
+        if self.binary_missing:
+            problems.append(f"missing DS4 binary: {self.binary_path}")
+        elif self.binary_not_executable:
+            problems.append(f"DS4 binary is not executable: {self.binary_path}")
+        if self.missing_files:
+            missing = ", ".join(self.missing_files)
+            problems.append(f"missing DS4 support files under {self.support_dir}: {missing}")
+        if not problems:
+            return None
+        return "; ".join(problems)
+
+
+@dataclass(frozen=True)
+class DS4SupportCopyResult:
+    """Files copied into the DS4 support directory."""
+
+    source_dir: Path
+    destination_dir: Path
+    copied_files: tuple[Path, ...]
+
+
+def _platform_name(system: str | None = None, machine: str | None = None) -> str:
+    system = system or platform.system()
+    machine = machine or platform.machine()
+    return f"{system} {machine}".strip()
+
+
+def is_ds4_supported_platform(
+    system: str | None = None, machine: str | None = None
+) -> bool:
+    """Return True for the v1 DS4 target platform: macOS Apple Silicon."""
+    system = (system or platform.system()).lower()
+    machine = (machine or platform.machine()).lower()
+    return system == "darwin" and machine in {"arm64", "aarch64"}
+
+
+def required_ds4_support_relative_paths(*, include_binary: bool = True) -> tuple[str, ...]:
+    """Return required support paths relative to the DS4 support directory."""
+    paths: list[str] = []
+    if include_binary:
+        paths.append(DS4_SERVER_BINARY)
+    paths.extend(DS4_SUPPORT_FILES)
+    paths.extend(f"metal/{name}" for name in DS4_METAL_FILES)
+    return tuple(paths)
+
+
+def _missing_relative_paths(root: Path, relative_paths: Iterable[str]) -> tuple[str, ...]:
+    return tuple(rel for rel in relative_paths if not (root / rel).is_file())
+
+
+def inspect_ds4_support(
+    settings: DS4Settings | None = None,
+    *,
+    base_path: str | Path | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+) -> DS4SupportStatus:
+    """Inspect configured DS4 support files without mutating the filesystem."""
+    settings = settings or DS4Settings()
+    base = Path(base_path).expanduser().resolve() if base_path else DEFAULT_BASE_PATH
+    support_dir = settings.get_support_dir(base)
+    binary_path = settings.get_binary_path(base)
+    binary_override = settings.binary_path is not None
+    missing_files = _missing_relative_paths(
+        support_dir,
+        required_ds4_support_relative_paths(include_binary=not binary_override),
+    )
+    binary_missing = not binary_path.is_file()
+    binary_not_executable = binary_path.is_file() and not os.access(binary_path, os.X_OK)
+    platform_name = _platform_name(system, machine)
+
+    return DS4SupportStatus(
+        support_dir=support_dir,
+        binary_path=binary_path,
+        missing_files=missing_files,
+        binary_missing=binary_missing,
+        binary_not_executable=binary_not_executable,
+        unsupported_platform=not is_ds4_supported_platform(system, machine),
+        platform_name=platform_name,
+    )
+
+
+def require_ds4_support(
+    settings: DS4Settings | None = None,
+    *,
+    base_path: str | Path | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+) -> DS4SupportStatus:
+    """Return support status or raise ``DS4SupportError`` with a clear message."""
+    status = inspect_ds4_support(
+        settings,
+        base_path=base_path,
+        system=system,
+        machine=machine,
+    )
+    if not status.ready:
+        raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
+    return status
+
+
+def copy_ds4_support_files(
+    source_dir: str | Path,
+    destination_dir: str | Path,
+    *,
+    overwrite: bool = False,
+) -> DS4SupportCopyResult:
+    """Copy required DS4 support files from a bundled resource directory.
+
+    The copy is intentionally deterministic: only the required binary, license,
+    README, and Metal source files are copied.  Missing bundled inputs raise a
+    clear error instead of attempting to rebuild or fetch DS4.
+    """
+    source = Path(source_dir).expanduser().resolve()
+    destination = Path(destination_dir).expanduser().resolve()
+    required = required_ds4_support_relative_paths(include_binary=True)
+    missing = _missing_relative_paths(source, required)
+    if missing:
+        raise DS4SupportError(
+            "Bundled DS4 support files are incomplete under "
+            f"{source}: {', '.join(missing)}"
+        )
+
+    copied: list[Path] = []
+    for rel in required:
+        src = source / rel
+        dst = destination / rel
+        if dst.exists() and not overwrite:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append(dst)
+
+    return DS4SupportCopyResult(
+        source_dir=source,
+        destination_dir=destination,
+        copied_files=tuple(copied),
+    )
