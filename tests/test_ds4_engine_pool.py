@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyError
+from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyError, DS4ProxyResponse
 from omlx.engine_pool import EnginePool
 from omlx.server import ServerState, app
 from omlx.settings import DS4_THINK_MAX_CONTEXT_TOKENS, DS4Settings
@@ -34,7 +34,11 @@ class FakeManagedProcess:
 
     @property
     def is_running(self) -> bool:
-        return self.started and not self.stopped
+        return (
+            self.started
+            and self.process is not None
+            and self.process.returncode is None
+        )
 
     async def start(self) -> None:
         self.started = True
@@ -49,6 +53,10 @@ class FakeManagedProcess:
 
     def recent_log_text(self) -> str:
         return "fake ds4 logs"
+
+    def crash(self, returncode: int = 9) -> None:
+        if self.process is not None:
+            self.process.returncode = returncode
 
 
 def _patch_fake_process(monkeypatch):
@@ -241,6 +249,93 @@ async def test_ds4_process_engine_rejects_context_raise_while_active(
 
 
 @pytest.mark.asyncio
+async def test_ds4_process_engine_restarts_crashed_backend_before_request(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    def fake_proxy_response(self, path, body):
+        try:
+            assert self.is_running is True
+            assert path == "/v1/chat/completions"
+            assert body == {"model": "foo"}
+            return DS4ProxyResponse(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                body=b'{"ok":true}',
+            )
+        finally:
+            self._decrement_active_requests()
+
+    monkeypatch.setattr(
+        DS4ProcessEngine,
+        "_proxy_json_response_blocking",
+        fake_proxy_response,
+    )
+
+    await engine.start()
+    FakeManagedProcess.instances[0].crash(returncode=9)
+
+    response = await engine.proxy_chat_completion({"model": "foo"})
+
+    try:
+        assert response.body == b'{"ok":true}'
+        assert len(FakeManagedProcess.instances) == 2
+        assert FakeManagedProcess.instances[0].stopped is True
+        assert FakeManagedProcess.instances[1].started is True
+        stats = engine.get_stats()
+        assert stats["running"] is True
+        assert stats["crashed"] is False
+        assert stats["crash_count"] == 1
+        assert stats["restart_count"] == 1
+        assert stats["last_crash_exit_code"] == 9
+        assert stats["last_crash_logs"] == "fake ds4 logs"
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_ds4_process_engine_rejects_crash_restart_while_active(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    gguf = tmp_path / "Foo.gguf"
+    gguf.write_bytes(b"0" * 1000)
+    engine = DS4ProcessEngine(
+        model_id="foo",
+        model_path=gguf,
+        settings=DS4Settings(
+            support_dir=str(tmp_path / "support" / "ds4"),
+            kv_root=str(tmp_path / "kv"),
+        ),
+        base_path=tmp_path,
+    )
+
+    await engine.start()
+    FakeManagedProcess.instances[0].crash(returncode=9)
+    engine._increment_active_requests()
+    try:
+        with pytest.raises(DS4ProxyError, match="retry when idle"):
+            await engine.restart_if_crashed()
+        assert len(FakeManagedProcess.instances) == 1
+        assert FakeManagedProcess.instances[0].stopped is False
+    finally:
+        engine._decrement_active_requests()
+        await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_ds4_process_engine_protocol_methods_are_explicitly_deferred(tmp_path):
     gguf = tmp_path / "Foo.gguf"
     gguf.write_bytes(b"0" * 1000)
@@ -292,6 +387,80 @@ async def test_engine_pool_preloads_pinned_ds4_models(monkeypatch, tmp_path):
 
     assert pool.get_entry("foo").engine is not None
     assert FakeManagedProcess.instances[0].started is True
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_restarts_crashed_pinned_ds4_models(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(base_path=tmp_path, ds4_settings=DS4Settings())
+    pool._get_final_ceiling = lambda: 0
+    pool.discover_models(str(tmp_path), pinned_models=["foo"])
+    await pool.preload_pinned_models()
+
+    FakeManagedProcess.instances[0].crash(returncode=7)
+    restarted = await pool.restart_crashed_pinned_ds4()
+
+    assert restarted == ["foo"]
+    assert len(FakeManagedProcess.instances) == 2
+    assert FakeManagedProcess.instances[0].stopped is True
+    assert FakeManagedProcess.instances[1].started is True
+    status = pool.get_status()["models"][0]
+    assert status["ds4"]["running"] is True
+    assert status["ds4"]["restart_count"] == 1
+    assert status["ds4"]["last_crash_exit_code"] == 7
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_leaves_unpinned_crashed_ds4_stopped_until_request(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    pool = _pool_with_ds4(tmp_path)
+    await pool.get_engine("foo")
+
+    FakeManagedProcess.instances[0].crash(returncode=8)
+    restarted = await pool.restart_crashed_pinned_ds4()
+
+    assert restarted == []
+    assert len(FakeManagedProcess.instances) == 1
+    status = pool.get_status()["models"][0]
+    assert status["ds4"]["running"] is False
+    assert status["ds4"]["crashed"] is True
+    assert status["ds4"]["exit_code"] == 8
+    assert status["ds4"]["crash_count"] == 1
+    assert status["ds4"]["last_crash_exit_code"] == 8
+    assert status["ds4"]["last_crash_logs"] == "fake ds4 logs"
+
+    status_again = pool.get_status()["models"][0]
+    assert status_again["ds4"]["crash_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ttl_check_restarts_crashed_pinned_ds4_models(
+    monkeypatch, tmp_path
+):
+    _patch_fake_process(monkeypatch)
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(base_path=tmp_path, ds4_settings=DS4Settings())
+    pool._get_final_ceiling = lambda: 0
+    pool.discover_models(str(tmp_path), pinned_models=["foo"])
+    await pool.preload_pinned_models()
+
+    class SettingsManager:
+        def get_settings(self, model_id):
+            from omlx.model_settings import ModelSettings
+
+            return ModelSettings(ttl_seconds=0)
+
+    FakeManagedProcess.instances[0].crash(returncode=7)
+    expired = await pool.check_ttl_expirations(SettingsManager())
+
+    assert expired == []
+    assert len(FakeManagedProcess.instances) == 2
+    assert FakeManagedProcess.instances[1].started is True
 
 
 @pytest.mark.asyncio

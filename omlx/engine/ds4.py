@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +96,12 @@ class DS4ProcessEngine(BaseEngine):
         self.auto_enable_ssd_streaming = auto_enable_ssd_streaming
         self.process: DS4ManagedProcess | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._crash_count = 0
+        self._restart_count = 0
+        self._last_crash_exit_code: int | None = None
+        self._last_crash_logs = ""
+        self._last_crash_monotonic_time: float | None = None
+        self._recorded_crash_process_id: int | None = None
         self._active_requests = 0
         self._active_requests_lock = threading.Lock()
 
@@ -128,6 +135,15 @@ class DS4ProcessEngine(BaseEngine):
     def is_running(self) -> bool:
         """Return True while the managed DS4 subprocess is alive."""
         return self.process is not None and self.process.is_running
+
+    def _process_returncode(self) -> int | None:
+        process = self.process.process if self.process is not None else None
+        return process.returncode if process is not None else None
+
+    def has_crashed(self) -> bool:
+        """Return True when the managed DS4 subprocess exited unexpectedly."""
+        process = self.process.process if self.process is not None else None
+        return process is not None and process.returncode is not None
 
     async def start(self) -> None:
         """Start DS4 and wait for readiness."""
@@ -176,6 +192,55 @@ class DS4ProcessEngine(BaseEngine):
             if was_running:
                 await self.start()
             return True
+
+    def _record_crashed_process(self) -> None:
+        process = self.process
+        process_obj = process.process if process is not None else None
+        if process is None or process_obj is None or process_obj.returncode is None:
+            return
+        process_id = id(process_obj)
+        if self._recorded_crash_process_id == process_id:
+            return
+        self._recorded_crash_process_id = process_id
+        self._crash_count += 1
+        self._last_crash_exit_code = process_obj.returncode
+        self._last_crash_logs = process.recent_log_text()
+        self._last_crash_monotonic_time = time.monotonic()
+
+    async def _restart_stopped_locked(self) -> bool:
+        """Restart a stopped/crashed DS4 subprocess while lifecycle-locked."""
+        if self.is_running:
+            return False
+        if self.has_active_requests():
+            raise DS4ProxyError(
+                "DS4 backend process exited while another request is active; "
+                "retry when idle"
+            )
+        had_process = self.process is not None
+        if had_process:
+            self._record_crashed_process()
+            await self.stop()
+        try:
+            await self.start()
+        except Exception as exc:  # noqa: BLE001 - normalize restart failures
+            raise DS4ProxyError(
+                f"DS4 backend restart after crash failed: {exc}"
+            ) from exc
+        if had_process:
+            self._restart_count += 1
+        return had_process
+
+    async def restart_if_crashed(self) -> bool:
+        """Restart an idle DS4 subprocess that exited after being loaded."""
+        async with self._lifecycle_lock:
+            if not self.has_crashed():
+                return False
+            return await self._restart_stopped_locked()
+
+    async def _ensure_running_for_request_locked(self) -> None:
+        if self.is_running:
+            return
+        await self._restart_stopped_locked()
 
     def _increment_active_requests(self) -> None:
         with self._active_requests_lock:
@@ -272,6 +337,7 @@ class DS4ProcessEngine(BaseEngine):
         body: dict[str, Any],
     ) -> DS4ProxyResponse:
         async with self._lifecycle_lock:
+            await self._ensure_running_for_request_locked()
             self._increment_active_requests()
             task = asyncio.create_task(
                 asyncio.to_thread(
@@ -304,6 +370,7 @@ class DS4ProcessEngine(BaseEngine):
         body: dict[str, Any],
     ) -> DS4StreamingProxyResponse:
         async with self._lifecycle_lock:
+            await self._ensure_running_for_request_locked()
             self._increment_active_requests()
             task = asyncio.create_task(
                 asyncio.to_thread(
@@ -388,6 +455,8 @@ class DS4ProcessEngine(BaseEngine):
 
     def get_stats(self) -> dict[str, Any]:
         """Return DS4 lifecycle/status fields for admin/status endpoints."""
+        if self.has_crashed():
+            self._record_crashed_process()
         command = self.process.command if self.process is not None else None
         logs = self.process.recent_log_text() if self.process is not None else ""
         return {
@@ -396,6 +465,13 @@ class DS4ProcessEngine(BaseEngine):
             "port": self.port,
             "pid": self.pid,
             "running": self.is_running,
+            "crashed": self.has_crashed(),
+            "exit_code": self._process_returncode(),
+            "crash_count": self._crash_count,
+            "restart_count": self._restart_count,
+            "last_crash_exit_code": self._last_crash_exit_code,
+            "last_crash_logs": self._last_crash_logs,
+            "last_crash_monotonic_time": self._last_crash_monotonic_time,
             "rss_bytes": self.get_process_rss_bytes(),
             "context_tokens": self.effective_context_tokens(),
             "command": command,

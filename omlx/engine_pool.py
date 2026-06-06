@@ -1343,6 +1343,46 @@ class EnginePool:
             except Exception as e:
                 logger.error(f"Failed to preload pinned model {model_id}: {e}")
 
+    async def restart_crashed_pinned_ds4(self) -> list[str]:
+        """Restart pinned DS4 subprocesses that exited while loaded."""
+        async with self._lock:
+            return await self._restart_crashed_pinned_ds4_locked()
+
+    async def _restart_crashed_pinned_ds4_locked(self) -> list[str]:
+        restarted: list[str] = []
+        now = time.time()
+        for model_id, entry in self._entries.items():
+            if (
+                entry.engine_type != "ds4"
+                or entry.engine is None
+                or not entry.is_pinned
+                or entry.is_loading
+            ):
+                continue
+            has_crashed = getattr(entry.engine, "has_crashed", None)
+            if not callable(has_crashed) or not has_crashed():
+                continue
+            if entry.in_use > 0 or entry.engine.has_active_requests():
+                entry.last_access = now
+                continue
+            restart = getattr(entry.engine, "restart_if_crashed", None)
+            if not callable(restart):
+                continue
+            try:
+                logger.warning("Restarting crashed pinned DS4 model: %s", model_id)
+                did_restart = await restart()
+            except Exception as e:  # noqa: BLE001 - keep health loop alive
+                logger.error("Failed to restart pinned DS4 model %s: %s", model_id, e)
+                continue
+            if not did_restart:
+                continue
+            entry.last_access = now
+            get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+            if callable(get_rss):
+                entry.actual_size = get_rss() or entry.actual_size
+            restarted.append(model_id)
+        return restarted
+
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         async with self._lock:
@@ -1437,6 +1477,7 @@ class EnginePool:
         expired: list[str] = []
 
         async with self._lock:
+            await self._restart_crashed_pinned_ds4_locked()
             for model_id, entry in self._entries.items():
                 if entry.engine is None or entry.is_loading or entry.is_pinned:
                     continue
