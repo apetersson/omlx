@@ -2012,26 +2012,47 @@ async def _create_markitdown_chat_completion(
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
+    seen_model_ids: set[str] = set()
+
+    def add_model_info(display_id: str, *, context_model_id: str) -> None:
+        if display_id in seen_model_ids:
+            return
+        seen_model_ids.add(display_id)
+        models.append(
+            ModelInfo(
+                id=display_id,
+                owned_by="omlx",
+                max_model_len=get_max_context_window(context_model_id),
+            )
+        )
 
     if _server_state.engine_pool is not None:
+        from .ds4_aliases import ds4_aliases_for_model
+
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
+        display_ids_by_model: dict[str, str] = {}
         for m in status["models"]:
             model_id = m["id"]
             display_id = model_id
             if settings_manager:
                 ms = settings_manager.get_settings(model_id)
-                if ms.model_alias:
+                if ms and ms.model_alias:
                     display_id = ms.model_alias
-            models.append(
-                ModelInfo(
-                    id=display_id,
-                    owned_by="omlx",
-                    max_model_len=get_max_context_window(model_id),
-                )
-            )
+            display_ids_by_model[model_id] = display_id
 
-    if _markitdown_is_visible() and not any(m.id == MARKITDOWN_MODEL_ID for m in models):
+        reserved_display_ids = set(display_ids_by_model.values())
+        for m in status["models"]:
+            model_id = m["id"]
+            display_id = display_ids_by_model[model_id]
+            add_model_info(display_id, context_model_id=model_id)
+            if m.get("engine_type") == "ds4":
+                for alias in ds4_aliases_for_model(display_id):
+                    if alias.alias_id in reserved_display_ids:
+                        continue
+                    add_model_info(alias.alias_id, context_model_id=model_id)
+
+    if _markitdown_is_visible() and MARKITDOWN_MODEL_ID not in seen_model_ids:
         models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
 
     return ModelsResponse(data=models)
@@ -2059,12 +2080,20 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
 
         # Resolve effective max_tokens: model setting > global default
         max_tokens = _server_state.sampling.max_tokens
+        display_id = model_id
         if _server_state.settings_manager:
             ms = _server_state.settings_manager.get_settings(model_id)
             if ms and ms.model_alias:
                 m["model_alias"] = ms.model_alias
+                display_id = ms.model_alias
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
+        if m.get("engine_type") == "ds4":
+            from .ds4_aliases import ds4_aliases_for_model
+
+            m["ds4_aliases"] = [
+                alias.alias_id for alias in ds4_aliases_for_model(display_id)
+            ]
         m["max_tokens"] = max_tokens
     return status
 

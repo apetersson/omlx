@@ -18,7 +18,7 @@ import gc
 import logging
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -27,22 +27,22 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from .ds4_aliases import parse_ds4_alias_id
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
-from .engine.stt import STTEngine
 from .engine.sts import STSEngine
+from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
+from .engine_core import get_mlx_executor
 from .exceptions import (
-    EnginePoolError,
     InsufficientMemoryError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from .model_discovery import DiscoveredModel, discover_models, format_size
-from .engine_core import get_mlx_executor
+from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -340,6 +340,33 @@ class EnginePool:
                 return mid
         return None
 
+    def _resolve_ds4_alias_id(
+        self, alias_id: str, all_settings: dict | None
+    ) -> str | None:
+        """Resolve OMLX-managed DS4 suffix aliases to the base DS4 model id."""
+        parsed = parse_ds4_alias_id(alias_id)
+        if parsed is None:
+            return None
+
+        base_id, _kind = parsed
+        entry = self._entries.get(base_id)
+        if entry is not None and self._is_ds4_entry(entry):
+            return base_id
+
+        ci_match = self._case_insensitive_entry_match(base_id)
+        if ci_match is not None and self._is_ds4_entry(self._entries[ci_match]):
+            return ci_match
+
+        if all_settings is not None:
+            for mid, ms in all_settings.items():
+                entry = self._entries.get(mid)
+                if entry is None or not self._is_ds4_entry(entry):
+                    continue
+                if getattr(ms, "model_alias", None) == base_id:
+                    return mid
+
+        return None
+
     def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
@@ -358,10 +385,14 @@ class EnginePool:
 
         all_settings = None
         if settings_manager is not None:
-            all_settings = settings_manager.get_all_settings()
+            all_settings = settings_manager.get_all_settings() or {}
             for mid, ms in all_settings.items():
-                if ms.model_alias and ms.model_alias == model_id_or_alias:
+                if getattr(ms, "model_alias", None) == model_id_or_alias:
                     return mid
+
+        ds4_alias_match = self._resolve_ds4_alias_id(model_id_or_alias, all_settings)
+        if ds4_alias_match is not None:
+            return ds4_alias_match
 
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
@@ -373,8 +404,11 @@ class EnginePool:
                 return ci_match
             if all_settings is not None:
                 for mid, ms in all_settings.items():
-                    if ms.model_alias and ms.model_alias == stripped:
+                    if getattr(ms, "model_alias", None) == stripped:
                         return mid
+            ds4_alias_match = self._resolve_ds4_alias_id(stripped, all_settings)
+            if ds4_alias_match is not None:
+                return ds4_alias_match
 
         return model_id_or_alias
 
