@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -14,6 +15,7 @@ from omlx.ds4_process import (
     DS4LaunchConfig,
     DS4ManagedProcess,
     DS4ProcessError,
+    prune_ds4_kv_cache,
     safe_ds4_fs_name,
 )
 from omlx.ds4_support import DS4_METAL_FILES, DS4_SERVER_BINARY, DS4SupportError
@@ -80,6 +82,79 @@ import time
 print('fake ds4 never ready', flush=True)
 time.sleep(60)
 """
+
+
+class TestDS4KVPruning:
+    """Tests for global DS4 disk KV budget enforcement."""
+
+    def test_prune_ds4_kv_cache_deletes_oldest_kv_files_only(self, tmp_path):
+        root = tmp_path / "kv"
+        old_dir = root / "old-model"
+        new_dir = root / "new-model"
+        old_dir.mkdir(parents=True)
+        new_dir.mkdir(parents=True)
+        old_kv = old_dir / "old.kv"
+        new_kv = new_dir / "new.kv"
+        non_kv = old_dir / "notes.txt"
+        old_kv.write_bytes(b"a" * 10)
+        new_kv.write_bytes(b"b" * 10)
+        non_kv.write_bytes(b"c" * 100)
+        old_mtime = 1_700_000_000
+        new_mtime = old_mtime + 100
+        os.utime(old_kv, (old_mtime, old_mtime))
+        os.utime(new_kv, (new_mtime, new_mtime))
+
+        result = prune_ds4_kv_cache(root, max_bytes=15)
+
+        assert result.bytes_before == 20
+        assert result.files_before == 2
+        assert result.deleted_files == (old_kv.resolve(),)
+        assert result.deleted_bytes == 10
+        assert result.bytes_after == 10
+        assert result.files_after == 1
+        assert not old_kv.exists()
+        assert new_kv.exists()
+        assert non_kv.exists()
+
+    def test_prepare_directories_prunes_global_kv_root_budget(self, tmp_path):
+        kv_root = tmp_path / "kv"
+        old_dir = kv_root / "old-model"
+        new_dir = kv_root / "new-model"
+        old_dir.mkdir(parents=True)
+        new_dir.mkdir(parents=True)
+        old_kv = old_dir / "old.kv"
+        new_kv = new_dir / "new.kv"
+        old_kv.write_bytes(b"a" * 800_000)
+        new_kv.write_bytes(b"b" * 800_000)
+        old_mtime = 1_700_000_000
+        new_mtime = old_mtime + 100
+        os.utime(old_kv, (old_mtime, old_mtime))
+        os.utime(new_kv, (new_mtime, new_mtime))
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"gguf")
+        settings = DS4Settings(
+            kv_root=str(kv_root),
+            kv_disk_space_mb=1,
+            debug_dir=str(tmp_path / "debug"),
+        )
+        managed = DS4ManagedProcess(
+            DS4LaunchConfig(
+                model_id="current/model",
+                gguf_path=gguf,
+                settings=settings,
+                base_path=tmp_path,
+            )
+        )
+
+        managed._prepare_directories()
+
+        assert (kv_root / "current-model").is_dir()
+        assert not old_kv.exists()
+        assert new_kv.exists()
+        assert managed.last_kv_prune_result is not None
+        assert managed.last_kv_prune_result.max_bytes == 1024 * 1024
+        assert managed.last_kv_prune_result.deleted_files == (old_kv.resolve(),)
+        assert managed.last_kv_prune_result.bytes_after == 800_000
 
 
 class TestDS4LaunchConfig:

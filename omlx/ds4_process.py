@@ -9,6 +9,7 @@ It intentionally does not implement request forwarding yet.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import socket
 import time
@@ -24,10 +25,25 @@ from .settings import DEFAULT_BASE_PATH, DS4Settings
 
 DS4_HOST = "127.0.0.1"
 _DS4_FS_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+logger = logging.getLogger(__name__)
 
 
 class DS4ProcessError(RuntimeError):
     """Raised when a managed DS4 process cannot start or become ready."""
+
+
+@dataclass(frozen=True)
+class DS4KVPruneResult:
+    """Summary of DS4 disk KV cache budget enforcement."""
+
+    root: Path
+    max_bytes: int
+    files_before: int
+    bytes_before: int
+    files_after: int
+    bytes_after: int
+    deleted_files: tuple[Path, ...]
+    deleted_bytes: int
 
 
 @dataclass(frozen=True)
@@ -161,6 +177,56 @@ def find_free_localhost_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _scan_ds4_kv_files(root: Path) -> list[tuple[float, Path, int]]:
+    """Return `(mtime, path, size)` for all recursive DS4 `*.kv` files."""
+    if not root.exists():
+        return []
+    files: list[tuple[float, Path, int]] = []
+    for path in root.rglob("*.kv"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+        files.append((stat.st_mtime, path, int(stat.st_size)))
+    return files
+
+
+def prune_ds4_kv_cache(root: Path, max_bytes: int) -> DS4KVPruneResult:
+    """Prune oldest recursive DS4 `*.kv` files until the root is under budget."""
+    root = Path(root).expanduser().resolve()
+    before = _scan_ds4_kv_files(root)
+    bytes_before = sum(size for _, _, size in before)
+    deleted_files: list[Path] = []
+    deleted_bytes = 0
+    current_bytes = bytes_before
+
+    for _mtime, path, size in sorted(before, key=lambda item: (item[0], str(item[1]))):
+        if current_bytes <= max_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("Failed to prune DS4 KV cache file %s: %s", path, exc)
+            continue
+        deleted_files.append(path)
+        deleted_bytes += size
+        current_bytes = max(0, current_bytes - size)
+
+    after = _scan_ds4_kv_files(root)
+    return DS4KVPruneResult(
+        root=root,
+        max_bytes=max_bytes,
+        files_before=len(before),
+        bytes_before=bytes_before,
+        files_after=len(after),
+        bytes_after=sum(size for _, _, size in after),
+        deleted_files=tuple(deleted_files),
+        deleted_bytes=deleted_bytes,
+    )
+
+
 def _readiness_probe(host: str, port: int) -> bool:
     url = f"http://{host}:{port}/v1/models"
     request = urllib.request.Request(url, method="GET")
@@ -181,6 +247,7 @@ class DS4ManagedProcess:
         self.port: int | None = None
         self.command: list[str] | None = None
         self.logs: list[DS4LogLine] = []
+        self.last_kv_prune_result: DS4KVPruneResult | None = None
         self._log_tasks: list[asyncio.Task[None]] = []
 
     @property
@@ -262,7 +329,13 @@ class DS4ManagedProcess:
 
     def _prepare_directories(self) -> None:
         if self.config.settings.kv_cache_enabled:
+            kv_root = self.config.settings.get_kv_root(self.config.base_path)
+            kv_root.mkdir(parents=True, exist_ok=True)
             self.config.kv_dir.mkdir(parents=True, exist_ok=True)
+            self.last_kv_prune_result = prune_ds4_kv_cache(
+                kv_root,
+                self.config.settings.kv_disk_space_mb * 1024 * 1024,
+            )
         if self.config.settings.trace_enabled:
             self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
         self.config.debug_dir.mkdir(parents=True, exist_ok=True)
