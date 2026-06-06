@@ -2501,6 +2501,15 @@ def _is_ds4_completion_proxy_engine(engine: object) -> bool:
     )
 
 
+def _is_ds4_response_proxy_engine(engine: object) -> bool:
+    """Return True when *engine* can proxy Responses API requests to DS4."""
+    return (
+        getattr(engine, "model_type", None) == "ds4"
+        and callable(getattr(engine, "proxy_response", None))
+        and callable(getattr(engine, "open_response_stream", None))
+    )
+
+
 def _ds4_request_uses_suffix_alias(
     request_model: str,
     resolved_model: str,
@@ -2571,18 +2580,12 @@ def _ds4_sampling_params_without_force(
     }
 
 
-def _apply_ds4_suffix_alias_to_body(
-    body: dict,
-    *,
+def _ds4_suffix_alias_for_request(
     request_model: str,
     resolved_model: str,
-) -> dict:
-    """Apply DS4 per-model suffix alias request mutations in-place."""
-    from .ds4_aliases import (
-        ds4_model_for_alias_kind,
-        ds4_reasoning_effort_for_alias_kind,
-        parse_ds4_alias_id,
-    )
+):
+    """Return parsed DS4 suffix alias data when the request selected one."""
+    from .ds4_aliases import parse_ds4_alias_id
 
     alias_source = (
         request_model.split("/", 1)[1]
@@ -2593,12 +2596,59 @@ def _apply_ds4_suffix_alias_to_body(
     if parsed_alias is not None and _ds4_request_uses_suffix_alias(
         request_model, resolved_model
     ):
+        return parsed_alias
+    return None
+
+
+def _apply_ds4_suffix_alias_to_body(
+    body: dict,
+    *,
+    request_model: str,
+    resolved_model: str,
+) -> dict:
+    """Apply DS4 per-model suffix alias request mutations in-place."""
+    from .ds4_aliases import (
+        ds4_model_for_alias_kind,
+        ds4_reasoning_effort_for_alias_kind,
+    )
+
+    parsed_alias = _ds4_suffix_alias_for_request(request_model, resolved_model)
+    if parsed_alias is not None:
         alias_base, alias_kind = parsed_alias
         ds4_model = ds4_model_for_alias_kind(alias_kind)
         body["model"] = ds4_model or alias_base
         reasoning_effort = ds4_reasoning_effort_for_alias_kind(alias_kind)
         if reasoning_effort is not None:
             body["reasoning_effort"] = reasoning_effort
+    return body
+
+
+def _apply_ds4_responses_suffix_alias_to_body(
+    body: dict,
+    *,
+    request_model: str,
+    resolved_model: str,
+) -> dict:
+    """Apply DS4 suffix aliases using Responses API request shapes."""
+    from .ds4_aliases import (
+        ds4_model_for_alias_kind,
+        ds4_reasoning_effort_for_alias_kind,
+    )
+
+    parsed_alias = _ds4_suffix_alias_for_request(request_model, resolved_model)
+    if parsed_alias is not None:
+        alias_base, alias_kind = parsed_alias
+        ds4_model = ds4_model_for_alias_kind(alias_kind)
+        body["model"] = ds4_model or alias_base
+        reasoning_effort = ds4_reasoning_effort_for_alias_kind(alias_kind)
+        if reasoning_effort is not None:
+            reasoning = body.get("reasoning")
+            if not isinstance(reasoning, dict):
+                reasoning = {}
+            else:
+                reasoning = dict(reasoning)
+            reasoning["effort"] = reasoning_effort
+            body["reasoning"] = reasoning
     return body
 
 
@@ -2624,6 +2674,55 @@ def _build_ds4_completion_proxy_body(
     body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
     body.update(_ds4_sampling_params_without_force(request))
     return _apply_ds4_suffix_alias_to_body(
+        body,
+        request_model=request.model,
+        resolved_model=resolved_model,
+    )
+
+
+def _ds4_responses_sampling_params_without_force(
+    request: ResponsesRequest,
+    body: dict,
+) -> dict:
+    """Resolve Responses API DS4 sampling defaults without forcing clients."""
+    global_sampling = _server_state.sampling
+    model_settings = None
+    model_id = resolve_model_id(request.model)
+    if model_id and _server_state.settings_manager:
+        model_settings = _server_state.settings_manager.get_settings(model_id)
+
+    def choose(request_value, setting_name: str, default):
+        if request_value is not None:
+            return request_value
+        if model_settings is not None:
+            model_value = getattr(model_settings, setting_name, None)
+            if model_value is not None:
+                return model_value
+        return default
+
+    params = {
+        "temperature": choose(
+            request.temperature, "temperature", global_sampling.temperature
+        ),
+        "top_p": choose(request.top_p, "top_p", global_sampling.top_p),
+    }
+    if request.max_output_tokens is not None:
+        params["max_output_tokens"] = request.max_output_tokens
+    else:
+        params["max_output_tokens"] = choose(
+            None, "max_tokens", global_sampling.max_tokens
+        )
+    return params
+
+
+def _build_ds4_responses_proxy_body(
+    request: ResponsesRequest,
+    resolved_model: str,
+) -> dict:
+    """Build the JSON body sent to DS4 for OpenAI Responses API requests."""
+    body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
+    body.update(_ds4_responses_sampling_params_without_force(request, body))
+    return _apply_ds4_responses_suffix_alias_to_body(
         body,
         request_model=request.model,
         resolved_model=resolved_model,
@@ -2680,6 +2779,38 @@ async def _create_ds4_text_completion(
             )
 
         proxy = await engine.proxy_completion(body)
+        return Response(
+            content=proxy.body,
+            status_code=proxy.status_code,
+            media_type=_proxy_response_media_type(proxy.headers, "application/json"),
+            headers=_proxy_response_headers(proxy.headers),
+        )
+    except DS4ProxyError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _create_ds4_response(
+    engine: object,
+    request: ResponsesRequest,
+    resolved_model: str,
+):
+    """Proxy an OpenAI Responses API request to the managed DS4 backend."""
+    from .engine.ds4 import DS4ProxyError
+
+    body = _build_ds4_responses_proxy_body(request, resolved_model)
+    try:
+        if request.stream:
+            proxy = await engine.open_response_stream(body)
+            return _DS4StreamingResponse(
+                proxy,
+                status_code=proxy.status_code,
+                media_type=_proxy_response_media_type(
+                    proxy.headers, "text/event-stream"
+                ),
+                headers=_proxy_response_headers(proxy.headers),
+            )
+
+        proxy = await engine.proxy_response(body)
         return Response(
             content=proxy.body,
             status_code=proxy.status_code,
@@ -4595,6 +4726,9 @@ async def create_response(
     model_load_duration = time.perf_counter() - load_start
 
     resolved_model = resolve_model_id(request.model) or request.model
+
+    if _is_ds4_response_proxy_engine(engine):
+        return await _create_ds4_response(engine, request, resolved_model)
 
     current_input_messages = convert_responses_input_to_messages(request.input)
 

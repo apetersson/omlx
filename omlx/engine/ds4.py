@@ -266,6 +266,10 @@ class DS4ProcessEngine(BaseEngine):
         """Forward one non-streaming OpenAI text completion request to DS4."""
         return await self._proxy_json_endpoint("/v1/completions", body)
 
+    async def proxy_response(self, body: dict[str, Any]) -> DS4ProxyResponse:
+        """Forward one non-streaming OpenAI Responses API request to DS4."""
+        return await self._proxy_json_endpoint("/v1/responses", body)
+
     async def _open_json_stream(
         self,
         path: str,
@@ -328,6 +332,12 @@ class DS4ProcessEngine(BaseEngine):
     ) -> DS4StreamingProxyResponse:
         """Open a streaming OpenAI text completion request to DS4."""
         return await self._open_json_stream("/v1/completions", body)
+
+    async def open_response_stream(
+        self, body: dict[str, Any]
+    ) -> DS4StreamingProxyResponse:
+        """Open a streaming OpenAI Responses API request to DS4."""
+        return await self._open_json_stream("/v1/responses", body)
 
     def get_process_rss_bytes(self) -> int | None:
         """Return the DS4 subprocess RSS when psutil can observe it."""
