@@ -19,6 +19,7 @@ from omlx.api.responses_models import ResponsesRequest
 from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyResponse
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
+from omlx.server_metrics import get_server_metrics, reset_server_metrics
 
 
 class _SettingsManager:
@@ -149,13 +150,17 @@ class _FakeDS4Engine(DS4ProcessEngine):
         self.response_stream_bodies: list[dict] = []
         self.anthropic_bodies: list[dict] = []
         self.anthropic_stream_bodies: list[dict] = []
+        self.chat_response_body = b'{"ds4":true,"choices":[]}'
+        self.completion_response_body = b'{"ds4_completion":true,"choices":[]}'
+        self.responses_response_body = b'{"ds4_response":true,"output":[]}'
+        self.anthropic_response_body = b'{"type":"message","content":[]}'
 
     async def proxy_chat_completion(self, body: dict):
         self.proxy_bodies.append(body)
         return DS4ProxyResponse(
             status_code=201,
             headers={"Content-Type": "application/json; charset=utf-8"},
-            body=b'{"ds4":true,"choices":[]}',
+            body=self.chat_response_body,
         )
 
     async def open_chat_completion_stream(self, body: dict):
@@ -170,7 +175,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
         return DS4ProxyResponse(
             status_code=202,
             headers={"Content-Type": "application/json; charset=utf-8"},
-            body=b'{"ds4_completion":true,"choices":[]}',
+            body=self.completion_response_body,
         )
 
     async def open_completion_stream(self, body: dict):
@@ -185,7 +190,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
         return DS4ProxyResponse(
             status_code=203,
             headers={"Content-Type": "application/json; charset=utf-8"},
-            body=b'{"ds4_response":true,"output":[]}',
+            body=self.responses_response_body,
         )
 
     async def open_response_stream(self, body: dict):
@@ -200,7 +205,7 @@ class _FakeDS4Engine(DS4ProcessEngine):
         return DS4ProxyResponse(
             status_code=204,
             headers={"Content-Type": "application/json; charset=utf-8"},
-            body=b'{"type":"message","content":[]}',
+            body=self.anthropic_response_body,
         )
 
     async def open_anthropic_message_stream(self, body: dict):
@@ -669,6 +674,57 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
     assert body["xtc_probability"] == 0.0
     assert body["xtc_threshold"] == 0.1
     assert body["max_tokens"] == 123
+
+
+def test_ds4_usage_parser_handles_openai_responses_and_anthropic_shapes():
+    from omlx.server import _ds4_usage_from_body
+
+    assert _ds4_usage_from_body(
+        b'{"usage":{"prompt_tokens":10,"completion_tokens":4,'
+        b'"prompt_tokens_details":{"cached_tokens":3}}}'
+    ) == (10, 4, 3)
+    assert _ds4_usage_from_body(
+        b'{"usage":{"input_tokens":12,"output_tokens":5,'
+        b'"input_tokens_details":{"cached_tokens":2}}}'
+    ) == (12, 5, 2)
+    assert _ds4_usage_from_body(
+        b'{"usage":{"input_tokens":8,"output_tokens":6,'
+        b'"cache_read_input_tokens":4}}'
+    ) == (8, 6, 4)
+    assert _ds4_usage_from_body(
+        b'{"usage":{"prompt_tokens":10,"completion_tokens":4,'
+        b'"cached_tokens":9,"prompt_tokens_details":{"cached_tokens":3}}}'
+    ) == (10, 4, 9)
+    assert _ds4_usage_from_body(b"not json") == (0, 0, 0)
+
+
+def test_ds4_non_streaming_proxy_records_usage_metrics(tmp_path):
+    reset_server_metrics()
+    engine = _FakeDS4Engine(tmp_path)
+    engine.chat_response_body = (
+        b'{"ds4":true,"choices":[],"usage":{"prompt_tokens":10,'
+        b'"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}'
+    )
+
+    try:
+        with _client_with_engine(engine) as (client, _pool):
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "foo",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        assert response.status_code == 201
+        assert response.content == engine.chat_response_body
+        snapshot = get_server_metrics().get_snapshot(model_id="foo")
+        assert snapshot["total_requests"] == 1
+        assert snapshot["total_prompt_tokens"] == 10
+        assert snapshot["total_completion_tokens"] == 4
+        assert snapshot["total_cached_tokens"] == 3
+    finally:
+        reset_server_metrics()
 
 
 def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(

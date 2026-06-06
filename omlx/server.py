@@ -2795,6 +2795,69 @@ def _proxy_response_headers(headers: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in excluded}
 
 
+def _ds4_int_usage_value(value: object) -> int:
+    """Return a non-negative integer usage value, ignoring malformed data."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    return 0
+
+
+def _ds4_usage_from_body(body: bytes) -> tuple[int, int, int]:
+    """Parse DS4 non-streaming usage fields without changing response bytes."""
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+        return 0, 0, 0
+    if not isinstance(payload, dict):
+        return 0, 0, 0
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0, 0
+
+    prompt_tokens = _ds4_int_usage_value(
+        usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    )
+    completion_tokens = _ds4_int_usage_value(
+        usage.get("completion_tokens", usage.get("output_tokens", 0))
+    )
+    cached_candidates = [_ds4_int_usage_value(usage.get("cached_tokens", 0))]
+
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, dict):
+        cached_candidates.append(
+            _ds4_int_usage_value(prompt_details.get("cached_tokens", 0))
+        )
+
+    input_details = usage.get("input_tokens_details")
+    if isinstance(input_details, dict):
+        cached_candidates.append(
+            _ds4_int_usage_value(input_details.get("cached_tokens", 0))
+        )
+
+    cached_candidates.append(_ds4_int_usage_value(usage.get("cache_read_input_tokens", 0)))
+    cached_tokens = max(cached_candidates)
+    return prompt_tokens, completion_tokens, cached_tokens
+
+
+def _record_ds4_proxy_metrics(
+    *,
+    body: bytes,
+    elapsed: float,
+    resolved_model: str,
+) -> None:
+    """Record best-effort server metrics for one non-streaming DS4 response."""
+    prompt_tokens, completion_tokens, cached_tokens = _ds4_usage_from_body(body)
+    get_server_metrics().record_request_complete(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
+        generation_duration=elapsed,
+        model_id=resolved_model,
+    )
+
+
 class _DS4StreamingResponse(StreamingResponse):
     """StreamingResponse variant that always closes its DS4 upstream proxy."""
 
@@ -2832,7 +2895,13 @@ async def _create_ds4_text_completion(
                 headers=_proxy_response_headers(proxy.headers),
             )
 
+        proxy_start = time.perf_counter()
         proxy = await engine.proxy_completion(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
         return Response(
             content=proxy.body,
             status_code=proxy.status_code,
@@ -2864,7 +2933,13 @@ async def _create_ds4_response(
                 headers=_proxy_response_headers(proxy.headers),
             )
 
+        proxy_start = time.perf_counter()
         proxy = await engine.proxy_response(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
         return Response(
             content=proxy.body,
             status_code=proxy.status_code,
@@ -2896,7 +2971,13 @@ async def _create_ds4_anthropic_message(
                 headers=_proxy_response_headers(proxy.headers),
             )
 
+        proxy_start = time.perf_counter()
         proxy = await engine.proxy_anthropic_message(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
         return Response(
             content=proxy.body,
             status_code=proxy.status_code,
@@ -2928,7 +3009,13 @@ async def _create_ds4_chat_completion(
                 headers=_proxy_response_headers(proxy.headers),
             )
 
+        proxy_start = time.perf_counter()
         proxy = await engine.proxy_chat_completion(body)
+        _record_ds4_proxy_metrics(
+            body=proxy.body,
+            elapsed=time.perf_counter() - proxy_start,
+            resolved_model=resolved_model,
+        )
         return Response(
             content=proxy.body,
             status_code=proxy.status_code,
