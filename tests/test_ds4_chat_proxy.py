@@ -16,7 +16,11 @@ from fastapi.testclient import TestClient
 from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
 from omlx.api.openai_models import ChatCompletionRequest, CompletionRequest, Message
 from omlx.api.responses_models import ResponsesRequest
-from omlx.engine.ds4 import DS4ProcessEngine, DS4ProxyResponse
+from omlx.engine.ds4 import (
+    DS4ProcessEngine,
+    DS4ProxyResponse,
+    DS4StreamingProxyResponse,
+)
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
 from omlx.server_metrics import get_server_metrics, reset_server_metrics
@@ -88,12 +92,29 @@ class _RawResponseBody:
     def __init__(self, *, content: bytes = b"", chunks: list[bytes] | None = None):
         self.content = content
         self.chunks = chunks or []
+        self._read_buffer = b"".join(self.chunks) if self.chunks else self.content
+        self._read_offset = 0
 
-    def read(self, decode_content=True):
-        return self.content
+    def read(self, amt=None, decode_content=True):
+        if amt is None:
+            data = self._read_buffer[self._read_offset :]
+            self._read_offset = len(self._read_buffer)
+            return data
+        end = min(self._read_offset + amt, len(self._read_buffer))
+        data = self._read_buffer[self._read_offset : end]
+        self._read_offset = end
+        return data
 
     def stream(self, amt=None, decode_content=True):
         yield from self.chunks
+
+
+class _BufferingRawResponseBody(_RawResponseBody):
+    def stream(self, amt=None, decode_content=True):
+        if self.chunks:
+            yield b"".join(self.chunks)
+        elif self.content:
+            yield self.content
 
 
 class _RequestsResponse:
@@ -405,6 +426,29 @@ async def test_ds4_process_engine_stream_tracks_active_until_consumed(
     assert backend_response.closed is True
     assert session.closed is True
     assert engine.has_active_requests() is False
+
+
+def test_ds4_streaming_proxy_flushes_buffered_raw_sse_events():
+    """SSE events are yielded individually even if urllib3 stream would buffer."""
+    chunks = [b"data: one\n\n", b"data: two\n\n"]
+    response = _RequestsResponse(chunks=chunks)
+    response.raw = _BufferingRawResponseBody(chunks=chunks)
+    closed = False
+
+    def close():
+        nonlocal closed
+        closed = True
+
+    proxy = DS4StreamingProxyResponse(
+        status_code=200,
+        headers={"Content-Type": "text/event-stream"},
+        response=response,
+        on_close=close,
+    )
+
+    assert list(proxy.iter_bytes()) == chunks
+    assert closed is True
+    assert response.closed is True
 
 
 @pytest.mark.asyncio
@@ -819,6 +863,8 @@ def test_ds4_streaming_proxy_tees_usage_metrics_without_changing_bytes(tmp_path)
                 body = b"".join(response.iter_bytes())
 
         assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache"
+        assert response.headers["x-accel-buffering"] == "no"
         assert body == expected_body
         snapshot = get_server_metrics().get_snapshot(model_id="foo")
         assert snapshot["total_requests"] == 1

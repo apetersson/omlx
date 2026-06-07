@@ -19,6 +19,8 @@ from typing import Any
 
 import requests
 
+DS4_STREAM_FLUSH_BYTES = 128
+
 from ..ds4_process import DS4_HOST, DS4LaunchConfig, DS4ManagedProcess
 from ..settings import DEFAULT_BASE_PATH, DS4Settings
 from .base import BaseEngine, GenerationOutput
@@ -107,18 +109,55 @@ class DS4StreamingProxyResponse:
             self.session.close()
         self.on_close()
 
+    @staticmethod
+    def _raw_read(raw: object, amount: int) -> bytes:
+        """Read at most ``amount`` raw bytes without content decoding."""
+        read = getattr(raw, "read")
+        try:
+            return read(amount, decode_content=False)
+        except TypeError:
+            return read(amount)
+
+    @classmethod
+    def _iter_low_latency_raw_bytes(cls, raw: object) -> Iterator[bytes]:
+        """Yield raw SSE bytes as soon as an event boundary is observed.
+
+        urllib3's ``stream(amt)`` can wait until ``amt`` bytes or EOF for
+        non-chunked DS4 SSE responses, which makes clients see a fully buffered
+        stream even while DS4 is generating.  Reading a byte at a time and
+        flushing on SSE event separators keeps the response byte-preserving but
+        low-latency.
+        """
+        buffer = bytearray()
+        while True:
+            chunk = cls._raw_read(raw, 1)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            if (
+                buffer.endswith(b"\n\n")
+                or buffer.endswith(b"\r\n\r\n")
+                or len(buffer) >= DS4_STREAM_FLUSH_BYTES
+            ):
+                yield bytes(buffer)
+                buffer.clear()
+        if buffer:
+            yield bytes(buffer)
+
     def iter_bytes(self) -> Iterator[bytes]:
         """Yield DS4 response bytes without parsing or reformatting them."""
         if self.closed:
             return
         try:
             raw = getattr(self.response, "raw", None)
-            if raw is not None and hasattr(raw, "stream"):
-                for chunk in raw.stream(65536, decode_content=False):
+            if raw is not None and hasattr(raw, "read"):
+                yield from self._iter_low_latency_raw_bytes(raw)
+            elif raw is not None and hasattr(raw, "stream"):
+                for chunk in raw.stream(1, decode_content=False):
                     if chunk:
                         yield chunk
             else:
-                for chunk in self.response.iter_content(chunk_size=None):
+                for chunk in self.response.iter_content(chunk_size=1):
                     if chunk:
                         yield chunk
         finally:

@@ -2841,6 +2841,14 @@ def _proxy_response_headers(headers: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in excluded}
 
 
+def _proxy_streaming_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Return proxy headers appropriate for low-latency SSE forwarding."""
+    forwarded = _proxy_response_headers(headers)
+    forwarded.setdefault("Cache-Control", "no-cache")
+    forwarded.setdefault("X-Accel-Buffering", "no")
+    return forwarded
+
+
 def _ds4_int_usage_value(value: object) -> int:
     """Return a non-negative integer usage value, ignoring malformed data."""
     if isinstance(value, bool):
@@ -3054,7 +3062,7 @@ async def _create_ds4_text_completion(
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
                 ),
-                headers=_proxy_response_headers(proxy.headers),
+                headers=_proxy_streaming_response_headers(proxy.headers),
             )
 
         proxy_start = time.perf_counter()
@@ -3106,7 +3114,7 @@ async def _create_ds4_response(
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
                 ),
-                headers=_proxy_response_headers(proxy.headers),
+                headers=_proxy_streaming_response_headers(proxy.headers),
             )
 
         proxy_start = time.perf_counter()
@@ -3158,7 +3166,7 @@ async def _create_ds4_anthropic_message(
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
                 ),
-                headers=_proxy_response_headers(proxy.headers),
+                headers=_proxy_streaming_response_headers(proxy.headers),
             )
 
         proxy_start = time.perf_counter()
@@ -3210,7 +3218,7 @@ async def _create_ds4_chat_completion(
                 media_type=_proxy_response_media_type(
                     proxy.headers, "text/event-stream"
                 ),
-                headers=_proxy_response_headers(proxy.headers),
+                headers=_proxy_streaming_response_headers(proxy.headers),
             )
 
         proxy_start = time.perf_counter()
