@@ -50,6 +50,14 @@ from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
 
+_DS4_AUTO_ADMISSION_SETTLE_TIMEOUT_SECONDS = 8.0
+_DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS = 0.5
+# DS4 itself is a single-process backend. When a frontend switches models it
+# often cancels the old stream and immediately sends the new request; keep the
+# new request queued here until the old stream is officially inactive.
+_DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS = 300.0
+_DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS = 0.1
+
 
 @dataclass
 class EngineEntry:
@@ -219,6 +227,87 @@ class EnginePool:
             format_size(admission_size),
         )
         return admission_size
+
+    async def _settle_ds4_auto_admission_after_eviction(
+        self,
+        entry: EngineEntry,
+        *,
+        current: int,
+        ceiling: int,
+    ) -> tuple[int, int]:
+        """Wait briefly for kernel memory ledgers before DS4 auto streaming.
+
+        DS4 teardown happens in a child process and can release Metal/wired
+        memory a little after the process exits. A single low dynamic ceiling
+        sampled immediately after eviction can otherwise force the next DS4
+        model into SSD streaming even though resident load would fit seconds
+        later.
+        """
+        if (
+            entry.engine_type != "ds4"
+            or self._get_ds4_settings().ssd_streaming != "auto"
+            or ceiling <= 0
+            or entry.estimated_size <= max(0, ceiling - current)
+        ):
+            return current, ceiling
+
+        best_current = current
+        best_ceiling = ceiling
+        best_available = max(0, ceiling - current)
+        deadline = time.monotonic() + _DS4_AUTO_ADMISSION_SETTLE_TIMEOUT_SECONDS
+        started = time.monotonic()
+        logged_wait = False
+
+        while time.monotonic() < deadline:
+            if not logged_wait:
+                logger.info(
+                    "Waiting for DS4 admission memory to settle for %s before "
+                    "auto-enabling SSD streaming: estimated %s exceeds "
+                    "available memory budget %s",
+                    entry.model_id,
+                    format_size(entry.estimated_size),
+                    format_size(best_available),
+                )
+                logged_wait = True
+
+            await asyncio.sleep(_DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS)
+            self._wake_process_memory_enforcer()
+
+            sampled_ceiling = self._current_ceiling()
+            sampled_current = self._current_admission_memory()
+            if sampled_ceiling <= 0:
+                logger.info(
+                    "DS4 admission memory guard disabled while settling %s "
+                    "after %.1fs; admitting without guarded ceiling",
+                    entry.model_id,
+                    time.monotonic() - started,
+                )
+                return sampled_current, 0
+            sampled_available = max(0, sampled_ceiling - sampled_current)
+            if sampled_available > best_available:
+                best_current = sampled_current
+                best_ceiling = sampled_ceiling
+                best_available = sampled_available
+
+            if sampled_ceiling > 0 and entry.estimated_size <= sampled_available:
+                logger.info(
+                    "DS4 admission memory settled for %s after %.1fs: "
+                    "available memory budget recovered to %s",
+                    entry.model_id,
+                    time.monotonic() - started,
+                    format_size(sampled_available),
+                )
+                return sampled_current, sampled_ceiling
+
+        if logged_wait:
+            logger.info(
+                "DS4 admission memory did not recover enough for resident "
+                "load of %s after %.1fs; best available memory budget was %s",
+                entry.model_id,
+                time.monotonic() - started,
+                format_size(best_available),
+            )
+        return best_current, best_ceiling
 
     @property
     def current_model_memory(self) -> int:
@@ -686,6 +775,10 @@ class EnginePool:
                         entry.in_use += 1
                     return entry.engine
 
+            ds4_evicted_for_singleton = await self._prepare_ds4_singleton_for_load(
+                entry
+            )
+
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
             # evicting LRU non-pinned models first; if the model still
@@ -695,7 +788,17 @@ class EnginePool:
             # not yet wired up), so we admit unconditionally.
             ceiling = self._current_ceiling()
             if ceiling > 0:
+                evicted_any = ds4_evicted_for_singleton
                 while True:
+                    ceiling = self._current_ceiling()
+                    if ceiling <= 0:
+                        if entry.engine_type == "ds4":
+                            self._prepare_ds4_auto_ssd_streaming(
+                                entry,
+                                current=self._current_admission_memory(),
+                                ceiling=0,
+                            )
+                        break
                     current = self._current_admission_memory()
                     admission_size = entry.estimated_size
                     projected = current + admission_size
@@ -715,7 +818,24 @@ class EnginePool:
                             f"{format_size(ceiling)})"
                         )
                         await self._unload_engine(victim)
+                        evicted_any = True
                         continue
+                    if evicted_any:
+                        (
+                            current,
+                            ceiling,
+                        ) = await self._settle_ds4_auto_admission_after_eviction(
+                            entry,
+                            current=current,
+                            ceiling=ceiling,
+                        )
+                        if ceiling <= 0:
+                            self._prepare_ds4_auto_ssd_streaming(
+                                entry,
+                                current=current,
+                                ceiling=0,
+                            )
+                            break
                     admission_size = self._prepare_ds4_auto_ssd_streaming(
                         entry,
                         current=current,
@@ -828,6 +948,101 @@ class EnginePool:
             return None
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
+
+    def _find_loaded_ds4_conflict(
+        self, model_id: str
+    ) -> tuple[str, EngineEntry] | None:
+        """Return another loaded DS4 entry, if any."""
+        for other_id, other in self._entries.items():
+            if other_id == model_id:
+                continue
+            if other.engine_type == "ds4" and other.engine is not None:
+                return other_id, other
+        return None
+
+    @staticmethod
+    def _ds4_entry_is_busy(entry: EngineEntry) -> bool:
+        if entry.in_use > 0:
+            return True
+        try:
+            return bool(
+                entry.engine is not None and entry.engine.has_active_requests()
+            )
+        except AttributeError:
+            return False
+
+    async def _wait_for_ds4_conflict_idle(
+        self, entry: EngineEntry, *, next_model_id: str
+    ) -> bool:
+        """Wait for a just-cancelled DS4 stream to close before switching."""
+        if not self._ds4_entry_is_busy(entry):
+            return True
+
+        deadline = time.monotonic() + _DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS
+        started = time.monotonic()
+        logger.info(
+            "Queueing DS4 switch to '%s' while active model '%s' finishes "
+            "cancelling",
+            next_model_id,
+            entry.model_id,
+        )
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS)
+            if not self._ds4_entry_is_busy(entry):
+                logger.info(
+                    "DS4 model '%s' became idle after %.1fs; continuing "
+                    "switch to '%s'",
+                    entry.model_id,
+                    time.monotonic() - started,
+                    next_model_id,
+                )
+                return True
+        logger.info(
+            "Timed out after %.1fs waiting for DS4 model '%s' to become "
+            "idle before switching to '%s'",
+            time.monotonic() - started,
+            entry.model_id,
+            next_model_id,
+        )
+        return False
+
+    async def _prepare_ds4_singleton_for_load(self, entry: EngineEntry) -> bool:
+        """Unload an idle DS4 conflict before loading another DS4 model."""
+        if entry.engine_type != "ds4":
+            return False
+
+        conflict = self._find_loaded_ds4_conflict(entry.model_id)
+        if conflict is None:
+            return False
+
+        other_id, other = conflict
+        if other.is_pinned:
+            raise ModelLoadingError(
+                entry.model_id,
+                message=(
+                    f"Cannot load DS4 model '{entry.model_id}' while pinned "
+                    f"DS4 model '{other_id}' is loaded"
+                ),
+            )
+        if not await self._wait_for_ds4_conflict_idle(
+            other, next_model_id=entry.model_id
+        ):
+            raise ModelLoadingError(
+                entry.model_id,
+                message=(
+                    f"Timed out waiting to switch DS4 model from '{other_id}' "
+                    f"to '{entry.model_id}' because the current request did "
+                    "not become idle"
+                ),
+            )
+
+        logger.info(
+            "Unloading DS4 process '%s' before switching to '%s'",
+            other_id,
+            entry.model_id,
+        )
+        await self._unload_engine(other_id)
+        return True
 
     @staticmethod
     def _resolve_scheduler_from_engine(engine: object) -> object | None:

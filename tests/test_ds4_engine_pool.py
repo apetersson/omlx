@@ -18,7 +18,7 @@ from omlx.engine.ds4 import (
     parse_ds4_progress_log_line,
 )
 from omlx.engine_pool import EnginePool
-from omlx.exceptions import InsufficientMemoryError
+from omlx.exceptions import InsufficientMemoryError, ModelLoadingError
 from omlx.server import ServerState, app
 from omlx.settings import DS4_THINK_MAX_CONTEXT_TOKENS, DS4Settings
 
@@ -604,6 +604,219 @@ async def test_engine_pool_auto_enables_ds4_ssd_streaming_when_budget_is_tight(
     assert launch.config.auto_enable_ssd_streaming is True
     assert "--ssd-streaming" in launch.command
     assert "--ssd-streaming-cache-experts" not in launch.command
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_waits_for_ds4_ceiling_recovery_after_eviction(
+    monkeypatch, tmp_path
+):
+    """A stale low ceiling after DS4 eviction should not force streaming."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_AUTO_ADMISSION_SETTLE_TIMEOUT_SECONDS",
+        2.0,
+    )
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS",
+        0.1,
+    )
+
+    (tmp_path / "Pro.gguf").write_bytes(b"0" * 1000)
+    (tmp_path / "Flash.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    ceiling = {"value": 20_000}
+    pool._get_final_ceiling = lambda: ceiling["value"]
+    pool.discover_models(str(tmp_path))
+    pool._entries["pro"].estimated_size = 10_000
+    pool._entries["flash"].estimated_size = 4_000
+
+    await pool.get_engine("pro")
+
+    ceiling["value"] = 1_500
+    sleep_calls = 0
+
+    async def recover_during_settle(_duration):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        ceiling["value"] = 20_000
+
+    monkeypatch.setattr("omlx.engine_pool.asyncio.sleep", recover_during_settle)
+
+    await pool.get_engine("flash")
+
+    launch = FakeManagedProcess.instances[-1]
+    assert sleep_calls >= 1
+    assert launch.config.auto_enable_ssd_streaming is False
+    assert "--ssd-streaming" not in launch.command
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_preserves_zero_ceiling_during_ds4_settle(
+    monkeypatch, tmp_path
+):
+    """A 0 ceiling sampled during DS4 settle still means guard disabled."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    monkeypatch.setattr(
+        "omlx.engine_pool.EnginePool._system_available_memory_bytes",
+        lambda self: 20_000,
+    )
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_AUTO_ADMISSION_SETTLE_TIMEOUT_SECONDS",
+        2.0,
+    )
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS",
+        0.1,
+    )
+
+    (tmp_path / "Pro.gguf").write_bytes(b"0" * 1000)
+    (tmp_path / "Flash.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    ceiling = {"value": 20_000}
+    pool._get_final_ceiling = lambda: ceiling["value"]
+    pool.discover_models(str(tmp_path))
+    pool._entries["pro"].estimated_size = 10_000
+    pool._entries["flash"].estimated_size = 4_000
+
+    await pool.get_engine("pro")
+
+    ceiling["value"] = 1_500
+
+    async def disable_guard_during_settle(_duration):
+        ceiling["value"] = 0
+
+    monkeypatch.setattr("omlx.engine_pool.asyncio.sleep", disable_guard_during_settle)
+
+    await pool.get_engine("flash")
+
+    launch = FakeManagedProcess.instances[-1]
+    assert launch.config.auto_enable_ssd_streaming is False
+    assert "--ssd-streaming" not in launch.command
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_unloads_idle_ds4_before_switch(monkeypatch, tmp_path):
+    """DS4 model switches must stop the old singleton process first."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    (tmp_path / "Pro.gguf").write_bytes(b"0" * 1000)
+    (tmp_path / "Flash.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    pool._get_final_ceiling = lambda: 20_000
+    pool.discover_models(str(tmp_path))
+    pool._entries["pro"].estimated_size = 4_000
+    pool._entries["flash"].estimated_size = 4_000
+
+    await pool.get_engine("pro")
+    await pool.get_engine("flash")
+
+    assert len(FakeManagedProcess.instances) == 2
+    assert FakeManagedProcess.instances[0].stopped is True
+    assert FakeManagedProcess.instances[1].started is True
+    assert pool._entries["pro"].engine is None
+    assert pool._entries["flash"].engine is not None
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_rejects_ds4_switch_while_current_request_active(
+    monkeypatch, tmp_path
+):
+    """A busy DS4 process should block switching before spawning a second one."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS",
+        0.2,
+    )
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS",
+        0.01,
+    )
+    (tmp_path / "Pro.gguf").write_bytes(b"0" * 1000)
+    (tmp_path / "Flash.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    pool._get_final_ceiling = lambda: 1_500
+    pool.discover_models(str(tmp_path))
+    pool._entries["pro"].estimated_size = 10_000
+    pool._entries["flash"].estimated_size = 4_000
+
+    await pool.get_engine("pro")
+    monkeypatch.setattr(
+        pool._entries["pro"].engine,
+        "has_active_requests",
+        lambda: True,
+    )
+
+    with pytest.raises(ModelLoadingError, match="Timed out waiting to switch"):
+        await pool.get_engine("flash")
+
+    assert len(FakeManagedProcess.instances) == 1
+    assert FakeManagedProcess.instances[0].stopped is False
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_waits_for_ds4_cancel_before_switch(
+    monkeypatch, tmp_path
+):
+    """A just-cancelled DS4 stream may go idle during the switch grace."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS",
+        1.0,
+    )
+    monkeypatch.setattr(
+        "omlx.engine_pool._DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS",
+        0.1,
+    )
+    (tmp_path / "Pro.gguf").write_bytes(b"0" * 1000)
+    (tmp_path / "Flash.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    pool._get_final_ceiling = lambda: 20_000
+    pool.discover_models(str(tmp_path))
+    pool._entries["pro"].estimated_size = 4_000
+    pool._entries["flash"].estimated_size = 4_000
+
+    await pool.get_engine("pro")
+    active = {"value": True}
+    monkeypatch.setattr(
+        pool._entries["pro"].engine,
+        "has_active_requests",
+        lambda: active["value"],
+    )
+
+    async def finish_cancel(_duration):
+        active["value"] = False
+
+    monkeypatch.setattr("omlx.engine_pool.asyncio.sleep", finish_cancel)
+
+    await pool.get_engine("flash")
+
+    assert len(FakeManagedProcess.instances) == 2
+    assert FakeManagedProcess.instances[0].stopped is True
+    assert FakeManagedProcess.instances[1].started is True
 
 
 @pytest.mark.asyncio

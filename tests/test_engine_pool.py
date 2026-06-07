@@ -984,6 +984,27 @@ class TestEnginePoolEviction:
             with pytest.raises(InsufficientMemoryError):
                 await pool.get_engine("model-b")
 
+    @pytest.mark.asyncio
+    async def test_ceiling_zero_after_refresh_disables_admission_guard(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """A refreshed 0 ceiling keeps its sentinel meaning: guard disabled."""
+        pool = EnginePool()
+        ceilings = iter([2500, 0])
+        pool._get_final_ceiling = lambda: next(ceilings)
+        pool.discover_models(str(small_mock_model_dir))
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.has_active_requests.return_value = False
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await pool.get_engine("model-a")
+
+        assert pool._entries["model-a"].engine is mock_engine
+
 
 class TestEnginePoolPrefillEviction:
     """Tests for request-time idle LRU eviction before prefill throttling."""
