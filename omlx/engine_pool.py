@@ -42,7 +42,8 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from .model_discovery import discover_models, format_size, normalize_ds4_gguf_model_id
+from .ds4_gguf import normalize_ds4_gguf_model_id
+from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
 from .settings import DEFAULT_BASE_PATH, DS4Settings
 from .utils.proc_memory import get_phys_footprint

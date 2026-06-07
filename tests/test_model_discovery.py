@@ -2,11 +2,13 @@
 """Tests for model discovery functionality."""
 
 import json
+import struct
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from omlx.ds4_gguf import normalize_ds4_gguf_model_id
 from omlx.model_discovery import (
     DiscoveredModel,
     _is_adapter_dir,
@@ -19,8 +21,37 @@ from omlx.model_discovery import (
     estimate_model_size,
     format_size,
     model_directory_access_error,
-    normalize_ds4_gguf_model_id,
 )
+
+
+def _write_minimal_gguf(
+    path: Path,
+    *,
+    architecture: str = "deepseek4",
+    split_no: int | None = None,
+    split_count: int | None = None,
+) -> None:
+    """Write a tiny GGUF v3 file with only metadata and no tensors."""
+    metadata: list[tuple[str, int, object]] = [("general.architecture", 8, architecture)]
+    if split_no is not None:
+        metadata.append(("split.no", 4, split_no))
+    if split_count is not None:
+        metadata.append(("split.count", 4, split_count))
+
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<IQQ", 3, 0, len(metadata)))
+        for key, value_type, value in metadata:
+            key_bytes = key.encode("utf-8")
+            f.write(struct.pack("<Q", len(key_bytes)))
+            f.write(key_bytes)
+            f.write(struct.pack("<I", value_type))
+            if value_type == 8:
+                value_bytes = str(value).encode("utf-8")
+                f.write(struct.pack("<Q", len(value_bytes)))
+                f.write(value_bytes)
+            else:
+                f.write(struct.pack("<I", int(value)))
 
 
 class TestDetectModelType:
@@ -731,6 +762,28 @@ class TestDiscoverModels:
         assert models["deepseek-v4-flash-gguf-q4-k-m"].estimated_size == int(
             2000 * 1.05
         )
+
+    def test_discover_skips_unsupported_ds4_gguf_architecture(self, tmp_path):
+        """Real GGUFs for non-DS4 architectures are not exposed as DS4."""
+        _write_minimal_gguf(tmp_path / "MiMo-V2.5-coder-Q2.gguf", architecture="mimo2")
+        _write_minimal_gguf(tmp_path / "DeepSeek-V4-Flash.gguf")
+
+        models = discover_models(tmp_path)
+
+        assert list(models) == ["deepseek-v4-flash"]
+        assert models["deepseek-v4-flash"].engine_type == "ds4"
+
+    def test_discover_skips_ds4_gguf_continuation_shards(self, tmp_path):
+        """Split GGUF continuation shards do not become separate model entries."""
+        first = tmp_path / "DeepSeek-V4-Flash-Q2-00001-of-00002.gguf"
+        second = tmp_path / "DeepSeek-V4-Flash-Q2-00002-of-00002.gguf"
+        _write_minimal_gguf(first, split_no=0, split_count=2)
+        _write_minimal_gguf(second, split_no=1, split_count=2)
+
+        models = discover_models(tmp_path)
+
+        assert list(models) == ["deepseek-v4-flash-q2-00001-of-00002"]
+        assert models["deepseek-v4-flash-q2-00001-of-00002"].model_path == str(first)
 
     def test_discover_mixed_mlx_and_ds4_entries(self, tmp_path):
         """Mixed MLX+GGUF directories expose separate entries."""

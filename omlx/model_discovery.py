@@ -23,6 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .ds4_gguf import (
+    DS4GGUFModelCandidate,
+    collect_ds4_gguf_model_candidates,
+    is_ds4_gguf_file,
+)
+
 logger = logging.getLogger(__name__)
 
 ModelType = Literal[
@@ -960,53 +966,6 @@ def _safetensors_has_mlx_metadata(path: Path) -> bool:
 
 
 _MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
-_DS4_ID_SEPARATORS_RE = re.compile(r"[^a-z0-9.]+")
-_DS4_ID_DASHES_RE = re.compile(r"-+")
-_DS4_GENERIC_GGUF_STEMS = {
-    "model",
-    "gguf",
-    "weights",
-    "consolidated",
-}
-
-
-def normalize_ds4_gguf_model_id(name: str) -> str:
-    """Normalize a DS4 GGUF file/repo name into an API model id.
-
-    DS4 model ids are intentionally lowercased and separator-normalized so
-    `Foo.gguf` and `foo` resolve consistently.  The original source casing is
-    kept separately in ``DiscoveredModel.display_name`` for UI presentation.
-    """
-    raw = name.strip()
-    if raw.lower().endswith(".gguf"):
-        raw = raw[:-5]
-    normalized = raw.lower()
-    normalized = _DS4_ID_SEPARATORS_RE.sub("-", normalized)
-    normalized = _DS4_ID_DASHES_RE.sub("-", normalized).strip("-.")
-    return normalized or "gguf-model"
-
-
-def _is_ds4_gguf_file(path: Path) -> bool:
-    """Return True for visible GGUF model files handled by DS4."""
-    return (
-        path.is_file()
-        and path.suffix.lower() == ".gguf"
-        and not path.name.startswith(".")
-    )
-
-
-def _detect_ds4_gguf_config_type(
-    gguf_path: Path, source_repo_id: str | None = None
-) -> str:
-    """Classify DeepSeek V4 GGUF variant from filename/repo heuristics."""
-    haystack = " ".join(
-        part for part in (source_repo_id, gguf_path.parent.name, gguf_path.name) if part
-    ).lower()
-    if "deepseek" in haystack and "v4" in haystack and "flash" in haystack:
-        return "deepseek_v4_flash_gguf"
-    if "deepseek" in haystack and "v4" in haystack and "pro" in haystack:
-        return "deepseek_v4_pro_gguf"
-    return "ds4_gguf"
 
 
 def _unique_ds4_model_id(
@@ -1044,102 +1003,37 @@ def _relocate_ds4_collisions_for_model_id(
         models[new_id] = info
 
 
-def _compose_ds4_gguf_model_id(
-    container: Path,
-    gguf_path: Path,
-    gguf_count: int,
-    *,
-    source_repo_id: str | None = None,
-) -> str:
-    """Build the preferred normalized id before collision suffixing."""
-    file_id = normalize_ds4_gguf_model_id(gguf_path.stem)
-    if container == gguf_path.parent:
-        if source_repo_id:
-            repo_id = normalize_ds4_gguf_model_id(source_repo_id.split("/")[-1])
-            if gguf_count == 1 and (
-                file_id in _DS4_GENERIC_GGUF_STEMS
-                or file_id.startswith("model-")
-                or file_id == repo_id
-            ):
-                return repo_id
-            if file_id.startswith(f"{repo_id}-"):
-                return file_id
-            return f"{repo_id}-{file_id}"
-        # For top-level GGUFs, the filename is the model id:
-        #   Foo.gguf -> foo
-        return file_id
-
-    container_id = normalize_ds4_gguf_model_id(gguf_path.parent.name)
-    if gguf_count == 1 and (
-        file_id in _DS4_GENERIC_GGUF_STEMS
-        or file_id.startswith("model-")
-        or file_id == container_id
-    ):
-        return container_id
-    if file_id.startswith(f"{container_id}-"):
-        return file_id
-    return f"{container_id}-{file_id}"
-
-
-def _register_ds4_gguf_model(
+def _register_ds4_gguf_candidates(
     models: dict[str, DiscoveredModel],
-    root_dir: Path,
-    gguf_path: Path,
-    *,
-    gguf_count: int,
-    source_type: str = "local",
-    source_repo_id: str | None = None,
-) -> None:
-    """Register one DS4 GGUF file as a loadable model entry."""
-    try:
-        base_id = _compose_ds4_gguf_model_id(
-            root_dir,
-            gguf_path,
-            gguf_count,
-            source_repo_id=source_repo_id,
-        )
-        model_id = _unique_ds4_model_id(models, base_id)
-        estimated_size = int(gguf_path.stat().st_size * 1.05)
-        if source_repo_id and gguf_path.parent == root_dir:
-            repo_display = source_repo_id.split("/")[-1]
-            file_id = normalize_ds4_gguf_model_id(gguf_path.stem)
-            display_name = (
-                repo_display
-                if gguf_count == 1 and file_id in _DS4_GENERIC_GGUF_STEMS
-                else f"{repo_display} / {gguf_path.stem}"
-            )
-        else:
-            file_id = normalize_ds4_gguf_model_id(gguf_path.stem)
-            if gguf_path.parent == root_dir:
-                display_name = gguf_path.stem
-            elif gguf_count == 1 and file_id in _DS4_GENERIC_GGUF_STEMS:
-                display_name = gguf_path.parent.name
-            else:
-                display_name = f"{gguf_path.parent.name} / {gguf_path.stem}"
-
+    candidates: list[DS4GGUFModelCandidate],
+) -> bool:
+    """Register DS4 GGUF candidates as discovered models."""
+    registered = False
+    for candidate in candidates:
+        model_id = _unique_ds4_model_id(models, candidate.base_id)
         models[model_id] = DiscoveredModel(
             model_id=model_id,
-            model_path=str(gguf_path),
+            model_path=str(candidate.model_path),
             model_type="llm",
             engine_type="ds4",
-            estimated_size=estimated_size,
-            config_model_type=_detect_ds4_gguf_config_type(gguf_path, source_repo_id),
+            estimated_size=candidate.estimated_size,
+            config_model_type=candidate.config_model_type,
             thinking_default=None,
             preserve_thinking_default=None,
             model_context_length=None,
-            source_type=source_type,
-            source_repo_id=source_repo_id,
-            display_name=display_name,
+            source_type=candidate.source_type,
+            source_repo_id=candidate.source_repo_id,
+            display_name=candidate.display_name,
         )
 
         logger.info(
             "Discovered DS4 GGUF model: %s (path: %s, size: %s)",
             model_id,
-            gguf_path,
-            format_size(estimated_size),
+            candidate.model_path,
+            format_size(candidate.estimated_size),
         )
-    except Exception as e:
-        logger.error("Failed to discover DS4 GGUF %s: %s", gguf_path, e)
+        registered = True
+    return registered
 
 
 def _register_ds4_gguf_models_in_dir(
@@ -1150,27 +1044,19 @@ def _register_ds4_gguf_models_in_dir(
     source_type: str = "local",
     source_repo_id: str | None = None,
 ) -> bool:
-    """Register all direct GGUF files in ``gguf_dir``.
+    """Register all direct DS4-supported primary GGUF files in ``gguf_dir``.
 
     Returns True when at least one GGUF was registered.  Discovery is direct by
     design so ordinary MLX model trees are not recursively walked for every
     nested artifact; callers decide which known model/repo directories to scan.
     """
-    ggufs = [
-        entry
-        for entry in _iter_readable_entries(gguf_dir, "DS4 GGUF directory")
-        if _is_ds4_gguf_file(entry)
-    ]
-    for gguf_path in ggufs:
-        _register_ds4_gguf_model(
-            models,
-            root_dir,
-            gguf_path,
-            gguf_count=len(ggufs),
-            source_type=source_type,
-            source_repo_id=source_repo_id,
-        )
-    return bool(ggufs)
+    candidates = collect_ds4_gguf_model_candidates(
+        root_dir,
+        _iter_readable_entries(gguf_dir, "DS4 GGUF directory"),
+        source_type=source_type,
+        source_repo_id=source_repo_id,
+    )
+    return _register_ds4_gguf_candidates(models, candidates)
 
 
 def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
@@ -1302,19 +1188,23 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     models: dict[str, DiscoveredModel] = {}
     entries = _iter_readable_entries(model_dir, "model directory")
     root_is_model_dir = _is_model_dir(model_dir)
-    root_gguf_count = sum(1 for entry in entries if _is_ds4_gguf_file(entry))
+    root_ds4_gguf_dir = model_dir.parent if root_is_model_dir else model_dir
+    root_ds4_gguf_candidates = {
+        candidate.model_path: candidate
+        for candidate in collect_ds4_gguf_model_candidates(
+            root_ds4_gguf_dir,
+            entries,
+        )
+    }
 
     for subdir in entries:
         if subdir.name.startswith("."):
             continue
 
-        if _is_ds4_gguf_file(subdir):
-            _register_ds4_gguf_model(
-                models,
-                model_dir.parent if root_is_model_dir else model_dir,
-                subdir,
-                gguf_count=root_gguf_count,
-            )
+        if is_ds4_gguf_file(subdir):
+            candidate = root_ds4_gguf_candidates.get(subdir)
+            if candidate is not None:
+                _register_ds4_gguf_candidates(models, [candidate])
             continue
 
         if not _is_readable_dir(subdir, "model entry"):
@@ -1360,7 +1250,7 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             for child in _iter_readable_entries(subdir, "model group"):
                 if child.name.startswith("."):
                     continue
-                if _is_ds4_gguf_file(child):
+                if is_ds4_gguf_file(child):
                     continue
                 if not _is_readable_dir(child, "model group entry"):
                     continue
