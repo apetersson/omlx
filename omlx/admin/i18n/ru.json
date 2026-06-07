@@ -453,8 +453,6 @@
   "modal.model_settings.ds4_model_type_hint": "Модели DS4 GGUF всегда используют управляемый бэкенд DS4.",
   "modal.model_settings.ds4_section_label": "Бэкенд DS4-GGUF",
   "modal.model_settings.ds4_context_hint": "Необязательный контекст запуска DS4 для модели. Сохранение загруженной неактивной модели DS4 перезапускает её; активные запросы должны завершиться.",
-  "modal.model_settings.ds4_context_tokens": "Токены контекста DS4",
-  "modal.model_settings.ds4_context_auto": "Авто",
   "modal.model_settings.ds4_status_context": "Загруж. ctx",
   "modal.model_settings.ds4_status_rss": "RSS",
   "modal.model_settings.ds4_status_log": "Лог",

@@ -571,7 +571,7 @@ async def test_engine_pool_loads_ds4_with_per_model_context(
         def get_settings(self, model_id):
             from omlx.model_settings import ModelSettings
 
-            return ModelSettings(ds4_context_tokens=100_000)
+            return ModelSettings(max_context_window=100_000)
 
     pool._settings_manager = SettingsManager()
 

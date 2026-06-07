@@ -453,8 +453,6 @@
   "modal.model_settings.ds4_model_type_hint": "DS4 GGUF モデルは常に管理対象の DS4 バックエンドを使用します。",
   "modal.model_settings.ds4_section_label": "DS4-GGUF バックエンド",
   "modal.model_settings.ds4_context_hint": "モデルごとの任意の DS4 起動コンテキストです。アイドル状態の読み込み済み DS4 モデルを保存すると再起動します。アクティブなリクエストは先に完了する必要があります。",
-  "modal.model_settings.ds4_context_tokens": "DS4 コンテキストトークン",
-  "modal.model_settings.ds4_context_auto": "自動",
   "modal.model_settings.ds4_status_context": "読込済み ctx",
   "modal.model_settings.ds4_status_rss": "RSS",
   "modal.model_settings.ds4_status_log": "ログ",

@@ -453,8 +453,6 @@
   "modal.model_settings.ds4_model_type_hint": "DS4 GGUF 模型一律使用受管理的 DS4 後端。",
   "modal.model_settings.ds4_section_label": "DS4-GGUF 後端",
   "modal.model_settings.ds4_context_hint": "可選的每模型 DS4 啟動上下文。儲存已載入且閒置的 DS4 模型會重新啟動；作用中的請求必須先完成。",
-  "modal.model_settings.ds4_context_tokens": "DS4 上下文權杖",
-  "modal.model_settings.ds4_context_auto": "自動",
   "modal.model_settings.ds4_status_context": "已載入 ctx",
   "modal.model_settings.ds4_status_rss": "RSS",
   "modal.model_settings.ds4_status_log": "日誌",

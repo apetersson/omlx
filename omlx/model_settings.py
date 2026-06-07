@@ -97,7 +97,6 @@ class ModelSettings:
         display_name: Human-readable name for UI display.
         description: Optional description of the model.
         active_profile_name: Name of the currently-applied profile (None = no profile).
-        ds4_context_tokens: Per-model DS4 launch context override (None = DS4 auto/global default).
     """
 
     # Sampling parameters (None means use global default)
@@ -185,9 +184,6 @@ class ModelSettings:
     display_name: Optional[str] = None
     description: Optional[str] = None
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
-
-    # DS4-specific launch settings
-    ds4_context_tokens: Optional[int] = None  # None = DS4 auto/global context default
 
     def __post_init__(self) -> None:
         # Native MTP is mutually exclusive with DFlash (also speculative) and

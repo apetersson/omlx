@@ -1137,7 +1137,7 @@ class EnginePool:
                     settings=ds4_settings,
                     base_path=self._base_path,
                     context_tokens=getattr(
-                        model_settings, "ds4_context_tokens", None
+                        model_settings, "max_context_window", None
                     ),
                     auto_enable_ssd_streaming=entry.ds4_auto_enable_ssd_streaming,
                 )

@@ -182,7 +182,7 @@ from .api.markitdown import (
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .settings import DS4_THINK_MAX_CONTEXT_TOKENS
+from .settings import DS4Settings, DS4_THINK_MAX_CONTEXT_TOKENS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1177,6 +1177,18 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     pool = _server_state.engine_pool
     if model_id and pool is not None:
         entry = pool.get_entry(model_id)
+        if entry is not None and entry.engine_type == "ds4":
+            engine = entry.engine
+            effective_context = getattr(engine, "effective_context_tokens", None)
+            if callable(effective_context):
+                return effective_context()
+            get_ds4_settings = getattr(pool, "_get_ds4_settings", None)
+            ds4_settings = get_ds4_settings() if callable(get_ds4_settings) else None
+            if not isinstance(ds4_settings, DS4Settings):
+                global_settings = _server_state.global_settings
+                ds4_settings = getattr(global_settings, "ds4", None)
+            if isinstance(ds4_settings, DS4Settings):
+                return ds4_settings.get_auto_context_tokens()
         if entry is not None and entry.model_context_length is not None:
             return entry.model_context_length
 

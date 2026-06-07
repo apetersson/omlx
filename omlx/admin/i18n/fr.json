@@ -453,8 +453,6 @@
   "modal.model_settings.ds4_model_type_hint": "Les modèles GGUF DS4 utilisent toujours le backend DS4 géré.",
   "modal.model_settings.ds4_section_label": "Backend DS4-GGUF",
   "modal.model_settings.ds4_context_hint": "Contexte de lancement DS4 optionnel par modèle. Enregistrer un modèle DS4 chargé et inactif le redémarre ; les requêtes actives doivent d’abord se terminer.",
-  "modal.model_settings.ds4_context_tokens": "Jetons de contexte DS4",
-  "modal.model_settings.ds4_context_auto": "Auto",
   "modal.model_settings.ds4_status_context": "Ctx chargé",
   "modal.model_settings.ds4_status_rss": "RSS",
   "modal.model_settings.ds4_status_log": "Journal",

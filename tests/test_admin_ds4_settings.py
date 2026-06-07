@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from omlx.admin import routes as admin_routes
 from omlx.engine.ds4 import DS4ProxyError
 from omlx.engine_pool import EngineEntry, EnginePool
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.settings import DS4_MAX_CONTEXT_TOKENS, GlobalSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -288,10 +288,10 @@ async def test_update_model_settings_can_clear_stale_ds4_model_type_override(
 
 
 @pytest.mark.asyncio
-async def test_update_model_settings_sets_ds4_context_and_restarts_loaded(
+async def test_update_model_settings_sets_ds4_max_context_and_restarts_loaded(
     monkeypatch,
 ):
-    """DS4 per-model context overrides restart loaded DS4 engines."""
+    """DS4 context windows restart loaded DS4 engines."""
     pool = _ds4_pool()
     fake_engine = _FakeLoadedDS4Engine()
     pool.get_entry("foo").engine = fake_engine
@@ -303,12 +303,12 @@ async def test_update_model_settings_sets_ds4_context_and_restarts_loaded(
 
     result = await admin_routes.update_model_settings(
         "foo",
-        admin_routes.ModelSettingsRequest(ds4_context_tokens=100_000),
+        admin_routes.ModelSettingsRequest(max_context_window=100_000),
         is_admin=True,
     )
 
     saved = manager.set_settings.call_args.args[1]
-    assert saved.ds4_context_tokens == 100_000
+    assert saved.max_context_window == 100_000
     assert fake_engine.restarted_context_tokens == 100_000
     assert result["requires_reload"] is True
     assert result["auto_reloaded"] is True
@@ -316,29 +316,29 @@ async def test_update_model_settings_sets_ds4_context_and_restarts_loaded(
 
 
 @pytest.mark.asyncio
-async def test_update_model_settings_clears_ds4_context_to_auto(monkeypatch):
+async def test_update_model_settings_clears_ds4_max_context_to_auto(monkeypatch):
     """Null or non-positive DS4 context values clear back to auto."""
     pool = _ds4_pool()
     manager = MagicMock()
-    manager.get_settings.return_value = ModelSettings(ds4_context_tokens=100_000)
+    manager.get_settings.return_value = ModelSettings(max_context_window=100_000)
     monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
     monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
     monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
 
     result = await admin_routes.update_model_settings(
         "foo",
-        admin_routes.ModelSettingsRequest(ds4_context_tokens=0),
+        admin_routes.ModelSettingsRequest(max_context_window=0),
         is_admin=True,
     )
 
     saved = manager.set_settings.call_args.args[1]
-    assert saved.ds4_context_tokens is None
-    assert result["settings"].get("ds4_context_tokens") is None
+    assert saved.max_context_window is None
+    assert result["settings"].get("max_context_window") is None
 
 
 @pytest.mark.asyncio
-async def test_update_model_settings_rejects_ds4_context_above_limit(monkeypatch):
-    """DS4 context overrides are capped to the DS4-supported UI maximum."""
+async def test_update_model_settings_rejects_ds4_max_context_above_limit(monkeypatch):
+    """DS4 context windows are capped to the DS4-supported UI maximum."""
     pool = _ds4_pool()
     manager = MagicMock()
     manager.get_settings.return_value = ModelSettings()
@@ -350,18 +350,18 @@ async def test_update_model_settings_rejects_ds4_context_above_limit(monkeypatch
         await admin_routes.update_model_settings(
             "foo",
             admin_routes.ModelSettingsRequest(
-                ds4_context_tokens=DS4_MAX_CONTEXT_TOKENS + 1
+                max_context_window=DS4_MAX_CONTEXT_TOKENS + 1
             ),
             is_admin=True,
         )
 
     assert exc_info.value.status_code == 400
-    assert "ds4_context_tokens" in exc_info.value.detail
+    assert "max_context_window" in exc_info.value.detail
     manager.set_settings.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_update_model_settings_rejects_ds4_context_when_active(monkeypatch):
+async def test_update_model_settings_rejects_ds4_max_context_when_active(monkeypatch):
     """Context restart avoids interrupting active DS4 proxy requests."""
     pool = _ds4_pool()
     pool.get_entry("foo").engine = _FakeLoadedDS4Engine(active=True)
@@ -374,7 +374,7 @@ async def test_update_model_settings_rejects_ds4_context_when_active(monkeypatch
     with pytest.raises(HTTPException) as exc_info:
         await admin_routes.update_model_settings(
             "foo",
-            admin_routes.ModelSettingsRequest(ds4_context_tokens=100_000),
+            admin_routes.ModelSettingsRequest(max_context_window=100_000),
             is_admin=True,
         )
 
@@ -384,26 +384,26 @@ async def test_update_model_settings_rejects_ds4_context_when_active(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_update_model_settings_allows_noop_ds4_context_while_active(
+async def test_update_model_settings_allows_noop_ds4_max_context_while_active(
     monkeypatch,
 ):
     """Full-form saves do not reject active DS4 when context is unchanged."""
     pool = _ds4_pool()
     pool.get_entry("foo").engine = _FakeLoadedDS4Engine(active=True)
     manager = MagicMock()
-    manager.get_settings.return_value = ModelSettings(ds4_context_tokens=100_000)
+    manager.get_settings.return_value = ModelSettings(max_context_window=100_000)
     monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
     monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
     monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
 
     result = await admin_routes.update_model_settings(
         "foo",
-        admin_routes.ModelSettingsRequest(ds4_context_tokens=100_000),
+        admin_routes.ModelSettingsRequest(max_context_window=100_000),
         is_admin=True,
     )
 
     saved = manager.set_settings.call_args.args[1]
-    assert saved.ds4_context_tokens == 100_000
+    assert saved.max_context_window == 100_000
     assert result["requires_reload"] is False
     assert result["ds4_context_restarted"] is False
 
@@ -424,7 +424,7 @@ async def test_update_model_settings_does_not_persist_if_restart_races_active(
     with pytest.raises(HTTPException) as exc_info:
         await admin_routes.update_model_settings(
             "foo",
-            admin_routes.ModelSettingsRequest(ds4_context_tokens=100_000),
+            admin_routes.ModelSettingsRequest(max_context_window=100_000),
             is_admin=True,
         )
 
@@ -434,8 +434,41 @@ async def test_update_model_settings_does_not_persist_if_restart_races_active(
 
 
 @pytest.mark.asyncio
-async def test_update_model_settings_rejects_ds4_context_for_non_ds4(monkeypatch):
-    """DS4 context overrides are not accepted for MLX model entries."""
+async def test_apply_profile_restarts_loaded_ds4_on_max_context_window(
+    monkeypatch,
+    tmp_path,
+):
+    """Profile-applied max_context_window also restarts loaded DS4 engines."""
+    pool = _ds4_pool()
+    fake_engine = _FakeLoadedDS4Engine()
+    pool.get_entry("foo").engine = fake_engine
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("foo", ModelSettings(max_context_window=32_768))
+    manager.save_profile(
+        "foo",
+        "long-context",
+        "Long Context",
+        None,
+        {"max_context_window": 100_000},
+    )
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
+
+    result = await admin_routes.apply_model_profile(
+        "foo",
+        "long-context",
+        is_admin=True,
+    )
+
+    assert result["settings"]["max_context_window"] == 100_000
+    assert result["ds4_context_restarted"] is True
+    assert fake_engine.restarted_context_tokens == 100_000
+    assert manager.get_settings("foo").max_context_window == 100_000
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_accepts_max_context_for_non_ds4(monkeypatch):
+    """max_context_window remains the shared context setting for MLX models."""
     pool = EnginePool()
     pool._entries["foo"] = EngineEntry(
         model_id="foo",
@@ -450,16 +483,15 @@ async def test_update_model_settings_rejects_ds4_context_for_non_ds4(monkeypatch
     monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
     monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await admin_routes.update_model_settings(
-            "foo",
-            admin_routes.ModelSettingsRequest(ds4_context_tokens=100_000),
-            is_admin=True,
-        )
+    result = await admin_routes.update_model_settings(
+        "foo",
+        admin_routes.ModelSettingsRequest(max_context_window=100_000),
+        is_admin=True,
+    )
 
-    assert exc_info.value.status_code == 400
-    assert "DS4 GGUF" in exc_info.value.detail
-    manager.set_settings.assert_not_called()
+    saved = manager.set_settings.call_args.args[1]
+    assert saved.max_context_window == 100_000
+    assert result["settings"]["max_context_window"] == 100_000
 
 
 @pytest.mark.asyncio
@@ -556,7 +588,7 @@ async def test_list_models_exposes_ds4_admin_status(monkeypatch, tmp_path):
     entry.actual_size = 2 * 1024**3
     manager = MagicMock()
     manager.get_all_settings.return_value = {
-        "foo": ModelSettings(ds4_context_tokens=100_000)
+        "foo": ModelSettings(max_context_window=100_000)
     }
     monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
     monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
@@ -568,7 +600,7 @@ async def test_list_models_exposes_ds4_admin_status(monkeypatch, tmp_path):
     model = result["models"][0]
     assert model["engine_type"] == "ds4"
     assert model["actual_size_formatted"] == "2.00 GB"
-    assert model["settings"]["ds4_context_tokens"] == 100_000
+    assert model["settings"]["max_context_window"] == 100_000
     assert model["ds4"]["status"] == "running"
     assert model["ds4"]["running"] is True
     assert model["ds4"]["port"] == 49152
@@ -603,9 +635,10 @@ def test_model_settings_modal_exposes_ds4_supported_controls_only():
     ).read_text(encoding="utf-8")
 
     assert "selectedModel?.engine_type === 'ds4'" in template
-    assert 'x-model.number="modelSettings.ds4_context_tokens"' in template
-    assert 'max="1000000"' in template
-    assert "modal.model_settings.ds4_context_tokens" in template
+    assert 'x-model.number="modelSettings.max_context_window"' in template
+    assert ':max="selectedModel?.engine_type === \'ds4\' ? 1000000 : null"' in template
+    assert "modal.model_settings.max_context_window" in template
+    assert "modelSettings." + "ds4_" + "context_tokens" not in template
     assert "selectedModel?.engine_type !== 'ds4'" in template
     assert "selectedModel?.engine_type !== 'ds4' && reasoningParsers.length > 0" in template
     assert "selectedModel?.engine_type !== 'ds4' && (!selectedModel?.model_type" in template
@@ -617,11 +650,12 @@ def test_dashboard_saves_ds4_supported_settings_only():
         encoding="utf-8"
     )
 
-    assert "ds4_context_tokens: settings.ds4_context_tokens ?? null" in js
+    assert "max_context_window: settings.max_context_window || null" in js
     assert "model_type_override: model.engine_type === 'ds4' ? ''" in js
     assert "const isDs4 = this.selectedModel?.engine_type === 'ds4'" in js
     assert "if (isDs4)" in js
-    assert "ds4_context_tokens: this.modelSettings.ds4_context_tokens || null" in js
+    assert "max_context_window: this.modelSettings.max_context_window || null" in js
+    assert "ds4_" + "context_tokens" not in js
     assert "repetition_penalty: null" in js
     assert "presence_penalty: null" in js
     assert "force_sampling: false" in js
@@ -681,8 +715,7 @@ def test_ds4_context_ui_strings_are_localized():
         "modal.model_settings.ds4_model_type_hint",
         "modal.model_settings.ds4_section_label",
         "modal.model_settings.ds4_context_hint",
-        "modal.model_settings.ds4_context_tokens",
-        "modal.model_settings.ds4_context_auto",
+        "modal.model_settings.max_context_window",
         "modal.model_settings.ds4_status_context",
         "modal.model_settings.ds4_status_rss",
         "modal.model_settings.ds4_status_log",

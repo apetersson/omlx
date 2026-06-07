@@ -120,7 +120,6 @@
                 model_alias: '',
                 model_type_override: '',
                 max_context_window: null,
-                ds4_context_tokens: null,
                 max_tokens: null,
                 temperature: null,
                 top_p: null,
@@ -1629,7 +1628,6 @@
                     model_alias: settings.model_alias || '',
                     model_type_override: model.engine_type === 'ds4' ? '' : (settings.model_type_override || ''),
                     max_context_window: settings.max_context_window || null,
-                    ds4_context_tokens: settings.ds4_context_tokens ?? null,
                     max_tokens: settings.max_tokens || null,
                     temperature: isOcr ? 0.0 : (settings.temperature ?? null),
                     top_p: settings.top_p ?? null,
@@ -1732,8 +1730,7 @@
                             if (isDs4) {
                                 return {
                                     ...commonPayload,
-                                    max_context_window: null,
-                                    ds4_context_tokens: this.modelSettings.ds4_context_tokens || null,
+                                    max_context_window: this.modelSettings.max_context_window || null,
                                     max_tokens: this.modelSettings.max_tokens || null,
                                     temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
                                     top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
@@ -1783,9 +1780,6 @@
                             return {
                                 ...commonPayload,
                                 max_context_window: this.modelSettings.max_context_window || null,
-                                ...(this.selectedModel?.engine_type === 'ds4'
-                                    ? { ds4_context_tokens: this.modelSettings.ds4_context_tokens || null }
-                                    : {}),
                                 max_tokens: this.modelSettings.max_tokens || null,
                                 temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
                                 top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,

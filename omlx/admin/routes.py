@@ -105,7 +105,6 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
-    ds4_context_tokens: int | None = None
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -2020,9 +2019,7 @@ async def update_model_settings(
 
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
-    previous_ds4_context_tokens = getattr(
-        current_settings, "ds4_context_tokens", None
-    )
+    previous_max_context_window = current_settings.max_context_window
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -2098,28 +2095,22 @@ async def update_model_settings(
                 entry.model_type = detected_type
                 entry.engine_type = type_to_engine.get(detected_type, "batched")
     if "max_context_window" in sent:
-        current_settings.max_context_window = request.max_context_window
-    if "ds4_context_tokens" in sent:
-        if not engine_pool._is_ds4_entry(entry):
-            raise HTTPException(
-                status_code=400,
-                detail="ds4_context_tokens is only supported for DS4 GGUF models",
-            )
-        ds4_context_tokens = request.ds4_context_tokens
-        if ds4_context_tokens is not None and ds4_context_tokens <= 0:
-            ds4_context_tokens = None
-        if (
-            ds4_context_tokens is not None
-            and ds4_context_tokens > DS4_MAX_CONTEXT_TOKENS
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "ds4_context_tokens must be <= "
-                    f"{DS4_MAX_CONTEXT_TOKENS}"
-                ),
-            )
-        current_settings.ds4_context_tokens = ds4_context_tokens
+        max_context_window = request.max_context_window
+        if engine_pool._is_ds4_entry(entry):
+            if max_context_window is not None and max_context_window <= 0:
+                max_context_window = None
+            if (
+                max_context_window is not None
+                and max_context_window > DS4_MAX_CONTEXT_TOKENS
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "max_context_window must be <= "
+                        f"{DS4_MAX_CONTEXT_TOKENS} for DS4 GGUF models"
+                    ),
+                )
+        current_settings.max_context_window = max_context_window
     if "max_tokens" in sent:
         current_settings.max_tokens = request.max_tokens
     if "temperature" in sent:
@@ -2475,8 +2466,8 @@ async def update_model_settings(
 
     ds4_context_restarted = False
     ds4_context_requires_restart = (
-        "ds4_context_tokens" in sent
-        and current_settings.ds4_context_tokens != previous_ds4_context_tokens
+        "max_context_window" in sent
+        and current_settings.max_context_window != previous_max_context_window
         and entry.engine is not None
         and engine_pool._is_ds4_entry(entry)
     )
@@ -2496,7 +2487,7 @@ async def update_model_settings(
 
             try:
                 ds4_context_restarted = bool(
-                    await restart_with_context(current_settings.ds4_context_tokens)
+                    await restart_with_context(current_settings.max_context_window)
                 )
                 if ds4_context_restarted:
                     get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
@@ -2696,10 +2687,84 @@ async def apply_model_profile(
 ):
     mgr = _require_settings_manager()
     _require_model(model_id)
+
+    previous_settings = mgr.get_settings(model_id)
+    profile = mgr.get_profile(model_id, name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    profile_settings = profile.get("settings", {}) or {}
+
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    is_ds4_entry = (
+        getattr(engine_pool, "_is_ds4_entry", None)
+        if engine_pool is not None
+        else None
+    )
+    is_ds4 = bool(
+        entry is not None
+        and callable(is_ds4_entry)
+        and is_ds4_entry(entry)
+    )
+    target_max_context = previous_settings.max_context_window
+    if is_ds4 and "max_context_window" in profile_settings:
+        target_max_context = profile_settings.get("max_context_window")
+        if target_max_context is not None and target_max_context <= 0:
+            target_max_context = None
+        if (
+            target_max_context is not None
+            and target_max_context > DS4_MAX_CONTEXT_TOKENS
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_context_window must be <= "
+                    f"{DS4_MAX_CONTEXT_TOKENS} for DS4 GGUF models"
+                ),
+            )
+    ds4_context_requires_restart = (
+        is_ds4
+        and entry is not None
+        and entry.engine is not None
+        and target_max_context != previous_settings.max_context_window
+    )
+    if ds4_context_requires_restart and entry.engine.has_active_requests():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "DS4 context change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            ),
+        )
+
     applied = mgr.apply_profile(model_id, name)
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
-    return {"model_id": model_id, "settings": applied.to_dict()}
+    if is_ds4 and applied.max_context_window != target_max_context:
+        applied.max_context_window = target_max_context
+        mgr.set_settings(model_id, applied)
+
+    ds4_context_restarted = False
+    if ds4_context_requires_restart:
+        restart_with_context = getattr(entry.engine, "restart_with_context", None)
+        if callable(restart_with_context):
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_context_restarted = bool(
+                    await restart_with_context(applied.max_context_window)
+                )
+            except DS4ProxyError as e:
+                mgr.set_settings(model_id, previous_settings)
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                mgr.set_settings(model_id, previous_settings)
+                raise HTTPException(status_code=500, detail=str(e)) from e
+    return {
+        "model_id": model_id,
+        "settings": applied.to_dict(),
+        "ds4_context_restarted": ds4_context_restarted,
+    }
 
 
 @router.get("/api/profile-fields")
