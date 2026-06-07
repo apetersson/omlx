@@ -4,6 +4,7 @@
 import json
 from contextlib import contextmanager
 from unittest.mock import patch
+from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
@@ -107,3 +108,17 @@ def test_models_status_includes_ds4_aliases_for_ui(tmp_path):
         "gpt-4o-reasoner",
         "gpt-4o-think-max",
     ]
+
+
+def test_public_load_resolves_ds4_source_filename(tmp_path):
+    """Manual load accepts a discovered source GGUF filename alias."""
+    filename = "DeepSeek V4 Flash Q2_K.gguf"
+    pool = _ds4_pool(tmp_path, filename=filename)
+    model_id = "deepseek-v4-flash-q2-k"
+    pool._entries[model_id].engine = object()
+
+    with _client_for_pool(pool) as client:
+        response = client.post(f"/v1/models/{quote(filename)}/load")
+
+    assert response.status_code == 200
+    assert response.json()["model_id"] == model_id

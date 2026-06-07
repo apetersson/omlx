@@ -42,7 +42,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from .model_discovery import discover_models, format_size
+from .model_discovery import discover_models, format_size, normalize_ds4_gguf_model_id
 from .scheduler import SchedulerConfig
 from .settings import DEFAULT_BASE_PATH, DS4Settings
 from .utils.proc_memory import get_phys_footprint
@@ -463,6 +463,81 @@ class EnginePool:
                 return mid
         return None
 
+    def _resolve_ds4_source_name(
+        self, name: str, *, require_gguf_hint: bool = False
+    ) -> str | None:
+        """Resolve source GGUF filenames/paths to discovered DS4 model ids.
+
+        DS4 entries are exposed through normalized API ids, but users often
+        copy the original ``*.gguf`` filename or absolute path from the model
+        directory.  Accept those source names as aliases while still requiring
+        the file to have been discovered under ``self._entries``.
+        """
+        raw = name.strip()
+        if not raw:
+            return None
+
+        raw_path = Path(raw)
+        raw_name = raw_path.name or raw
+        has_gguf_hint = raw.lower().endswith(".gguf") or raw_name.lower().endswith(
+            ".gguf"
+        )
+        if require_gguf_hint and not has_gguf_hint:
+            return None
+
+        path_like = raw_path.is_absolute() or raw_name != raw
+
+        for model_id, entry in self._entries.items():
+            if not self._is_ds4_entry(entry):
+                continue
+
+            entry_path = Path(entry.model_path)
+            exact_terms = {entry.model_path, str(entry_path)}
+            if entry.display_name:
+                exact_terms.add(entry.display_name)
+                if not entry.display_name.lower().endswith(".gguf"):
+                    exact_terms.add(f"{entry.display_name}.gguf")
+            if raw.lower() in {term.lower() for term in exact_terms if term}:
+                return model_id
+
+            if path_like:
+                try:
+                    if raw_path.resolve(strict=False) == entry_path.resolve(strict=False):
+                        return model_id
+                except OSError:
+                    pass
+                continue
+
+            raw_terms = {raw, raw_name}
+            if has_gguf_hint:
+                if raw.lower().endswith(".gguf"):
+                    raw_terms.add(raw[:-5])
+                if raw_name.lower().endswith(".gguf"):
+                    raw_terms.add(raw_name[:-5])
+                raw_terms.add(raw_path.stem)
+
+            entry_terms = {model_id, entry_path.name, entry_path.stem}
+            if entry.display_name:
+                entry_terms.add(entry.display_name)
+
+            raw_terms_lower = {term.lower() for term in raw_terms if term}
+            entry_terms_lower = {term.lower() for term in entry_terms if term}
+            if raw_terms_lower & entry_terms_lower:
+                return model_id
+
+            normalized_terms = {
+                normalize_ds4_gguf_model_id(term) for term in raw_terms if term
+            }
+            entry_normalized_terms = {
+                normalize_ds4_gguf_model_id(term)
+                for term in {entry_path.name, entry_path.stem, entry.display_name or ""}
+                if term
+            }
+            if normalized_terms & entry_normalized_terms:
+                return model_id
+
+        return None
+
     def _resolve_ds4_alias_id(
         self, alias_id: str, all_settings: dict | None
     ) -> str | None:
@@ -487,6 +562,10 @@ class EnginePool:
                     continue
                 if getattr(ms, "model_alias", None) == base_id:
                     return mid
+
+        source_match = self._resolve_ds4_source_name(base_id, require_gguf_hint=True)
+        if source_match is not None:
+            return source_match
 
         return None
 
@@ -517,6 +596,10 @@ class EnginePool:
         if ds4_alias_match is not None:
             return ds4_alias_match
 
+        ds4_source_match = self._resolve_ds4_source_name(model_id_or_alias)
+        if ds4_source_match is not None:
+            return ds4_source_match
+
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
@@ -532,6 +615,9 @@ class EnginePool:
             ds4_alias_match = self._resolve_ds4_alias_id(stripped, all_settings)
             if ds4_alias_match is not None:
                 return ds4_alias_match
+            ds4_source_match = self._resolve_ds4_source_name(stripped)
+            if ds4_source_match is not None:
+                return ds4_source_match
 
         return model_id_or_alias
 

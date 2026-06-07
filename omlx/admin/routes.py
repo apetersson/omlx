@@ -1886,15 +1886,23 @@ async def unload_model(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    entry = engine_pool.get_entry(model_id)
+    settings_manager = _get_settings_manager()
+    resolved_model_id = engine_pool.resolve_model_id(model_id, settings_manager)
+    entry = engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
-        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+        raise HTTPException(
+            status_code=400, detail=f"Model not loaded: {resolved_model_id}"
+        )
 
-    await engine_pool._unload_engine(model_id)
-    logger.info(f"Manually unloaded model: {model_id}")
-    return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+    await engine_pool._unload_engine(resolved_model_id)
+    logger.info(f"Manually unloaded model: {resolved_model_id}")
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Unloaded {resolved_model_id}",
+    }
 
 
 async def _require_admin_or_bearer(request: Request) -> bool:
@@ -1938,27 +1946,33 @@ async def load_model(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
-    entry = engine_pool.get_entry(model_id)
+    settings_manager = _get_settings_manager()
+    resolved_model_id = engine_pool.resolve_model_id(model_id, settings_manager)
+    entry = engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is not None:
         return {
             "status": "ok",
-            "model_id": model_id,
-            "message": f"Already loaded: {model_id}",
+            "model_id": resolved_model_id,
+            "message": f"Already loaded: {resolved_model_id}",
         }
     if entry.is_loading:
         raise HTTPException(
-            status_code=409, detail=f"Model is already loading: {model_id}"
+            status_code=409, detail=f"Model is already loading: {resolved_model_id}"
         )
 
     try:
-        await engine_pool.get_engine(model_id)
+        await engine_pool.get_engine(resolved_model_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    logger.info(f"Manually loaded model: {model_id}")
-    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+    logger.info(f"Manually loaded model: {resolved_model_id}")
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Loaded {resolved_model_id}",
+    }
 
 
 @router.post("/api/reload")
@@ -5097,9 +5111,42 @@ async def get_hf_model_info(
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _engine_pool_status_models(engine_pool: Any) -> list[dict[str, Any]]:
+    """Return EnginePool status models when available."""
+    if engine_pool is None or not callable(getattr(engine_pool, "get_status", None)):
+        return []
+    try:
+        status = engine_pool.get_status()
+    except Exception as e:
+        logger.debug("Could not read EnginePool status for local models: %s", e)
+        return []
+    if not isinstance(status, dict):
+        return []
+    models = status.get("models", [])
+    if not isinstance(models, list):
+        return []
+    return [model for model in models if isinstance(model, dict)]
+
+
+def _containing_model_dir(path: Path, model_dirs: list[Path]) -> Path | None:
+    """Return the configured model dir containing *path*, if any."""
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        return None
+    for model_dir in model_dirs:
+        try:
+            resolved_dir = model_dir.resolve()
+        except OSError:
+            continue
+        if resolved_path == resolved_dir or resolved_path.is_relative_to(resolved_dir):
+            return model_dir
+    return None
+
+
 @router.get("/api/hf/models")
 async def list_hf_models(is_admin: bool = Depends(require_admin)):
-    """List models in all model directories with disk size info."""
+    """List local model artifacts in all model directories with disk size info."""
     global_settings = _get_global_settings()
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
@@ -5108,19 +5155,42 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
-    def _add_model(model_path: Path, model_name: str) -> None:
+    def _artifact_size(model_path: Path) -> int:
+        if model_path.is_file():
+            return model_path.stat().st_size
+        return sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+
+    def _add_model(
+        model_path: Path,
+        model_name: str,
+        *,
+        display_name: str | None = None,
+        engine_type: str | None = None,
+        model_type: str | None = None,
+        config_model_type: str | None = None,
+        backend_label: str | None = None,
+    ) -> None:
         if model_name in seen_names:
             return
         seen_names.add(model_name)
-        total_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
-        models.append(
-            {
-                "name": model_name,
-                "path": str(model_path),
-                "size": total_size,
-                "size_formatted": format_size(total_size),
-            }
-        )
+        total_size = _artifact_size(model_path)
+        model = {
+            "name": model_name,
+            "path": str(model_path),
+            "size": total_size,
+            "size_formatted": format_size(total_size),
+        }
+        if display_name:
+            model["display_name"] = display_name
+        if engine_type:
+            model["engine_type"] = engine_type
+        if model_type:
+            model["model_type"] = model_type
+        if config_model_type:
+            model["config_model_type"] = config_model_type
+        if backend_label:
+            model["backend_label"] = backend_label
+        models.append(model)
 
     models = []
     seen_names: set[str] = set()
@@ -5149,6 +5219,36 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                     if (child / "config.json").exists():
                         _add_model(child, child.name)
 
+    engine_pool = None
+    if callable(_get_engine_pool):
+        try:
+            engine_pool = _get_engine_pool()
+        except HTTPException as e:
+            if e.status_code != 503:
+                raise
+        except Exception as e:
+            logger.debug("Could not get EnginePool for local models: %s", e)
+    for model_info in _engine_pool_status_models(engine_pool):
+        if model_info.get("engine_type") != "ds4":
+            continue
+        model_path = Path(str(model_info.get("model_path") or ""))
+        if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
+            continue
+        if _containing_model_dir(model_path, model_dirs) is None:
+            continue
+        model_id = str(model_info.get("id") or "")
+        if not model_id:
+            continue
+        _add_model(
+            model_path,
+            model_id,
+            display_name=model_info.get("display_name") or model_path.stem,
+            engine_type="ds4",
+            model_type=model_info.get("model_type"),
+            config_model_type=model_info.get("config_model_type"),
+            backend_label="DS4-GGUF",
+        )
+
     # Sort case-insensitively by name for a stable, user-friendly order.
     models.sort(key=lambda m: m["name"].lower())
     return {"models": models}
@@ -5167,6 +5267,16 @@ async def delete_hf_model(
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+
+    settings_manager = _get_settings_manager() if callable(_get_settings_manager) else None
+    resolved_model_name = model_name
+    if engine_pool is not None and callable(getattr(engine_pool, "resolve_model_id", None)):
+        try:
+            resolved = engine_pool.resolve_model_id(model_name, settings_manager)
+            if isinstance(resolved, str):
+                resolved_model_name = resolved
+        except Exception as e:
+            logger.debug("Could not resolve local model name %s: %s", model_name, e)
 
     # Search for model across all directories in both flat and org-folder layouts
     model_path = None
@@ -5192,6 +5302,23 @@ async def delete_hf_model(
             break
 
     if model_path is None:
+        for model_info in _engine_pool_status_models(engine_pool):
+            if (
+                model_info.get("id") != resolved_model_name
+                or model_info.get("engine_type") != "ds4"
+            ):
+                continue
+            candidate = Path(str(model_info.get("model_path") or ""))
+            if candidate.suffix.lower() != ".gguf" or not candidate.is_file():
+                continue
+            parent = _containing_model_dir(candidate, model_dirs)
+            if parent is None:
+                continue
+            model_path = candidate
+            parent_model_dir = parent
+            break
+
+    if model_path is None:
         raise HTTPException(status_code=404, detail="Model not found")
 
     # Validate path traversal against parent model directory
@@ -5201,18 +5328,24 @@ async def delete_hf_model(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
 
-    if not model_path.is_dir():
-        raise HTTPException(status_code=400, detail="Not a model directory")
+    if not model_path.is_dir() and not (
+        model_path.is_file() and model_path.suffix.lower() == ".gguf"
+    ):
+        raise HTTPException(status_code=400, detail="Not a supported model artifact")
 
     # Unload model if loaded
     if engine_pool is not None:
         loaded_ids = engine_pool.get_loaded_model_ids()
-        if model_name in loaded_ids:
+        if resolved_model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
-                logger.info(f"Unloaded model '{model_name}' before deletion")
+                await engine_pool._unload_engine(resolved_model_name)
+                logger.info(
+                    f"Unloaded model '{resolved_model_name}' before deletion"
+                )
             except Exception as e:
-                logger.warning(f"Failed to unload model '{model_name}': {e}")
+                logger.warning(
+                    f"Failed to unload model '{resolved_model_name}': {e}"
+                )
 
     # Delete from disk
     # Handle macOS resource fork files (._*) that may disappear on non-native
@@ -5231,13 +5364,17 @@ async def delete_hf_model(
         raise exc_info[1].with_traceback(exc_info[2])
 
     try:
-        if sys.version_info >= (3, 12):
+        if model_path.is_file():
+            model_path.unlink()
+            logger.info(f"Deleted model file: {model_path}")
+        elif sys.version_info >= (3, 12):
             shutil.rmtree(model_path, onexc=_handle_onexc)
+            logger.info(f"Deleted model directory: {model_path}")
         else:
             shutil.rmtree(model_path, onerror=_handle_onerror)
-        logger.info(f"Deleted model directory: {model_path}")
+            logger.info(f"Deleted model directory: {model_path}")
     except Exception as e:
-        logger.error(f"Failed to delete model directory {model_path}: {e}")
+        logger.error(f"Failed to delete model artifact {model_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
     # If the model was inside an org folder (organized layout) and that
@@ -5252,16 +5389,17 @@ async def delete_hf_model(
 
     # Re-discover models
     if engine_pool is not None:
-        settings_manager = _get_settings_manager()
         pinned_models = []
         if settings_manager:
             pinned_models = settings_manager.get_pinned_model_ids()
 
-        engine_pool._entries.pop(model_name, None)
+        if hasattr(engine_pool, "_entries"):
+            engine_pool._entries.pop(model_name, None)
+            engine_pool._entries.pop(resolved_model_name, None)
         # Release the deleted model's persisted settings (including its alias)
         # so they can be reused by another model.
         if settings_manager:
-            settings_manager.delete_settings(model_name)
+            settings_manager.delete_settings(resolved_model_name)
         engine_pool.discover_models(
             [str(d) for d in global_settings.get_effective_model_dirs()],
             pinned_models,

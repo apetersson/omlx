@@ -2108,14 +2108,17 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    entry = _server_state.engine_pool.get_entry(model_id)
+    resolved_model_id = resolve_model_id(model_id) or model_id
+    entry = _server_state.engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
-        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+        raise HTTPException(
+            status_code=400, detail=f"Model not loaded: {resolved_model_id}"
+        )
 
-    await _server_state.engine_pool._unload_engine(model_id)
-    return {"status": "ok", "model_id": model_id}
+    await _server_state.engine_pool._unload_engine(resolved_model_id)
+    return {"status": "ok", "model_id": resolved_model_id}
 
 
 @app.post("/v1/models/{model_id}/load")
@@ -2124,18 +2127,27 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    entry = _server_state.engine_pool.get_entry(model_id)
+    resolved_model_id = resolve_model_id(model_id) or model_id
+    entry = _server_state.engine_pool.get_entry(resolved_model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is not None:
-        return {"status": "ok", "model_id": model_id, "message": f"Already loaded: {model_id}"}
+        return {
+            "status": "ok",
+            "model_id": resolved_model_id,
+            "message": f"Already loaded: {resolved_model_id}",
+        }
 
     try:
-        await _server_state.engine_pool.get_engine(model_id)
+        await _server_state.engine_pool.get_engine(resolved_model_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+    return {
+        "status": "ok",
+        "model_id": resolved_model_id,
+        "message": f"Loaded {resolved_model_id}",
+    }
 
 
 # =============================================================================

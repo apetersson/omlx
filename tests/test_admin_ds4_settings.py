@@ -484,6 +484,68 @@ async def test_list_models_exposes_ds4_display_name(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_local_models_manager_lists_ds4_gguf_files(monkeypatch, tmp_path):
+    """Models Manager's local list includes discovered DS4 GGUF files."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    gguf = model_dir / "DeepSeek-V4-Flash-IQ2XXS-w2Q2K.gguf"
+    gguf.write_bytes(b"g" * 2048)
+    mlx_dir = model_dir / "Qwen-MLX"
+    mlx_dir.mkdir()
+    (mlx_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    (mlx_dir / "model.safetensors").write_bytes(b"m" * 1024)
+
+    pool = EnginePool()
+    pool.discover_models(str(model_dir))
+    settings = MagicMock()
+    settings.base_path = tmp_path
+    settings.model.get_model_dirs.return_value = [model_dir]
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+
+    result = await admin_routes.list_hf_models(is_admin=True)
+    by_name = {model["name"]: model for model in result["models"]}
+
+    assert "Qwen-MLX" in by_name
+    ds4_id = "deepseek-v4-flash-iq2xxs-w2q2k"
+    assert ds4_id in by_name
+    assert by_name[ds4_id]["display_name"] == "DeepSeek-V4-Flash-IQ2XXS-w2Q2K"
+    assert by_name[ds4_id]["engine_type"] == "ds4"
+    assert by_name[ds4_id]["backend_label"] == "DS4-GGUF"
+    assert by_name[ds4_id]["path"] == str(gguf)
+    assert by_name[ds4_id]["size"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_local_models_manager_deletes_ds4_gguf_file(monkeypatch, tmp_path):
+    """Deleting a listed DS4 GGUF removes the file and refreshes discovery."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    gguf = model_dir / "DeepSeek-V4-Flash-IQ2XXS-w2Q2K.gguf"
+    gguf.write_bytes(b"g" * 2048)
+    pool = EnginePool()
+    pool.discover_models(str(model_dir))
+    ds4_id = "deepseek-v4-flash-iq2xxs-w2q2k"
+
+    settings = MagicMock()
+    settings.base_path = tmp_path
+    settings.model.get_model_dirs.return_value = [model_dir]
+    settings.get_effective_model_dirs.return_value = [model_dir]
+    settings_manager = MagicMock()
+    settings_manager.get_pinned_model_ids.return_value = []
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: settings_manager)
+
+    result = await admin_routes.delete_hf_model(model_name=ds4_id, is_admin=True)
+
+    assert result["success"] is True
+    assert not gguf.exists()
+    assert ds4_id not in pool.get_model_ids()
+    settings_manager.delete_settings.assert_called_once_with(ds4_id)
+
+
+@pytest.mark.asyncio
 async def test_list_models_exposes_ds4_admin_status(monkeypatch, tmp_path):
     """Admin model list includes DS4 lifecycle/log/context details."""
     gguf = tmp_path / "Foo.gguf"
@@ -518,6 +580,19 @@ async def test_list_models_exposes_ds4_admin_status(monkeypatch, tmp_path):
         "stdout: ready",
         "stderr: warning",
     ]
+
+
+def test_models_manager_can_render_ds4_gguf_entries():
+    """Models Manager local list can show discovered DS4 GGUF files."""
+    template = (_PROJECT_ROOT / "omlx/admin/templates/dashboard/_models.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert "model.display_name || model.name" in template
+    assert "model.backend_label" in template
+    assert "DS4-GGUF" in (_PROJECT_ROOT / "omlx/admin/routes.py").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_model_settings_modal_exposes_ds4_context_controls():
