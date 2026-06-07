@@ -88,6 +88,7 @@ async def test_get_global_settings_exposes_ds4_backend_controls(monkeypatch, tmp
     settings.ds4.kv_cache_continued_interval_tokens = 4096
     settings.ds4.ssd_streaming = "on"
     settings.ds4.power = 77
+    settings.ds4.logs_to_disk = False
     pool = _ds4_pool()
     pool.get_entry("foo").engine = _FakeStatusDS4Engine()
     monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
@@ -117,6 +118,7 @@ async def test_get_global_settings_exposes_ds4_backend_controls(monkeypatch, tmp
     assert ds4["kv_cache_continued_interval_tokens"] == 4096
     assert ds4["ssd_streaming"] == "on"
     assert ds4["power"] == 77
+    assert ds4["logs_to_disk"] is False
     assert ds4["status"] == "running"
     assert ds4["available_models"] == 1
     assert ds4["loaded_count"] == 1
@@ -144,6 +146,7 @@ async def test_update_global_settings_saves_ds4_backend_controls(monkeypatch, tm
             ds4_kv_cache_continued_interval_tokens=4096,
             ds4_ssd_streaming="on",
             ds4_power=77,
+            ds4_logs_to_disk=False,
         ),
         is_admin=True,
     )
@@ -160,6 +163,7 @@ async def test_update_global_settings_saves_ds4_backend_controls(monkeypatch, tm
     assert settings.ds4.kv_cache_continued_interval_tokens == 4096
     assert settings.ds4.ssd_streaming == "on"
     assert settings.ds4.power == 77
+    assert settings.ds4.logs_to_disk is False
     save.assert_called_once()
 
 
@@ -686,6 +690,7 @@ def test_global_settings_ui_exposes_ds4_backend_controls():
     assert "globalSettings.ds4.support_dir" in template
     assert "globalSettings.ds4.context_default_tokens" in template
     assert "globalSettings.ds4.kv_cache_enabled" in template
+    assert "globalSettings.ds4.logs_to_disk" in template
     assert "globalSettings.ds4.kv_root" in template
     assert "globalSettings.ds4.kv_disk_space_mb" in template
     assert "globalSettings.ds4.ssd_streaming" in template
@@ -707,6 +712,7 @@ def test_dashboard_saves_ds4_global_settings():
     assert "ds4_kv_disk_space_mb: this.globalSettings.ds4.kv_disk_space_mb" in js
     assert "ds4_ssd_streaming: this.globalSettings.ds4.ssd_streaming" in js
     assert "ds4_power: this.globalSettings.ds4.power" in js
+    assert "ds4_logs_to_disk: this.globalSettings.ds4.logs_to_disk" in js
 
 
 def test_ds4_context_ui_strings_are_localized():
@@ -723,6 +729,8 @@ def test_ds4_context_ui_strings_are_localized():
         "settings.ds4.status_label",
         "settings.ds4.enabled",
         "settings.ds4.support_dir",
+        "settings.ds4.logs_to_disk",
+        "settings.ds4.logs_to_disk_hint",
         "settings.ds4.context_default",
         "settings.ds4.context_auto",
         "settings.ds4.kv_cache_enabled",

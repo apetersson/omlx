@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import FrozenInstanceError
@@ -278,7 +279,7 @@ class TestDS4ManagedProcess:
     """Tests for managed DS4 subprocess lifecycle."""
 
     @pytest.mark.asyncio
-    async def test_start_waits_for_models_readiness_and_captures_logs(self, tmp_path):
+    async def test_start_waits_for_models_readiness_and_captures_logs(self, tmp_path, caplog):
         """A fake ds4-server is started, probed, and terminated cleanly."""
         support = tmp_path / "support" / "ds4"
         _write_support_tree(support, _ready_server_script())
@@ -301,6 +302,7 @@ class TestDS4ManagedProcess:
             )
         )
 
+        caplog.set_level(logging.INFO, logger="omlx.ds4_process")
         await managed.start()
         try:
             assert managed.is_running is True
@@ -318,6 +320,42 @@ class TestDS4ManagedProcess:
         log_text = managed.log_path.read_text()
         assert "model_id: model" in log_text
         assert "stdout: fake ds4 argv" in log_text
+        assert "[DS4] model stdout: fake ds4 argv" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_start_can_disable_ds4_debug_log_file(self, tmp_path, caplog):
+        """DS4 logs can be regular-log/in-memory only without ds4-debug files."""
+        support = tmp_path / "support" / "ds4"
+        _write_support_tree(support, _ready_server_script())
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"gguf")
+        settings = DS4Settings(
+            support_dir=str(support),
+            debug_dir=str(tmp_path / "debug"),
+            ready_timeout_ms=2_000,
+            logs_to_disk=False,
+        )
+        managed = DS4ManagedProcess(
+            DS4LaunchConfig(
+                model_id="model",
+                gguf_path=gguf,
+                settings=settings,
+                base_path=tmp_path,
+                platform_system="Darwin",
+                platform_machine="arm64",
+            )
+        )
+
+        caplog.set_level(logging.INFO, logger="omlx.ds4_process")
+        await managed.start()
+        try:
+            assert any("fake ds4 argv" in line.text for line in managed.logs)
+        finally:
+            await managed.stop()
+
+        assert managed.log_path is None
+        assert not (tmp_path / "debug" / "model" / "ds4.log").exists()
+        assert "[DS4] model stdout: fake ds4 argv" in caplog.text
 
     @pytest.mark.asyncio
     async def test_start_timeout_stops_process_and_reports_logs(self, tmp_path):

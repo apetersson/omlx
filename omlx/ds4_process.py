@@ -344,9 +344,12 @@ class DS4ManagedProcess:
             )
         if self.config.settings.trace_enabled:
             self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config.debug_dir.mkdir(parents=True, exist_ok=True)
-        self.log_path = self.config.log_path
-        self._append_log_file_header()
+        if self.config.settings.logs_to_disk:
+            self.config.debug_dir.mkdir(parents=True, exist_ok=True)
+            self.log_path = self.config.log_path
+            self._append_log_file_header()
+        else:
+            self.log_path = None
 
     def _start_log_capture(self) -> None:
         if self.process is None:
@@ -380,7 +383,7 @@ class DS4ManagedProcess:
             logger.warning("Failed to write DS4 log header to %s: %s", self.log_path, exc)
 
     def _append_log_file_line(self, line: DS4LogLine) -> None:
-        if self.log_path is None:
+        if self.log_path is None or not self.config.settings.logs_to_disk:
             return
         timestamp = datetime.now(UTC).isoformat()
         try:
@@ -402,5 +405,6 @@ class DS4ManagedProcess:
             log_line = DS4LogLine(stream, text, time.monotonic())
             self.logs.append(log_line)
             self._append_log_file_line(log_line)
+            logger.info("[DS4] %s %s: %s", self.config.model_id, stream, text)
             if len(self.logs) > self.max_log_lines:
                 del self.logs[: len(self.logs) - self.max_log_lines]

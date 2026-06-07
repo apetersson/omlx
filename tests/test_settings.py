@@ -395,6 +395,7 @@ class TestDS4Settings:
         assert settings.kv_cache_continued_interval_tokens == 2_048
         assert settings.ssd_streaming == "auto"
         assert settings.power == 100
+        assert settings.logs_to_disk is True
         assert settings.trace_enabled is False
 
     def test_custom_paths_expand(self):
@@ -446,6 +447,7 @@ class TestDS4Settings:
             kv_cache_continued_interval_tokens=512,
             ssd_streaming="on",
             power=50,
+            logs_to_disk=False,
             trace_enabled=True,
             trace_dir="/traces",
             debug_dir="/debug",
@@ -1381,6 +1383,7 @@ class TestGlobalSettings:
                     "OMLX_DS4_CONTEXT_DEFAULT_TOKENS": "100000",
                     "OMLX_DS4_SSD_STREAMING": "off",
                     "OMLX_DS4_POWER": "55",
+                    "OMLX_DS4_LOGS_TO_DISK": "false",
                     "OMLX_DS4_TRACE_ENABLED": "true",
                     "OMLX_DS4_TRACE_DIR": "/env/ds4-traces",
                     "OMLX_DS4_DEBUG_DIR": "/env/ds4-debug",
@@ -1399,6 +1402,7 @@ class TestGlobalSettings:
                 assert settings.ds4.context_default_tokens == 100_000
                 assert settings.ds4.ssd_streaming == "off"
                 assert settings.ds4.power == 55
+                assert settings.ds4.logs_to_disk is False
                 assert settings.ds4.trace_enabled is True
                 assert settings.ds4.trace_dir == "/env/ds4-traces"
                 assert settings.ds4.debug_dir == "/env/ds4-debug"

@@ -249,6 +249,7 @@ class GlobalSettingsRequest(BaseModel):
     ds4_kv_cache_continued_interval_tokens: int | None = None
     ds4_ssd_streaming: str | None = None
     ds4_power: int | None = None
+    ds4_logs_to_disk: bool | None = None
 
     # MCP settings
     mcp_config: str | None = None
@@ -3180,6 +3181,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             ),
             "ssd_streaming": global_settings.ds4.ssd_streaming,
             "power": global_settings.ds4.power,
+            "logs_to_disk": global_settings.ds4.logs_to_disk,
             "trace_enabled": global_settings.ds4.trace_enabled,
             "trace_dir": str(
                 global_settings.ds4.get_trace_dir(global_settings.base_path)
@@ -3834,6 +3836,9 @@ async def update_global_settings(
         ds4_changed = True
     if request.ds4_power is not None:
         global_settings.ds4.power = request.ds4_power
+        ds4_changed = True
+    if request.ds4_logs_to_disk is not None:
+        global_settings.ds4.logs_to_disk = request.ds4_logs_to_disk
         ds4_changed = True
 
     if ds4_changed:

@@ -315,6 +315,7 @@ class DS4Settings:
     trace_enabled: bool = False
     trace_dir: str | None = None  # None means ~/.omlx/logs/ds4-traces
     debug_dir: str | None = None  # None means ~/.omlx/logs/ds4-debug
+    logs_to_disk: bool = True  # Persist captured stdout/stderr to debug_dir/ds4.log
 
     def get_support_dir(self, base_path: Path) -> Path:
         """Return the DS4 support directory containing ds4-server and metal/."""
@@ -379,6 +380,7 @@ class DS4Settings:
             "trace_enabled": self.trace_enabled,
             "trace_dir": self.trace_dir,
             "debug_dir": self.debug_dir,
+            "logs_to_disk": self.logs_to_disk,
         }
 
     @classmethod
@@ -401,6 +403,7 @@ class DS4Settings:
             trace_enabled=data.get("trace_enabled", False),
             trace_dir=data.get("trace_dir"),
             debug_dir=data.get("debug_dir"),
+            logs_to_disk=data.get("logs_to_disk", True),
         )
 
 
@@ -1051,6 +1054,13 @@ class GlobalSettings:
                 self.ds4.power = int(ds4_power)
             except ValueError:
                 logger.warning(f"Invalid OMLX_DS4_POWER: {ds4_power}")
+        if ds4_logs_to_disk := os.getenv("OMLX_DS4_LOGS_TO_DISK"):
+            self.ds4.logs_to_disk = ds4_logs_to_disk.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         if ds4_trace_enabled := os.getenv("OMLX_DS4_TRACE_ENABLED"):
             self.ds4.trace_enabled = ds4_trace_enabled.strip().lower() in {
                 "1",
