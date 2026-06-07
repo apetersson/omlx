@@ -2582,23 +2582,8 @@ def _ds4_sampling_params_without_force(
         "top_p": choose(request.top_p, "top_p", global_sampling.top_p),
         "top_k": choose(request.top_k, "top_k", global_sampling.top_k),
         "min_p": choose(request.min_p, "min_p", 0.0),
-        "repetition_penalty": choose(
-            request.repetition_penalty,
-            "repetition_penalty",
-            getattr(global_sampling, "repetition_penalty", 1.0),
-        ),
-        "presence_penalty": choose(request.presence_penalty, "presence_penalty", 0.0),
-        "frequency_penalty": choose(
-            request.frequency_penalty, "frequency_penalty", 0.0
-        ),
         "max_tokens": choose(
             request.max_tokens, "max_tokens", global_sampling.max_tokens
-        ),
-        "xtc_probability": (
-            request.xtc_probability if request.xtc_probability is not None else 0.0
-        ),
-        "xtc_threshold": (
-            request.xtc_threshold if request.xtc_threshold is not None else 0.1
         ),
     }
 

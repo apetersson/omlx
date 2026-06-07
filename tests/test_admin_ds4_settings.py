@@ -595,8 +595,8 @@ def test_models_manager_can_render_ds4_gguf_entries():
     )
 
 
-def test_model_settings_modal_exposes_ds4_context_controls():
-    """Admin UI exposes DS4 context controls only for DS4-backed models."""
+def test_model_settings_modal_exposes_ds4_supported_controls_only():
+    """Admin UI hides unsupported MLX-only controls for DS4-backed models."""
     template = (
         _PROJECT_ROOT
         / "omlx/admin/templates/dashboard/_modal_model_settings.html"
@@ -605,21 +605,27 @@ def test_model_settings_modal_exposes_ds4_context_controls():
     assert "selectedModel?.engine_type === 'ds4'" in template
     assert 'x-model.number="modelSettings.ds4_context_tokens"' in template
     assert 'max="1000000"' in template
-    assert ':disabled="selectedModel?.engine_type === \'ds4\'"' in template
     assert "modal.model_settings.ds4_context_tokens" in template
+    assert "selectedModel?.engine_type !== 'ds4'" in template
+    assert "selectedModel?.engine_type !== 'ds4' && reasoningParsers.length > 0" in template
+    assert "selectedModel?.engine_type !== 'ds4' && (!selectedModel?.model_type" in template
 
 
-def test_dashboard_saves_ds4_context_only_for_ds4_models():
-    """Frontend payload avoids sending DS4-only fields for non-DS4 models."""
+def test_dashboard_saves_ds4_supported_settings_only():
+    """Frontend payload sends only DS4-supported settings for DS4 models."""
     js = (_PROJECT_ROOT / "omlx/admin/static/js/dashboard.js").read_text(
         encoding="utf-8"
     )
 
     assert "ds4_context_tokens: settings.ds4_context_tokens ?? null" in js
     assert "model_type_override: model.engine_type === 'ds4' ? ''" in js
-    assert "model_type_override: this.selectedModel?.engine_type === 'ds4'" in js
-    assert "this.selectedModel?.engine_type === 'ds4'" in js
-    assert "{ ds4_context_tokens: this.modelSettings.ds4_context_tokens || null }" in js
+    assert "const isDs4 = this.selectedModel?.engine_type === 'ds4'" in js
+    assert "if (isDs4)" in js
+    assert "ds4_context_tokens: this.modelSettings.ds4_context_tokens || null" in js
+    assert "repetition_penalty: null" in js
+    assert "presence_penalty: null" in js
+    assert "force_sampling: false" in js
+    assert "guided_grammar_enabled: false" in js
 
 
 def test_dashboard_formats_ds4_activity_phase_tps_metadata():

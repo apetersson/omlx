@@ -1721,11 +1721,67 @@
                                     if (entry.force) forcedCtKwargs.push(key);
                                 }
                             }
-                            return {
+                            const isDs4 = this.selectedModel?.engine_type === 'ds4';
+                            const commonPayload = {
                                 model_alias: this.modelSettings.model_alias?.trim() || null,
-                                model_type_override: this.selectedModel?.engine_type === 'ds4'
+                                model_type_override: isDs4
                                     ? null
                                     : (this.modelSettings.model_type_override || null),
+                                ttl_seconds: this.modelSettings.ttl_seconds || null,
+                            };
+                            if (isDs4) {
+                                return {
+                                    ...commonPayload,
+                                    max_context_window: null,
+                                    ds4_context_tokens: this.modelSettings.ds4_context_tokens || null,
+                                    max_tokens: this.modelSettings.max_tokens || null,
+                                    temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
+                                    top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
+                                    top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
+                                    min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
+                                    repetition_penalty: null,
+                                    presence_penalty: null,
+                                    force_sampling: false,
+                                    reasoning_parser: null,
+                                    index_cache_freq: 0,
+                                    enable_thinking: null,
+                                    thinking_budget_enabled: false,
+                                    thinking_budget_tokens: 0,
+                                    guided_grammar_enabled: false,
+                                    guided_grammar: null,
+                                    max_tool_result_tokens: 0,
+                                    chat_template_kwargs: null,
+                                    forced_ct_kwargs: null,
+                                    turboquant_kv_enabled: false,
+                                    turboquant_kv_bits: 4,
+                                    specprefill_enabled: false,
+                                    specprefill_draft_model: null,
+                                    specprefill_keep_pct: null,
+                                    specprefill_threshold: null,
+                                    dflash_enabled: false,
+                                    dflash_draft_model: null,
+                                    dflash_draft_quant_enabled: false,
+                                    dflash_draft_quant_weight_bits: null,
+                                    dflash_draft_quant_activation_bits: null,
+                                    dflash_draft_quant_group_size: null,
+                                    dflash_max_ctx: null,
+                                    dflash_in_memory_cache: true,
+                                    dflash_in_memory_cache_max_entries: 4,
+                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
+                                    dflash_ssd_cache: false,
+                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
+                                    dflash_draft_window_size: null,
+                                    dflash_draft_sink_size: null,
+                                    dflash_verify_mode: null,
+                                    mtp_enabled: false,
+                                    vlm_mtp_enabled: false,
+                                    vlm_mtp_draft_model: null,
+                                    vlm_mtp_draft_block_size: null,
+                                    trust_remote_code: false,
+                                };
+                            }
+                            return {
+                                ...commonPayload,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 ...(this.selectedModel?.engine_type === 'ds4'
                                     ? { ds4_context_tokens: this.modelSettings.ds4_context_tokens || null }

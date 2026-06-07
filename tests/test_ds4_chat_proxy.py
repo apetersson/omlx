@@ -736,12 +736,12 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
     assert body["temperature"] == 0.9
     assert body["top_p"] == 0.8
     assert body["top_k"] == 7
-    assert body["repetition_penalty"] == 1.2
-    assert body["presence_penalty"] == 0.4
-    assert body["frequency_penalty"] == 0.0
-    assert body["xtc_probability"] == 0.0
-    assert body["xtc_threshold"] == 0.1
     assert body["max_tokens"] == 123
+    assert "repetition_penalty" not in body
+    assert "presence_penalty" not in body
+    assert "frequency_penalty" not in body
+    assert "xtc_probability" not in body
+    assert "xtc_threshold" not in body
 
 
 def test_ds4_think_max_chat_request_raises_backend_context(tmp_path):
@@ -956,12 +956,12 @@ def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(
     assert body["temperature"] == 0.95
     assert body["top_p"] == 0.85
     assert body["top_k"] == 9
-    assert body["repetition_penalty"] == 1.1
-    assert body["presence_penalty"] == 0.2
-    assert body["frequency_penalty"] == 0.0
-    assert body["xtc_probability"] == 0.0
-    assert body["xtc_threshold"] == 0.1
     assert body["max_tokens"] == 77
+    assert "repetition_penalty" not in body
+    assert "presence_penalty" not in body
+    assert "frequency_penalty" not in body
+    assert "xtc_probability" not in body
+    assert "xtc_threshold" not in body
 
 
 def test_ds4_completion_streaming_preserves_backend_sse_bytes(tmp_path):
