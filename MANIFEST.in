@@ -1,0 +1,5 @@
+include omlx/vendor/ds4/darwin-arm64/ds4-server
+include omlx/vendor/ds4/darwin-arm64/LICENSE
+include omlx/vendor/ds4/darwin-arm64/README.md
+include omlx/vendor/ds4/darwin-arm64/manifest.json
+recursive-include omlx/vendor/ds4/darwin-arm64/metal *.metal

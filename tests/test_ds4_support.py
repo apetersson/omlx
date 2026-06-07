@@ -14,6 +14,7 @@ from omlx.ds4_support import (
     DS4_SERVER_BINARY,
     DS4SupportError,
     copy_ds4_support_files,
+    ensure_ds4_support,
     find_bundled_ds4_support_dir,
     inspect_ds4_support,
     install_bundled_ds4_support_files,
@@ -232,6 +233,17 @@ class TestDS4BundledSupport:
 
         assert found == source.resolve()
 
+    def test_find_bundled_support_dir_from_package_vendor(self, tmp_path):
+        package_dir = tmp_path / "site-packages" / "omlx"
+        source = package_dir / "vendor" / "ds4" / "darwin-arm64"
+        source.mkdir(parents=True)
+        module_file = package_dir / "ds4_support.py"
+        module_file.write_text("# module\n")
+
+        found = find_bundled_ds4_support_dir(env={}, module_file=module_file)
+
+        assert found == source.resolve()
+
     def test_install_bundled_support_files_to_default_dir(self, tmp_path):
         source = tmp_path / "Resources" / BUNDLED_DS4_SUPPORT_DIR_NAME
         _write_complete_support_tree(source)
@@ -261,6 +273,24 @@ class TestDS4BundledSupport:
 
         assert result is None
         assert not custom.exists()
+
+    def test_ensure_ds4_support_installs_bundled_files_transparently(self, tmp_path):
+        source = tmp_path / "Resources" / BUNDLED_DS4_SUPPORT_DIR_NAME
+        _write_complete_support_tree(source)
+        base_path = tmp_path / "base"
+
+        status = ensure_ds4_support(
+            DS4Settings(),
+            base_path=base_path,
+            source_dir=source,
+            system="Darwin",
+            machine="arm64",
+        )
+
+        assert status.ready is True
+        assert status.support_dir == (base_path / "support" / "ds4").resolve()
+        assert (status.support_dir / DS4_SERVER_BINARY).is_file()
+        assert os.access(status.support_dir / DS4_SERVER_BINARY, os.X_OK)
 
 
 class TestDS4SupportCopy:

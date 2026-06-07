@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=70.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -178,7 +178,14 @@ where = ["."]
 include = ["omlx*"]
 
 [tool.setuptools.package-data]
-"omlx" = ["oq_calibration_data.json"]
+"omlx" = [
+    "oq_calibration_data.json",
+    "vendor/ds4/darwin-arm64/ds4-server",
+    "vendor/ds4/darwin-arm64/LICENSE",
+    "vendor/ds4/darwin-arm64/README.md",
+    "vendor/ds4/darwin-arm64/manifest.json",
+    "vendor/ds4/darwin-arm64/metal/*.metal",
+]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 

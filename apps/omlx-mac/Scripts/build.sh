@@ -377,6 +377,8 @@ if [ -n "$DS4_SUPPORT_SOURCE" ]; then
     [ -d "$DS4_SUPPORT_SOURCE" ] || die "OMLX_DS4_BUNDLE_SOURCE not found: $DS4_SUPPORT_SOURCE"
 elif [ -f "$PACKAGING_DIR/DS4Support/ds4-server" ]; then
     DS4_SUPPORT_SOURCE="$PACKAGING_DIR/DS4Support"
+elif [ -f "$REPO_ROOT/omlx/vendor/ds4/darwin-arm64/ds4-server" ]; then
+    DS4_SUPPORT_SOURCE="$REPO_ROOT/omlx/vendor/ds4/darwin-arm64"
 elif [ -f "$REPO_ROOT/../ds4-apetersson/ds4-server" ]; then
     DS4_SUPPORT_SOURCE="$REPO_ROOT/../ds4-apetersson"
 fi
@@ -500,6 +502,9 @@ else
     _sign_embedded_mach_o_files "$PYTHON_DIR"
     if [ -d "$RESOURCES_DIR/DS4Support" ]; then
         _sign_embedded_mach_o_files "$RESOURCES_DIR/DS4Support"
+    fi
+    if [ -d "$RESOURCES_DIR/omlx/vendor/ds4" ]; then
+        _sign_embedded_mach_o_files "$RESOURCES_DIR/omlx/vendor/ds4"
     fi
     codesign --force --sign - "$CLI_WRAPPER" >/dev/null 2>&1
     ok "  + signed omlx-cli wrapper"

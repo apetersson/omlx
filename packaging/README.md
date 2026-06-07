@@ -36,27 +36,27 @@ apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
 ```
 
-DS4/GGUF backend releases should provide a prebuilt support tree containing
-`ds4-server`, `LICENSE`, `README.md`, and `metal/*.metal` files. To build and
-stage that tree from a local `ds4-apetersson` checkout before the app bundle
-step:
+DS4/GGUF backend releases include a vendored macOS arm64 support tree under
+`omlx/vendor/ds4/darwin-arm64` containing `ds4-server`, `LICENSE`, `README.md`,
+`manifest.json`, and `metal/*.metal` files. The app bundle step uses that tree
+by default and copies only the validated runtime files into
+`Contents/Resources/DS4Support`. To override it with a freshly staged local
+build, run:
 
 ```bash
-scripts/build-ds4-support.sh --source ../ds4-apetersson
+scripts/build-ds4-support.sh --source ../ds4
 OMLX_REQUIRE_DS4_BUNDLE=1 apps/omlx-mac/Scripts/build.sh release
 ```
 
-The helper writes `packaging/DS4Support/`, which the bundle step picks up
-automatically. Alternatively, point the bundle step at another validated tree
-with `OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4-support` (and set
-`OMLX_REQUIRE_DS4_BUNDLE=1` in release jobs); the build copies only the
-validated runtime files into `Contents/Resources/DS4Support`. Validation also
-probes `ds4-server --help` and rejects stale binaries that lack the current OMLX
-launch flags such as `--ssd-streaming`, so release artifacts must be built from
-a DS4 checkout new enough for the managed backend. On first server start from
-the app bundle, oMLX seeds the user support directory
-(`~/Library/Application Support/oMLX` / `~/.omlx` base path `support/ds4`) from
-that bundled resource. No DS4 build or network fetch happens at runtime.
+The helper writes `packaging/DS4Support/`, which the bundle step picks up before
+the vendored fallback. Alternatively, point the bundle step at another validated
+tree with `OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4-support` (and set
+`OMLX_REQUIRE_DS4_BUNDLE=1` in release jobs). Validation probes
+`ds4-server --help` and rejects stale binaries that lack the current OMLX launch
+flags such as `--ssd-streaming`. On first server start from the app bundle, oMLX
+seeds the user support directory (`~/Library/Application Support/oMLX` /
+`~/.omlx` base path `support/ds4`) from that bundled resource. No DS4 build or
+network fetch happens at runtime.
 
 ## Output
 

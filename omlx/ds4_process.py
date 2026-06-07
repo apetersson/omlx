@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from .ds4_support import DS4SupportStatus, require_ds4_support
+from .ds4_support import DS4SupportStatus, ensure_ds4_support
 from .settings import DEFAULT_BASE_PATH, DS4Settings
 
 DS4_HOST = "127.0.0.1"
@@ -78,7 +78,7 @@ class DS4LaunchConfig:
 
     def support_status(self) -> DS4SupportStatus:
         """Validate configured support files for this launch."""
-        return require_ds4_support(
+        return ensure_ds4_support(
             self.settings,
             base_path=self.base_path,
             system=self.platform_system,

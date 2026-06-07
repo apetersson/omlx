@@ -23,6 +23,8 @@ from .settings import DEFAULT_BASE_PATH, DS4Settings
 DS4_SERVER_BINARY = "ds4-server"
 BUNDLED_DS4_SUPPORT_ENV = "OMLX_BUNDLED_DS4_SUPPORT_DIR"
 BUNDLED_DS4_SUPPORT_DIR_NAME = "DS4Support"
+VENDORED_DS4_SUPPORT_RELATIVE_DIR = Path("vendor") / "ds4" / "darwin-arm64"
+DS4_SUPPORT_MANIFEST = "manifest.json"
 DS4_SUPPORT_FILES: tuple[str, ...] = (
     "LICENSE",
     "README.md",
@@ -222,6 +224,55 @@ def require_ds4_support(
     return status
 
 
+def ensure_ds4_support(
+    settings: DS4Settings | None = None,
+    *,
+    base_path: str | Path | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+    source_dir: str | Path | None = None,
+) -> DS4SupportStatus:
+    """Ensure bundled DS4 support files are installed, then validate them.
+
+    This is the transparent provisioning path used by managed DS4 launches.  A
+    ready configured directory is returned unchanged.  Otherwise, when the user
+    has not configured a custom ``ds4.support_dir``, bundled/vendor support
+    files are copied into the default oMLX support directory and validation is
+    retried.  Explicit custom support directories remain user-managed.
+    """
+    settings = settings or DS4Settings()
+    status = inspect_ds4_support(
+        settings,
+        base_path=base_path,
+        system=system,
+        machine=machine,
+    )
+    if status.ready:
+        return status
+    if status.unsupported_platform:
+        raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
+
+    # Keep explicit custom support directories fully user-managed.  The default
+    # support dir is oMLX-owned and can be repaired from bundled resources.
+    if settings.support_dir is None:
+        install_bundled_ds4_support_files(
+            settings,
+            base_path=base_path,
+            source_dir=source_dir,
+            overwrite=True,
+        )
+        status = inspect_ds4_support(
+            settings,
+            base_path=base_path,
+            system=system,
+            machine=machine,
+        )
+        if status.ready:
+            return status
+
+    raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
+
+
 def find_bundled_ds4_support_dir(
     *,
     env: Mapping[str, str] | None = None,
@@ -247,6 +298,10 @@ def find_bundled_ds4_support_dir(
         candidate = resources_dir / name
         if candidate.is_dir():
             return candidate
+
+    package_candidate = module_path.parent / VENDORED_DS4_SUPPORT_RELATIVE_DIR
+    if package_candidate.is_dir():
+        return package_candidate
     return None
 
 
@@ -314,10 +369,21 @@ def copy_ds4_support_files(
         src = source / rel
         dst = destination / rel
         if dst.exists() and not overwrite:
+            if rel == DS4_SERVER_BINARY:
+                dst.chmod(dst.stat().st_mode | 0o111)
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+        if rel == DS4_SERVER_BINARY:
+            dst.chmod(dst.stat().st_mode | 0o111)
         copied.append(dst)
+
+    manifest_src = source / DS4_SUPPORT_MANIFEST
+    if manifest_src.is_file():
+        manifest_dst = destination / DS4_SUPPORT_MANIFEST
+        if overwrite or not manifest_dst.exists():
+            shutil.copy2(manifest_src, manifest_dst)
+            copied.append(manifest_dst)
 
     return DS4SupportCopyResult(
         source_dir=source,

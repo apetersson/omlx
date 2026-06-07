@@ -11,12 +11,12 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-ds4-support.sh [options]
 
-Build ds4-server from a local ds4-apetersson checkout and stage the validated
+Build ds4-server from a local upstream ds4 checkout and stage the validated
 runtime support tree for the macOS app bundle.
 
 Options:
-  --source DIR     ds4-apetersson source checkout (default: $OMLX_DS4_SOURCE_DIR,
-                   ../ds4-apetersson, then ../ds4)
+  --source DIR     ds4 source checkout (default: $OMLX_DS4_SOURCE_DIR,
+                   ../ds4, then ../ds4-apetersson)
   --out DIR        Destination support tree (default: $OMLX_DS4_SUPPORT_OUT or
                    packaging/DS4Support)
   --skip-build     Do not run make; validate/copy an already-built ds4-server
@@ -71,10 +71,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$SOURCE_DIR" ]; then
-    if [ -d "$REPO_ROOT/../ds4-apetersson" ]; then
-        SOURCE_DIR="$REPO_ROOT/../ds4-apetersson"
-    elif [ -d "$REPO_ROOT/../ds4" ]; then
+    if [ -d "$REPO_ROOT/../ds4" ]; then
         SOURCE_DIR="$REPO_ROOT/../ds4"
+    elif [ -d "$REPO_ROOT/../ds4-apetersson" ]; then
+        SOURCE_DIR="$REPO_ROOT/../ds4-apetersson"
     else
         die "no DS4 source found; pass --source or set OMLX_DS4_SOURCE_DIR"
     fi
