@@ -18,6 +18,7 @@ from omlx.engine.ds4 import (
     parse_ds4_progress_log_line,
 )
 from omlx.engine_pool import EnginePool
+from omlx.exceptions import InsufficientMemoryError
 from omlx.server import ServerState, app
 from omlx.settings import DS4_THINK_MAX_CONTEXT_TOKENS, DS4Settings
 
@@ -579,6 +580,75 @@ async def test_engine_pool_loads_ds4_with_per_model_context(
     assert FakeManagedProcess.instances[0].config.context_tokens == 100_000
     assert "--ctx" in FakeManagedProcess.instances[0].command
     assert "100000" in FakeManagedProcess.instances[0].command
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_auto_enables_ds4_ssd_streaming_when_budget_is_tight(
+    monkeypatch, tmp_path
+):
+    """DS4 auto mode uses --ssd-streaming when a GGUF exceeds memory budget."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 1_000)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    pool._get_final_ceiling = lambda: 1_500
+    pool.discover_models(str(tmp_path))
+
+    await pool.get_engine("foo")
+
+    launch = FakeManagedProcess.instances[0]
+    assert launch.config.auto_enable_ssd_streaming is True
+    assert "--ssd-streaming" in launch.command
+    assert "--ssd-streaming-cache-experts" not in launch.command
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_ds4_ssd_streaming_off_preserves_full_admission(
+    monkeypatch, tmp_path
+):
+    """User-forced off mode does not bypass normal memory admission."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 1_000)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="off"),
+    )
+    pool._get_final_ceiling = lambda: 1_500
+    pool.discover_models(str(tmp_path))
+
+    with pytest.raises(InsufficientMemoryError):
+        await pool.get_engine("foo")
+
+    assert FakeManagedProcess.instances == []
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_ds4_ssd_streaming_on_forces_launch_flag(
+    monkeypatch, tmp_path
+):
+    """User-forced on mode passes --ssd-streaming even when auto would not."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 1_000)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="on"),
+    )
+    pool._get_final_ceiling = lambda: 5_000
+    pool.discover_models(str(tmp_path))
+
+    await pool.get_engine("foo")
+
+    launch = FakeManagedProcess.instances[0]
+    assert launch.config.auto_enable_ssd_streaming is False
+    assert "--ssd-streaming" in launch.command
 
 
 @pytest.mark.asyncio

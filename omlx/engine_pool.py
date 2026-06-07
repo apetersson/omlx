@@ -86,6 +86,8 @@ class EngineEntry:
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
+    # Launch DS4 auto-mode with --ssd-streaming for the next load attempt.
+    ds4_auto_enable_ssd_streaming: bool = False
 
 
 class EnginePool:
@@ -162,6 +164,60 @@ class EnginePool:
         if isinstance(ds4_settings, DS4Settings):
             return ds4_settings
         return DS4Settings()
+
+    @staticmethod
+    def _system_available_memory_bytes() -> int:
+        """Return best-effort system-available RAM for DS4 auto streaming."""
+        try:
+            import psutil
+
+            return max(0, int(psutil.virtual_memory().available))
+        except Exception:  # noqa: BLE001 - psutil may be absent or unavailable
+            return 0
+
+    def _prepare_ds4_auto_ssd_streaming(
+        self,
+        entry: EngineEntry,
+        *,
+        current: int,
+        ceiling: int,
+    ) -> int:
+        """Resolve DS4 SSD-streaming auto mode and return admission size."""
+        entry.ds4_auto_enable_ssd_streaming = False
+        if (
+            entry.engine_type != "ds4"
+            or self._get_ds4_settings().ssd_streaming != "auto"
+        ):
+            return entry.estimated_size
+
+        if ceiling > 0:
+            available = max(0, ceiling - current)
+        else:
+            available = self._system_available_memory_bytes()
+        if available <= 0 or entry.estimated_size <= available:
+            return entry.estimated_size
+
+        entry.ds4_auto_enable_ssd_streaming = True
+        if ceiling <= 0:
+            logger.info(
+                "Auto-enabling DS4 SSD streaming for %s: estimated %s exceeds "
+                "available system memory %s",
+                entry.model_id,
+                format_size(entry.estimated_size),
+                format_size(available),
+            )
+            return entry.estimated_size
+
+        admission_size = max(1, min(entry.estimated_size, available))
+        logger.info(
+            "Auto-enabling DS4 SSD streaming for %s: estimated %s exceeds "
+            "available memory budget %s; using streaming admission estimate %s",
+            entry.model_id,
+            format_size(entry.estimated_size),
+            format_size(available),
+            format_size(admission_size),
+        )
+        return admission_size
 
     @property
     def current_model_memory(self) -> int:
@@ -554,8 +610,14 @@ class EnginePool:
             if ceiling > 0:
                 while True:
                     current = self._current_admission_memory()
-                    projected = current + entry.estimated_size
+                    admission_size = entry.estimated_size
+                    projected = current + admission_size
                     if projected <= ceiling:
+                        self._prepare_ds4_auto_ssd_streaming(
+                            entry,
+                            current=current,
+                            ceiling=ceiling,
+                        )
                         break
                     victim = self._find_lru_victim()
                     if victim is not None:
@@ -567,27 +629,41 @@ class EnginePool:
                         )
                         await self._unload_engine(victim)
                         continue
+                    admission_size = self._prepare_ds4_auto_ssd_streaming(
+                        entry,
+                        current=current,
+                        ceiling=ceiling,
+                    )
+                    projected = current + admission_size
+                    if projected <= ceiling:
+                        break
                     # Nothing else to evict -- model cannot fit. Use
                     # ModelTooLargeError when the model alone exceeds the
                     # ceiling (no chance of fitting), InsufficientMemoryError
                     # when the model would fit on a clean process but the
                     # current usage leaves no room.
-                    if entry.estimated_size > ceiling:
+                    if admission_size > ceiling:
                         raise ModelTooLargeError(
-                            model_id, entry.estimated_size, ceiling
+                            model_id, admission_size, ceiling
                         )
                     raise InsufficientMemoryError(
-                        required=entry.estimated_size,
+                        required=admission_size,
                         current=current,
                         message=(
                             f"Cannot load {model_id}: projected memory "
                             f"{format_size(projected)} would exceed the memory "
                             f"ceiling {format_size(ceiling)} "
                             f"(current: {format_size(current)}, "
-                            f"model: {format_size(entry.estimated_size)}). "
+                            f"model: {format_size(admission_size)}). "
                             "Free system memory or lower memory_guard_tier."
                         ),
                     )
+            elif entry.engine_type == "ds4":
+                self._prepare_ds4_auto_ssd_streaming(
+                    entry,
+                    current=self._current_admission_memory(),
+                    ceiling=0,
+                )
 
             # Now load the model
             await self._load_engine(model_id, force_lm=force_lm)
@@ -977,6 +1053,7 @@ class EnginePool:
                     context_tokens=getattr(
                         model_settings, "ds4_context_tokens", None
                     ),
+                    auto_enable_ssd_streaming=entry.ds4_auto_enable_ssd_streaming,
                 )
             elif model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
