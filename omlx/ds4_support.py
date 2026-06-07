@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ DS4_SUPPORT_FILES: tuple[str, ...] = (
     "LICENSE",
     "README.md",
 )
+DS4_REQUIRED_CLI_FLAGS: tuple[str, ...] = ("--ssd-streaming",)
 DS4_METAL_FILES: tuple[str, ...] = (
     "flash_attn.metal",
     "dense.metal",
@@ -64,6 +66,7 @@ class DS4SupportStatus:
     binary_not_executable: bool
     unsupported_platform: bool
     platform_name: str
+    binary_capability_error: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -73,6 +76,7 @@ class DS4SupportStatus:
             or self.binary_missing
             or self.binary_not_executable
             or self.unsupported_platform
+            or self.binary_capability_error
         )
 
     def error_message(self) -> str | None:
@@ -87,6 +91,11 @@ class DS4SupportStatus:
             problems.append(f"missing DS4 binary: {self.binary_path}")
         elif self.binary_not_executable:
             problems.append(f"DS4 binary is not executable: {self.binary_path}")
+        elif self.binary_capability_error:
+            problems.append(
+                f"DS4 binary is incompatible: {self.binary_path}: "
+                f"{self.binary_capability_error}"
+            )
         if self.missing_files:
             missing = ", ".join(self.missing_files)
             problems.append(f"missing DS4 support files under {self.support_dir}: {missing}")
@@ -133,6 +142,30 @@ def _missing_relative_paths(root: Path, relative_paths: Iterable[str]) -> tuple[
     return tuple(rel for rel in relative_paths if not (root / rel).is_file())
 
 
+def _inspect_ds4_binary_capabilities(binary_path: Path) -> str | None:
+    """Return a compatibility error when the DS4 binary lacks required flags."""
+    try:
+        completed = subprocess.run(
+            [str(binary_path), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "timed out while probing --help"
+    except OSError as exc:
+        return f"failed to run --help: {exc}"
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    if completed.returncode != 0:
+        return f"--help exited with status {completed.returncode}"
+    missing = tuple(flag for flag in DS4_REQUIRED_CLI_FLAGS if flag not in output)
+    if missing:
+        return "missing required CLI option(s): " + ", ".join(missing)
+    return None
+
+
 def inspect_ds4_support(
     settings: DS4Settings | None = None,
     *,
@@ -153,6 +186,10 @@ def inspect_ds4_support(
     binary_missing = not binary_path.is_file()
     binary_not_executable = binary_path.is_file() and not os.access(binary_path, os.X_OK)
     platform_name = _platform_name(system, machine)
+    unsupported_platform = not is_ds4_supported_platform(system, machine)
+    binary_capability_error = None
+    if not (binary_missing or binary_not_executable or unsupported_platform):
+        binary_capability_error = _inspect_ds4_binary_capabilities(binary_path)
 
     return DS4SupportStatus(
         support_dir=support_dir,
@@ -160,8 +197,9 @@ def inspect_ds4_support(
         missing_files=missing_files,
         binary_missing=binary_missing,
         binary_not_executable=binary_not_executable,
-        unsupported_platform=not is_ds4_supported_platform(system, machine),
+        unsupported_platform=unsupported_platform,
         platform_name=platform_name,
+        binary_capability_error=binary_capability_error,
     )
 
 
@@ -264,6 +302,11 @@ def copy_ds4_support_files(
         raise DS4SupportError(
             "Bundled DS4 support files are incomplete under "
             f"{source}: {', '.join(missing)}"
+        )
+    capability_error = _inspect_ds4_binary_capabilities(source / DS4_SERVER_BINARY)
+    if capability_error:
+        raise DS4SupportError(
+            f"Bundled DS4 binary is incompatible under {source}: {capability_error}"
         )
 
     copied: list[Path] = []

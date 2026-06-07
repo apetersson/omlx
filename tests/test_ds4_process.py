@@ -78,7 +78,11 @@ HTTPServer((args.host, args.port), Handler).serve_forever()
 
 def _never_ready_script() -> str:
     return f"""#!{sys.executable}
+import sys
 import time
+if '--help' in sys.argv:
+    print('--ssd-streaming')
+    raise SystemExit(0)
 print('fake ds4 never ready', flush=True)
 time.sleep(60)
 """

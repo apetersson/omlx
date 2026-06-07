@@ -10,6 +10,7 @@ from omlx.ds4_support import (
     BUNDLED_DS4_SUPPORT_DIR_NAME,
     BUNDLED_DS4_SUPPORT_ENV,
     DS4_METAL_FILES,
+    DS4_REQUIRED_CLI_FLAGS,
     DS4_SERVER_BINARY,
     DS4SupportError,
     copy_ds4_support_files,
@@ -23,10 +24,23 @@ from omlx.ds4_support import (
 from omlx.settings import DS4Settings
 
 
-def _write_complete_support_tree(root: Path, *, executable: bool = True) -> None:
+def _write_complete_support_tree(
+    root: Path,
+    *,
+    executable: bool = True,
+    supports_required_flags: bool = True,
+) -> None:
     binary = root / DS4_SERVER_BINARY
     binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_bytes(b"#!/bin/sh\n")
+    if supports_required_flags:
+        flag_lines = "\n".join(f"echo '{flag}'" for flag in DS4_REQUIRED_CLI_FLAGS)
+        binary.write_text(
+            f"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n{flag_lines}\nfi\n"
+        )
+    else:
+        binary.write_text(
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\necho stale-ds4\nfi\n"
+        )
     binary.chmod(0o755 if executable else 0o644)
     (root / "LICENSE").write_text("MIT\n")
     (root / "README.md").write_text("DS4\n")
@@ -74,6 +88,24 @@ class TestDS4SupportInspection:
         assert status.support_dir == support.resolve()
         assert status.binary_path == (support / DS4_SERVER_BINARY).resolve()
 
+    def test_incompatible_binary_missing_required_flags_is_not_ready(self, tmp_path):
+        """Stale ds4-server binaries are rejected before launch."""
+        support = tmp_path / "support" / "ds4"
+        _write_complete_support_tree(support, supports_required_flags=False)
+        settings = DS4Settings(support_dir=str(support))
+
+        status = inspect_ds4_support(
+            settings,
+            base_path=tmp_path,
+            system="Darwin",
+            machine="arm64",
+        )
+
+        assert status.ready is False
+        assert status.binary_capability_error is not None
+        assert "--ssd-streaming" in status.binary_capability_error
+        assert "incompatible" in (status.error_message() or "")
+
     def test_missing_support_files_report_clear_error(self, tmp_path):
         """Missing support files produce a user-facing reinstall error message."""
         support = tmp_path / "support" / "ds4"
@@ -104,7 +136,10 @@ class TestDS4SupportInspection:
         (support / DS4_SERVER_BINARY).unlink()
         override = tmp_path / "custom" / "ds4-server"
         override.parent.mkdir()
-        override.write_bytes(b"#!/bin/sh\n")
+        flag_lines = "\n".join(f"echo '{flag}'" for flag in DS4_REQUIRED_CLI_FLAGS)
+        override.write_text(
+            f"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n{flag_lines}\nfi\n"
+        )
         override.chmod(0o755)
         settings = DS4Settings(
             support_dir=str(support),
@@ -285,4 +320,17 @@ class TestDS4SupportCopy:
             copy_ds4_support_files(source, destination)
 
         assert "Bundled DS4 support files are incomplete" in str(exc_info.value)
+        assert not destination.exists()
+
+    def test_copy_rejects_incompatible_binary(self, tmp_path):
+        """Bundled/staged DS4 binaries must expose current launch flags."""
+        source = tmp_path / "resources" / "ds4"
+        destination = tmp_path / "support" / "ds4"
+        _write_complete_support_tree(source, supports_required_flags=False)
+
+        with pytest.raises(DS4SupportError) as exc_info:
+            copy_ds4_support_files(source, destination)
+
+        assert "Bundled DS4 binary is incompatible" in str(exc_info.value)
+        assert "--ssd-streaming" in str(exc_info.value)
         assert not destination.exists()

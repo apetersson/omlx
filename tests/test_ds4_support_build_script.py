@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from omlx.ds4_support import DS4_METAL_FILES, DS4_SERVER_BINARY
+from omlx.ds4_support import DS4_METAL_FILES, DS4_REQUIRED_CLI_FLAGS, DS4_SERVER_BINARY
 
 _SCRIPT = Path("scripts/build-ds4-support.sh")
 
@@ -23,7 +23,11 @@ def _write_support_scaffold(source: Path, *, with_binary: bool = False) -> None:
         (metal / name).write_text("// metal\n", encoding="utf-8")
     if with_binary:
         binary = source / DS4_SERVER_BINARY
-        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        flag_lines = "\n".join(f"echo '{flag}'" for flag in DS4_REQUIRED_CLI_FLAGS)
+        binary.write_text(
+            f"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n{flag_lines}\nfi\n",
+            encoding="utf-8",
+        )
         binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
 
 
@@ -62,7 +66,9 @@ def test_build_ds4_support_script_builds_ds4_server_with_make(tmp_path):
     _write_support_scaffold(source)
     (source / "Makefile").write_text(
         "ds4-server:\n"
-        "\tprintf '#!/bin/sh\\nexit 0\\n' > ds4-server\n"
+        "\tprintf '#!/bin/sh\\nif [ \"$$1\" = \"--help\" ]; then\\n" +
+        "\\n".join(f"echo {flag}" for flag in DS4_REQUIRED_CLI_FLAGS) +
+        "\\nfi\\n' > ds4-server\n"
         "\tchmod 755 ds4-server\n"
         "\ttouch built.marker\n",
         encoding="utf-8",
