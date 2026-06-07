@@ -19,7 +19,7 @@ from typing import Any
 
 import requests
 
-DS4_STREAM_FLUSH_BYTES = 128
+DS4_STREAM_FLUSH_BYTES = 2048
 
 from ..ds4_process import DS4_HOST, DS4LaunchConfig, DS4ManagedProcess
 from ..settings import DEFAULT_BASE_PATH, DS4Settings
