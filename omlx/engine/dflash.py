@@ -914,7 +914,7 @@ class DFlashEngine(BaseEngine):
             logger.info("DFlash generate cancelled, waiting for executor to drain")
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("DFlash executor did not exit within 10s after abort")
             except Exception:
                 pass
@@ -1079,7 +1079,7 @@ class DFlashEngine(BaseEngine):
                 logger.info("DFlash stream cancelled, waiting for executor to drain")
             try:
                 await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "DFlash executor did not exit within 10s after abort; "
                     "next request may still be queued"
@@ -1199,6 +1199,24 @@ class DFlashEngine(BaseEngine):
             presence_penalty=presence_penalty, **kwargs,
         ):
             yield output
+
+    @property
+    def scheduler(self) -> Any | None:
+        fallback = self._fallback_engine
+        if fallback is None:
+            return None
+
+        scheduler = getattr(fallback, "scheduler", None)
+        if scheduler is not None:
+            return scheduler
+
+        inner = getattr(fallback, "_engine", None)
+        if inner is None:
+            return None
+        inner_engine = getattr(inner, "engine", None)
+        if inner_engine is None:
+            return None
+        return getattr(inner_engine, "scheduler", None)
 
     def has_active_requests(self) -> bool:
         if self._fallback_engine is not None and self._fallback_engine.has_active_requests():
