@@ -1263,6 +1263,14 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         (only possible when neither the model nor the global default
         provides a value, which shouldn't happen in practice).
     """
+    ds4_alias_kind = None
+    if model_id:
+        from .ds4_aliases import parse_ds4_alias_id
+
+        parsed_ds4_alias = parse_ds4_alias_id(model_id)
+        if parsed_ds4_alias is not None:
+            ds4_alias_kind = parsed_ds4_alias[1]
+
     # Resolve alias so per-model settings are found by real model ID
     model_id = resolve_model_id(model_id)
 
@@ -1270,26 +1278,40 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
+    pool = _server_state.engine_pool
+
     # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
+        if ds4_alias_kind == "think-max" and model_id and pool is not None:
+            entry = pool.get_entry(model_id)
+            if entry is not None and entry.engine_type == "ds4":
+                return max(
+                    model_settings.max_context_window,
+                    DS4_THINK_MAX_CONTEXT_TOKENS,
+                )
         return model_settings.max_context_window
 
     # Priority 2: model-native context, optionally clamped by policy
-    pool = _server_state.engine_pool
     if model_id and pool is not None:
         entry = pool.get_entry(model_id)
         if entry is not None and entry.engine_type == "ds4":
             engine = entry.engine
             effective_context = getattr(engine, "effective_context_tokens", None)
             if callable(effective_context):
-                return effective_context()
+                ds4_context = effective_context()
+                if ds4_alias_kind == "think-max":
+                    return max(ds4_context, DS4_THINK_MAX_CONTEXT_TOKENS)
+                return ds4_context
             get_ds4_settings = getattr(pool, "_get_ds4_settings", None)
             ds4_settings = get_ds4_settings() if callable(get_ds4_settings) else None
             if not isinstance(ds4_settings, DS4Settings):
                 global_settings = _server_state.global_settings
                 ds4_settings = getattr(global_settings, "ds4", None)
             if isinstance(ds4_settings, DS4Settings):
-                return ds4_settings.get_auto_context_tokens()
+                ds4_context = ds4_settings.get_auto_context_tokens()
+                if ds4_alias_kind == "think-max":
+                    return max(ds4_context, DS4_THINK_MAX_CONTEXT_TOKENS)
+                return ds4_context
         if entry is not None and entry.model_context_length is not None:
             native = entry.model_context_length
             policy = getattr(
@@ -2204,7 +2226,7 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                 for alias in ds4_aliases_for_model(display_id):
                     if alias.alias_id in reserved_display_ids:
                         continue
-                    add_model_info(alias.alias_id, context_model_id=model_id)
+                    add_model_info(alias.alias_id, context_model_id=alias.alias_id)
 
     if _markitdown_is_visible() and MARKITDOWN_MODEL_ID not in seen_model_ids:
         models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))

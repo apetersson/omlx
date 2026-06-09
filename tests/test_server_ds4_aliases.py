@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from omlx.engine_pool import EnginePool
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
+from omlx.settings import DS4Settings, DS4_THINK_MAX_CONTEXT_TOKENS
 
 
 class _SettingsManager:
@@ -24,9 +25,14 @@ class _SettingsManager:
         return self._settings
 
 
-def _ds4_pool(tmp_path, filename: str = "DeepSeek V4 Flash Q2_K.gguf") -> EnginePool:
+def _ds4_pool(
+    tmp_path,
+    filename: str = "DeepSeek V4 Flash Q2_K.gguf",
+    *,
+    ds4_settings: DS4Settings | None = None,
+) -> EnginePool:
     (tmp_path / filename).write_bytes(b"0" * 1000)
-    pool = EnginePool()
+    pool = EnginePool(ds4_settings=ds4_settings)
     pool.discover_models(str(tmp_path))
     return pool
 
@@ -55,6 +61,27 @@ def test_models_list_includes_ds4_base_and_per_model_aliases(tmp_path):
     assert f"{model_id}-chat" in ids
     assert f"{model_id}-reasoner" in ids
     assert f"{model_id}-think-max" in ids
+
+
+def test_models_list_advertises_ds4_variant_contexts(tmp_path):
+    pool = _ds4_pool(
+        tmp_path,
+        ds4_settings=DS4Settings(context_default_tokens=100_000),
+    )
+    model_id = pool.get_model_ids()[0]
+
+    with _client_for_pool(pool) as client:
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    models = {model["id"]: model for model in response.json()["data"]}
+    assert models[model_id]["max_model_len"] == 100_000
+    assert models[f"{model_id}-chat"]["max_model_len"] == 100_000
+    assert models[f"{model_id}-reasoner"]["max_model_len"] == 100_000
+    assert (
+        models[f"{model_id}-think-max"]["max_model_len"]
+        == DS4_THINK_MAX_CONTEXT_TOKENS
+    )
 
 
 def test_models_list_uses_user_alias_as_ds4_alias_base(tmp_path):
