@@ -129,23 +129,38 @@ class DS4StreamingProxyResponse:
     def _iter_low_latency_raw_bytes(cls, raw: object) -> Iterator[bytes]:
         """Yield raw SSE bytes as soon as an event boundary is observed.
 
-        urllib3's ``stream(amt)`` can wait until ``amt`` bytes or EOF for
-        non-chunked DS4 SSE responses, which makes clients see a fully buffered
-        stream even while DS4 is generating.  Reading a byte at a time and
-        flushing on SSE event separators keeps the response byte-preserving but
-        low-latency.
+        Reads in buffered chunks (up to DS4_STREAM_FLUSH_BYTES at a time)
+        and scans for ``\n\n`` / ``\r\n\r\n`` SSE event separators,
+        yielding each complete event immediately.  Partial data is kept in
+        the buffer and yielded at EOF.  This avoids the per-byte system
+        call overhead of the old single-byte read loop.
         """
         buffer = bytearray()
         while True:
-            chunk = cls._raw_read(raw, 1)
+            chunk = cls._raw_read(raw, DS4_STREAM_FLUSH_BYTES)
             if not chunk:
                 break
             buffer.extend(chunk)
-            if (
-                buffer.endswith(b"\n\n")
-                or buffer.endswith(b"\r\n\r\n")
-                or len(buffer) >= DS4_STREAM_FLUSH_BYTES
-            ):
+            # Scan for event boundaries within the accumulated buffer.
+            # Yield complete events as soon as the separator is found,
+            # retaining any trailing partial data in the buffer.
+            sep1 = b"\n\n"
+            sep2 = b"\r\n\r\n"
+            while True:
+                pos1 = buffer.find(sep1)
+                pos2 = buffer.find(sep2)
+                # Use the earliest separator to keep latency low.
+                if pos1 != -1 and (pos2 == -1 or pos1 <= pos2):
+                    end = pos1 + len(sep1)
+                elif pos2 != -1:
+                    end = pos2 + len(sep2)
+                else:
+                    break
+                yield bytes(buffer[:end])
+                del buffer[:end]
+            # Flush on size threshold as a safety valve (no separator found
+            # but the buffer has grown large — e.g. a malformed stream).
+            if len(buffer) >= DS4_STREAM_FLUSH_BYTES:
                 yield bytes(buffer)
                 buffer.clear()
         if buffer:
@@ -160,11 +175,11 @@ class DS4StreamingProxyResponse:
             if raw is not None and hasattr(raw, "read"):
                 yield from self._iter_low_latency_raw_bytes(raw)
             elif raw is not None and hasattr(raw, "stream"):
-                for chunk in raw.stream(1, decode_content=False):
+                for chunk in raw.stream(DS4_STREAM_FLUSH_BYTES, decode_content=False):
                     if chunk:
                         yield chunk
             else:
-                for chunk in self.response.iter_content(chunk_size=1):
+                for chunk in self.response.iter_content(chunk_size=DS4_STREAM_FLUSH_BYTES):
                     if chunk:
                         yield chunk
         finally:
