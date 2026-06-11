@@ -102,14 +102,12 @@ def hf_sibling_size(sibling) -> int:
         return 0
 
 
-def _is_mock_like(value) -> bool:
-    return value.__class__.__module__.startswith("unittest.mock")
-
-
 def hf_gguf_metadata(model):
-    """Return HF GGUF metadata from a model object, excluding test mocks."""
+    """Return HF GGUF metadata from a model object."""
     gguf = model.get("gguf") if isinstance(model, dict) else getattr(model, "gguf", None)
-    if gguf is None or isinstance(gguf, (bool, int, float, str)) or _is_mock_like(gguf):
+    if gguf is None or isinstance(gguf, (bool, int, float, str)):
+        return None
+    if not isinstance(gguf, dict):
         return None
     return gguf
 
@@ -117,15 +115,13 @@ def hf_gguf_metadata(model):
 def has_gguf_metadata(model) -> bool:
     """Return whether HF explicitly reports GGUF metadata for this repo."""
     gguf = hf_gguf_metadata(model)
-    if isinstance(gguf, dict):
-        return bool(gguf)
-    return gguf is not None
+    return isinstance(gguf, dict) and bool(gguf)
 
 
 def hf_gguf_total_size(model) -> int:
     """Return total GGUF byte size from HF list metadata when available."""
     gguf = hf_gguf_metadata(model)
-    if not gguf:
+    if not isinstance(gguf, dict):
         return 0
     for key in ("totalFileSize", "total_file_size", "totalSize", "size"):
         value = gguf.get(key) if isinstance(gguf, dict) else getattr(gguf, key, None)
