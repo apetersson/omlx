@@ -27,6 +27,15 @@ DS4_HOST = "127.0.0.1"
 _DS4_FS_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 logger = logging.getLogger(__name__)
 
+# Per-process-instance counter for short log identifiers (DS4-1, DS4-2, ...).
+_ds4_instance_counter = 0
+
+
+def _next_ds4_instance_id() -> str:
+    global _ds4_instance_counter
+    _ds4_instance_counter += 1
+    return f"DS4-{_ds4_instance_counter}"
+
 
 class DS4ProcessError(RuntimeError):
     """Raised when a managed DS4 process cannot start or become ready."""
@@ -255,6 +264,7 @@ class DS4ManagedProcess:
         self.log_path: Path | None = None
         self.last_kv_prune_result: DS4KVPruneResult | None = None
         self._log_tasks: list[asyncio.Task[None]] = []
+        self._instance_id: str = _next_ds4_instance_id()
 
     @property
     def is_running(self) -> bool:
@@ -276,6 +286,7 @@ class DS4ManagedProcess:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        logger.info("[%s] Loading model: %s", self._instance_id, self.config.model_id)
         self._start_log_capture()
 
         try:
@@ -405,6 +416,6 @@ class DS4ManagedProcess:
             log_line = DS4LogLine(stream, text, time.monotonic())
             self.logs.append(log_line)
             self._append_log_file_line(log_line)
-            logger.info("[DS4] %s %s: %s", self.config.model_id, stream, text)
+            logger.info("[%s] %s: %s", self._instance_id, stream, text)
             if len(self.logs) > self.max_log_lines:
                 del self.logs[: len(self.logs) - self.max_log_lines]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -320,7 +321,8 @@ class TestDS4ManagedProcess:
         log_text = managed.log_path.read_text()
         assert "model_id: model" in log_text
         assert "stdout: fake ds4 argv" in log_text
-        assert "[DS4] model stdout: fake ds4 argv" in caplog.text
+        assert re.search(r"\[DS4-\d+\] Loading model: model", caplog.text)
+        assert re.search(r"\[DS4-\d+\] stdout: fake ds4 argv", caplog.text)
 
     @pytest.mark.asyncio
     async def test_start_can_disable_ds4_debug_log_file(self, tmp_path, caplog):
@@ -355,7 +357,8 @@ class TestDS4ManagedProcess:
 
         assert managed.log_path is None
         assert not (tmp_path / "debug" / "model" / "ds4.log").exists()
-        assert "[DS4] model stdout: fake ds4 argv" in caplog.text
+        assert re.search(r"\[DS4-\d+\] Loading model: model", caplog.text)
+        assert re.search(r"\[DS4-\d+\] stdout: fake ds4 argv", caplog.text)
 
     @pytest.mark.asyncio
     async def test_start_timeout_stops_process_and_reports_logs(self, tmp_path):
