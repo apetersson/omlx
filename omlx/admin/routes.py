@@ -3314,6 +3314,21 @@ async def update_global_settings(
 
     # Apply server settings
     if request.host is not None:
+        from ..utils.network import is_valid_bind_host
+
+        _hosts = [h.strip() for h in request.host.split(",")]
+        _hosts = [h for h in _hosts if h]  # drop empty segments
+        if not _hosts:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid host: at least one non-empty host is required",
+            )
+        for h in _hosts:
+            if not is_valid_bind_host(h):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid host: {h!r} (must be a valid IP address or hostname)",
+                )
         global_settings.server.host = request.host
     if request.port is not None:
         global_settings.server.port = request.port
