@@ -921,6 +921,92 @@ class TestServeCommandFunctions:
         assert captured["socket_name"][1] > 0
 
 
+    def test_serve_binds_multiple_sockets_for_multi_host(self, tmp_path, monkeypatch):
+        """Comma-separated server.host should bind one socket per host."""
+        import uvicorn
+
+        from omlx.cli import serve_command
+
+        host = "127.0.0.1,0.0.0.0"
+        port = 0
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+        events = []
+
+        fake_server = ModuleType("omlx.server")
+
+        async def app(scope, receive, send):
+            return None
+
+        def fake_init_server(**kwargs):
+            events.append("init")
+
+        fake_server.app = app
+        fake_server.init_server = MagicMock(side_effect=fake_init_server)
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+
+        fake_mlx = ModuleType("mlx")
+        fake_mlx_core = ModuleType("mlx.core")
+        fake_mlx_core.device_info = lambda: {"memory_size": 0}
+        fake_mlx_core.set_cache_limit = MagicMock()
+        fake_mlx.core = fake_mlx_core
+        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+
+        original_bind_socket = uvicorn.Config.bind_socket
+
+        def tracking_bind_socket(config):
+            sock = original_bind_socket(config)
+            events.append("bind")
+            return sock
+
+        captured = {}
+
+        def fake_run(self, sockets=None):
+            self.config.load()
+            events.append("run")
+            captured["socket_count"] = len(sockets)
+
+        monkeypatch.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
+        monkeypatch.setattr("uvicorn.Server.run", fake_run)
+
+        serve_command(args)
+
+        assert events == ["bind", "bind", "init", "run"]
+        assert captured["socket_count"] == 2
+
+
+    def test_serve_exits_on_empty_bind_hosts(self, tmp_path, monkeypatch, capsys):
+        """Empty/whitespace-only host should exit cleanly with an error message."""
+        from omlx.cli import serve_command
+
+        host = " ,  "  # split + strip yields empty list
+        port = 8000
+        settings = self._make_settings(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            serve_command(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "no valid bind hosts" in captured.err
+
+
 class TestHasCliOverrides:
     """Tests for _has_cli_overrides() — detects explicitly passed CLI args."""
 

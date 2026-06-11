@@ -226,8 +226,13 @@ def serve_command(args):
     bind_hosts = [
         h.strip() for h in settings.server.host.split(",") if h.strip()
     ]
-    display_hosts = ", ".join(bind_hosts)
-    print(f"Binding server at http://{display_hosts}:{settings.server.port}")
+    if not bind_hosts:
+        print("Error: no valid bind hosts configured", file=sys.stderr)
+        sys.exit(1)
+    display_urls = ", ".join(
+        f"http://{h}:{settings.server.port}" for h in bind_hosts
+    )
+    print(f"Binding server at {display_urls}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -354,9 +359,7 @@ def serve_command(args):
             global_settings=settings,
         )
 
-        print(
-            f"Starting server at http://{display_hosts}:{settings.server.port}"
-        )
+        print(f"Starting server at {display_urls}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
@@ -399,7 +402,10 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve host/port: CLI args > env vars > settings.json > defaults
     settings = GlobalSettings.load()
-    host = args.host or settings.server.host
+    raw_host = args.host or settings.server.host
+    # settings.server.host may be comma-separated for multi-host binding;
+    # for client connections use only the first host.
+    host = raw_host.split(",")[0].strip() if raw_host else raw_host
     port = args.port or settings.server.port
 
     # 0.0.0.0 is a valid bind address but not a valid connect address.
