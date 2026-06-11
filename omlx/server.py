@@ -2746,6 +2746,19 @@ def _ds4_request_uses_suffix_alias(
     return parse_ds4_alias_id(stripped_model) is not None
 
 
+def _choose_sampling_value(
+    request_value, setting_name: str, default, model_settings
+):
+    """Resolve a sampling parameter: request > per-model setting > global default."""
+    if request_value is not None:
+        return request_value
+    if model_settings is not None:
+        model_value = getattr(model_settings, setting_name, None)
+        if model_value is not None:
+            return model_value
+    return default
+
+
 def _ds4_sampling_params_without_force(
     request: ChatCompletionRequest | CompletionRequest,
 ) -> dict:
@@ -2756,24 +2769,22 @@ def _ds4_sampling_params_without_force(
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
-    def choose(request_value, setting_name: str, default):
-        if request_value is not None:
-            return request_value
-        if model_settings is not None:
-            model_value = getattr(model_settings, setting_name, None)
-            if model_value is not None:
-                return model_value
-        return default
 
     return {
-        "temperature": choose(
-            request.temperature, "temperature", global_sampling.temperature
+        "temperature": _choose_sampling_value(
+            request.temperature, "temperature", global_sampling.temperature, model_settings
         ),
-        "top_p": choose(request.top_p, "top_p", global_sampling.top_p),
-        "top_k": choose(request.top_k, "top_k", global_sampling.top_k),
-        "min_p": choose(request.min_p, "min_p", 0.0),
-        "max_tokens": choose(
-            request.max_tokens, "max_tokens", global_sampling.max_tokens
+        "top_p": _choose_sampling_value(
+            request.top_p, "top_p", global_sampling.top_p, model_settings
+        ),
+        "top_k": _choose_sampling_value(
+            request.top_k, "top_k", global_sampling.top_k, model_settings
+        ),
+        "min_p": _choose_sampling_value(
+            request.min_p, "min_p", 0.0, model_settings
+        ),
+        "max_tokens": _choose_sampling_value(
+            request.max_tokens, "max_tokens", global_sampling.max_tokens, model_settings
         ),
     }
 
@@ -2921,26 +2932,20 @@ def _ds4_responses_sampling_params_without_force(
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
-    def choose(request_value, setting_name: str, default):
-        if request_value is not None:
-            return request_value
-        if model_settings is not None:
-            model_value = getattr(model_settings, setting_name, None)
-            if model_value is not None:
-                return model_value
-        return default
 
     params = {
-        "temperature": choose(
-            request.temperature, "temperature", global_sampling.temperature
+        "temperature": _choose_sampling_value(
+            request.temperature, "temperature", global_sampling.temperature, model_settings
         ),
-        "top_p": choose(request.top_p, "top_p", global_sampling.top_p),
+        "top_p": _choose_sampling_value(
+            request.top_p, "top_p", global_sampling.top_p, model_settings
+        ),
     }
     if request.max_output_tokens is not None:
         params["max_output_tokens"] = request.max_output_tokens
     else:
-        params["max_output_tokens"] = choose(
-            None, "max_tokens", global_sampling.max_tokens
+        params["max_output_tokens"] = _choose_sampling_value(
+            None, "max_tokens", global_sampling.max_tokens, model_settings
         )
     return params
 
@@ -2969,23 +2974,19 @@ def _ds4_anthropic_sampling_params_without_force(
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
 
-    def choose(request_value, setting_name: str, default):
-        if request_value is not None:
-            return request_value
-        if model_settings is not None:
-            model_value = getattr(model_settings, setting_name, None)
-            if model_value is not None:
-                return model_value
-        return default
 
     return {
-        "temperature": choose(
-            request.temperature, "temperature", global_sampling.temperature
+        "temperature": _choose_sampling_value(
+            request.temperature, "temperature", global_sampling.temperature, model_settings
         ),
-        "top_p": choose(request.top_p, "top_p", global_sampling.top_p),
-        "top_k": choose(request.top_k, "top_k", global_sampling.top_k),
-        "max_tokens": choose(
-            request.max_tokens, "max_tokens", global_sampling.max_tokens
+        "top_p": _choose_sampling_value(
+            request.top_p, "top_p", global_sampling.top_p, model_settings
+        ),
+        "top_k": _choose_sampling_value(
+            request.top_k, "top_k", global_sampling.top_k, model_settings
+        ),
+        "max_tokens": _choose_sampling_value(
+            request.max_tokens, "max_tokens", global_sampling.max_tokens, model_settings
         ),
     }
 

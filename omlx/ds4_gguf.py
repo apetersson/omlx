@@ -195,8 +195,8 @@ def read_ds4_gguf_metadata_summary(path: Path) -> GGUFMetadataSummary:
             raise GGUFMetadataError(
                 "not a GGUF file (missing magic bytes)"
             )
-        # Seek back so _read_exact can re-read for consistency.
-        f.seek(0)
+        # Magic already consumed; file pointer is now at position 4
+        # (start of version field).  Continue reading from here.
         _read_u32(f)  # version
         _read_u64(f)  # tensor count
         kv_count = _read_u64(f)
