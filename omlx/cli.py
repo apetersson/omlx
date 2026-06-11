@@ -246,16 +246,22 @@ def serve_command(args):
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
-    serve_sockets = [uvicorn_config.bind_socket()]
-    for host in bind_hosts[1:]:
-        extra_config = uvicorn.Config(
-            "omlx.server:app",
-            host=host,
-            port=settings.server.port,
-            log_level=uvicorn_level,
-            access_log=show_access_log,
-        )
-        serve_sockets.append(extra_config.bind_socket())
+    serve_sockets: list = []
+    try:
+        serve_sockets = [uvicorn_config.bind_socket()]
+        for host in bind_hosts[1:]:
+            extra_config = uvicorn.Config(
+                "omlx.server:app",
+                host=host,
+                port=settings.server.port,
+                log_level=uvicorn_level,
+                access_log=show_access_log,
+            )
+            serve_sockets.append(extra_config.bind_socket())
+    except Exception:
+        for sock in serve_sockets:
+            sock.close()
+        raise
 
     try:
         # Import server and config after the port is known to be available.
