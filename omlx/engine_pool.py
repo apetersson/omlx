@@ -1771,31 +1771,45 @@ class EnginePool:
             except Exception as e:
                 logger.error(f"Failed to preload pinned model {model_id}: {e}")
 
-    async def restart_crashed_pinned_ds4(self) -> list[str]:
-        """Restart pinned DS4 subprocesses that exited while loaded."""
-        async with self._lock:
-            return await self._restart_crashed_pinned_ds4_locked()
+    async def restart_crashed_pinned_ds4(self, backoff_s: float = 5.0) -> list[str]:
+        """Restart pinned DS4 subprocesses that exited while loaded.
 
-    async def _restart_crashed_pinned_ds4_locked(self) -> list[str]:
+        Snapshots crashed entries under the pool lock, then restarts each
+        one *outside* the lock so other pool operations are not blocked.
+        A configurable backoff delay is inserted before the first restart
+        to avoid rapid crash-restart loops.
+        """
+        # Snapshot candidates under the lock.
+        async with self._lock:
+            candidates: list[tuple[str, object, object]] = []
+            for model_id, entry in self._entries.items():
+                if (
+                    entry.engine_type != "ds4"
+                    or entry.engine is None
+                    or not entry.is_pinned
+                    or entry.is_loading
+                ):
+                    continue
+                has_crashed = getattr(entry.engine, "has_crashed", None)
+                if not callable(has_crashed) or not has_crashed():
+                    continue
+                restart = getattr(entry.engine, "restart_if_crashed", None)
+                if not callable(restart):
+                    continue
+                if entry.in_use > 0 or entry.engine.has_active_requests():
+                    entry.last_access = time.time()
+                    continue
+                candidates.append((model_id, entry, restart))
+
+        if not candidates:
+            return []
+
+        # Restart candidates outside the lock with backoff.
+        if backoff_s > 0:
+            await asyncio.sleep(backoff_s)
+
         restarted: list[str] = []
-        now = time.time()
-        for model_id, entry in self._entries.items():
-            if (
-                entry.engine_type != "ds4"
-                or entry.engine is None
-                or not entry.is_pinned
-                or entry.is_loading
-            ):
-                continue
-            has_crashed = getattr(entry.engine, "has_crashed", None)
-            if not callable(has_crashed) or not has_crashed():
-                continue
-            if entry.in_use > 0 or entry.engine.has_active_requests():
-                entry.last_access = now
-                continue
-            restart = getattr(entry.engine, "restart_if_crashed", None)
-            if not callable(restart):
-                continue
+        for model_id, entry, restart in candidates:
             try:
                 logger.warning("Restarting crashed pinned DS4 model: %s", model_id)
                 did_restart = await restart()
@@ -1804,7 +1818,7 @@ class EnginePool:
                 continue
             if not did_restart:
                 continue
-            entry.last_access = now
+            entry.last_access = time.time()
             get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
             if callable(get_rss):
                 entry.actual_size = get_rss() or entry.actual_size
@@ -1904,8 +1918,11 @@ class EnginePool:
         now = time.time()
         expired: list[str] = []
 
+        # Restart crashed pinned DS4 processes *before* acquiring the
+        # TTL lock so crash recovery does not block normal TTL eviction.
+        await self.restart_crashed_pinned_ds4(backoff_s=5.0)
+
         async with self._lock:
-            await self._restart_crashed_pinned_ds4_locked()
             for model_id, entry in self._entries.items():
                 if entry.engine is None or entry.is_loading or entry.is_pinned:
                     continue
