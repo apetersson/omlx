@@ -210,6 +210,7 @@ class GlobalSettingsRequest(BaseModel):
     server_aliases: list[str] | None = None
     sse_keepalive_mode: str | None = None
     auto_start_on_launch: bool | None = None
+    burst_decode_mode: str | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -3350,6 +3351,22 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.burst_decode_mode is not None:
+        valid_modes_bd = {"off", "light", "balanced", "aggressive"}
+        if request.burst_decode_mode not in valid_modes_bd:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid burst_decode_mode: {request.burst_decode_mode} "
+                f"(must be one of {sorted(valid_modes_bd)})",
+            )
+        global_settings.server.burst_decode_mode = request.burst_decode_mode
+        # Seed OMLX_DECODE_BURST_* env vars so engines loaded later pick up
+        # the new mode without a server restart.
+        from ..settings import burst_decode_env
+        import os
+        for key, val in burst_decode_env(request.burst_decode_mode).items():
+            os.environ[key] = val
+        runtime_applied.append("burst_decode_mode")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias

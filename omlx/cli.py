@@ -81,7 +81,7 @@ def serve_command(args):
     from ._version import __version__
     from . import process_title
     from .logging_config import AdminStatsAccessFilter, configure_file_logging
-    from .settings import init_settings
+    from .settings import init_settings, burst_decode_env
 
     process_title.set_process_title()
 
@@ -186,6 +186,10 @@ def serve_command(args):
     if settings.network.ca_bundle:
         os.environ["REQUESTS_CA_BUNDLE"] = settings.network.ca_bundle
         os.environ["SSL_CERT_FILE"] = settings.network.ca_bundle
+    # Apply Burst Decode mode — seeds OMLX_DECODE_BURST_* env vars before
+    # engine_core.EngineConfig reads them at construction time.
+    burst_vars = burst_decode_env(settings.server.burst_decode_mode)
+    os.environ.update(burst_vars)
 
     # Validate before persisting CLI overrides, so invalid flags never poison
     # settings.json.
