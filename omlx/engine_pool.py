@@ -1074,6 +1074,7 @@ class EnginePool:
             entry.model_id,
         )
         await self._unload_engine(other_id)
+        entry.is_loading = False
         return True
 
     @staticmethod
