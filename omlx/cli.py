@@ -223,6 +223,7 @@ def serve_command(args):
     # Bind the socket before importing/initializing the server. Uvicorn's
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
+    bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
     print(f"Binding server at http://{settings.server.host}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
@@ -232,12 +233,21 @@ def serve_command(args):
     show_access_log = settings.server.log_level == "trace"
     uvicorn_config = uvicorn.Config(
         "omlx.server:app",
-        host=settings.server.host,
+        host=bind_hosts[0],
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
-    serve_socket = uvicorn_config.bind_socket()
+    serve_sockets = [uvicorn_config.bind_socket()]
+    for h in bind_hosts[1:]:
+        extra_config = uvicorn.Config(
+            "omlx.server:app",
+            host=h,
+            port=settings.server.port,
+            log_level=uvicorn_level,
+            access_log=show_access_log,
+        )
+        serve_sockets.append(extra_config.bind_socket())
 
     try:
         # Import server and config after the port is known to be available.
@@ -345,13 +355,14 @@ def serve_command(args):
             f"Starting server at http://{settings.server.host}:{settings.server.port}"
         )
         try:
-            uvicorn.Server(uvicorn_config).run(sockets=[serve_socket])
+            uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
             pass
     finally:
         # Uvicorn closes sockets during normal shutdown; this covers failures
         # after bind succeeds but before the server takes ownership.
-        serve_socket.close()
+        for sock in serve_sockets:
+            sock.close()
 
 
 def launch_command(args, extra_args: list[str] | None = None):
