@@ -142,6 +142,7 @@ class EnginePool:
             or DEFAULT_BASE_PATH
         )
         self._ds4_settings: DS4Settings | None = ds4_settings
+        self._ds4_consecutive_restart_failures: dict[str, int] = {}
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
@@ -779,6 +780,14 @@ class EnginePool:
                 entry
             )
 
+            # If the engine was loaded by a concurrent get_engine() while we
+            # released the lock during the DS4 idle-wait, return it directly.
+            if entry.engine is not None:
+                entry.last_access = time.time()
+                if _lease:
+                    entry.in_use += 1
+                return entry.engine
+
             # Pre-load admission against the memory ceiling from the
             # process memory enforcer (min of static and dynamic). Try
             # evicting LRU non-pinned models first; if the model still
@@ -1021,7 +1030,10 @@ class EnginePool:
         """Unload an idle DS4 conflict before loading another DS4 model.
 
         The idle-wait in _wait_for_ds4_conflict_idle releases the pool lock
-        so other operations are not blocked during the poll loop.
+        so other operations are not blocked during the poll loop.  To prevent
+        a TOCTOU race where two concurrent get_engine() calls for the same
+        model both pass the entry.engine-is-None guard, we mark the entry as
+        loading *before* releasing the lock.
         """
         if entry.engine_type != "ds4":
             return False
@@ -1039,9 +1051,14 @@ class EnginePool:
                     f"DS4 model '{other_id}' is loaded"
                 ),
             )
+        # Mark loading *before* releasing the lock in the idle-wait to
+        # prevent a concurrent get_engine() for the same model from also
+        # entering _load_engine() and double-loading.
+        entry.is_loading = True
         if not await self._wait_for_ds4_conflict_idle(
             other, next_model_id=entry.model_id
         ):
+            entry.is_loading = False
             raise ModelLoadingError(
                 entry.model_id,
                 message=(
@@ -1792,7 +1809,9 @@ class EnginePool:
         Snapshots crashed entries under the pool lock, then restarts each
         one *outside* the lock so other pool operations are not blocked.
         A configurable backoff delay is inserted before the first restart
-        to avoid rapid crash-restart loops.
+        to avoid rapid crash-restart loops.  After 3 consecutive failed
+        restart attempts the model is skipped until it recovers naturally
+        (e.g. via an explicit unload / reload).
         """
         # Snapshot candidates under the lock.
         async with self._lock:
@@ -1823,16 +1842,23 @@ class EnginePool:
         if backoff_s > 0:
             await asyncio.sleep(backoff_s)
 
+        max_consecutive = 3
         restarted: list[str] = []
         for model_id, entry, restart in candidates:
+            fail_count = self._ds4_consecutive_restart_failures.get(model_id, 0)
+            if fail_count >= max_consecutive:
+                continue
             try:
                 logger.warning("Restarting crashed pinned DS4 model: %s", model_id)
                 did_restart = await restart()
             except Exception as e:  # noqa: BLE001 - keep health loop alive
                 logger.error("Failed to restart pinned DS4 model %s: %s", model_id, e)
+                self._ds4_consecutive_restart_failures[model_id] = fail_count + 1
                 continue
             if not did_restart:
+                self._ds4_consecutive_restart_failures[model_id] = fail_count + 1
                 continue
+            self._ds4_consecutive_restart_failures.pop(model_id, None)
             entry.last_access = time.time()
             get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
             if callable(get_rss):
