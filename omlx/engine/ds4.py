@@ -277,7 +277,12 @@ class DS4ProcessEngine(BaseEngine):
         return self.context_tokens or self.settings.get_auto_context_tokens()
 
     async def ensure_min_context(self, min_tokens: int) -> bool:
-        """Temporarily raise DS4 context for this loaded engine if needed."""
+        """Raise DS4 context for this loaded engine if needed.
+
+        The new context persists while the engine stays loaded; it is not
+        automatically lowered after the triggering request completes.
+        Use :meth:`restart_with_context` to explicitly reset the context.
+        """
         async with self._lifecycle_lock:
             if self.effective_context_tokens() >= min_tokens:
                 return False
