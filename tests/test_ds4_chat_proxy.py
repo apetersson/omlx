@@ -146,7 +146,7 @@ class _FakeRequestsSession:
         self.trust_env_at_post: bool | None = None
         _FakeRequestsSession.instances.append(self)
 
-    def post(self, url, *, json, stream, headers):
+    def post(self, url, *, json, stream, headers, timeout=None):
         self.trust_env_at_post = self.trust_env
         self.calls.append({"url": url, "json": json, "stream": stream, "headers": headers})
         if self.post_started is not None:
