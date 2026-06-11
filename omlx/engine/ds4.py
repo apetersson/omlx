@@ -282,10 +282,18 @@ class DS4ProcessEngine(BaseEngine):
         cannot observe a half-stopped backend.
         """
         async with self._lifecycle_lock:
-            process = self.process
-            if process is not None:
-                await process.stop()
-            self.process = None
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
+        """Stop the subprocess without acquiring _lifecycle_lock.
+
+        Callers that already hold _lifecycle_lock (e.g. ensure_min_context,
+        restart_with_context) must use this instead of stop().
+        """
+        process = self.process
+        if process is not None:
+            await process.stop()
+        self.process = None
 
     def effective_context_tokens(self) -> int:
         """Return the context token count DS4 will launch with."""
@@ -308,7 +316,7 @@ class DS4ProcessEngine(BaseEngine):
                 )
             was_running = self.is_running
             if was_running:
-                await self.stop()
+                await self._stop_locked()
             self.context_tokens = min_tokens
             if was_running:
                 await self.start()
@@ -327,7 +335,7 @@ class DS4ProcessEngine(BaseEngine):
             old_context_tokens = self.context_tokens
             was_loaded = self.process is not None
             if was_loaded:
-                await self.stop()
+                await self._stop_locked()
                 if self.has_active_requests():
                     self.context_tokens = old_context_tokens
                     await self.start()
@@ -339,7 +347,7 @@ class DS4ProcessEngine(BaseEngine):
             if was_loaded:
                 await self.start()
                 if self.has_active_requests():
-                    await self.stop()
+                    await self._stop_locked()
                     self.context_tokens = old_context_tokens
                     await self.start()
                     raise DS4ProxyError(
