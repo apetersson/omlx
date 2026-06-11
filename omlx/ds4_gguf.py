@@ -28,6 +28,12 @@ DS4_SUPPORTED_GGUF_ARCHITECTURES = {"deepseek4"}
 _DS4_ID_SEPARATORS_RE = re.compile(r"[^a-z0-9.]+")
 _DS4_ID_DASHES_RE = re.compile(r"-+")
 _GGUF_MAGIC = b"GGUF"
+
+# Maximum allowed string length for a single GGUF metadata key or value (1 MiB).
+# Real-world GGUF metadata strings (architecture names, tokenizer paths, etc.)
+# are well under 1 KiB; 1 MiB provides ample headroom while blocking OOM from
+# corrupted headers that claim multi-GB strings.
+_GGUF_MAX_STRING_LENGTH = 1 * 1024 * 1024
 _GGUF_TYPE_UINT8 = 0
 _GGUF_TYPE_INT8 = 1
 _GGUF_TYPE_UINT16 = 2
@@ -89,6 +95,15 @@ def _read_exact(f, size: int) -> bytes:
     return data
 
 
+def _file_remaining(f) -> int:
+    """Return the number of bytes remaining in the file from the current position."""
+    pos = f.tell()
+    f.seek(0, 2)
+    end = f.tell()
+    f.seek(pos)
+    return end - pos
+
+
 def _read_u32(f) -> int:
     return struct.unpack("<I", _read_exact(f, 4))[0]
 
@@ -99,9 +114,20 @@ def _read_u64(f) -> int:
 
 def _read_gguf_string(f, remaining: int | None = None) -> str:
     length = _read_u64(f)
-    if remaining is not None and length > remaining:
+    # Bound string length against remaining file size to prevent OOM
+    # from a corrupted header claiming a multi-GB string length.
+    if remaining is None:
+        remaining = _file_remaining(f)
+    if length > remaining:
         raise GGUFMetadataError(
-            f"GGUF string length {length} exceeds remaining file size {remaining}"
+            f"GGUF string length ({length}) exceeds remaining file size ({remaining})"
+        )
+    # Also reject unreasonably large strings even if theoretically within
+    # file bounds — a single metadata key/value should never need more than
+    # a few MB.
+    if length > _GGUF_MAX_STRING_LENGTH:
+        raise GGUFMetadataError(
+            f"GGUF string length ({length}) exceeds maximum ({_GGUF_MAX_STRING_LENGTH})"
         )
     return _read_exact(f, length).decode("utf-8", "replace")
 
@@ -158,8 +184,19 @@ def _skip_gguf_value(f, value_type: int, file_size: int) -> None:
 def read_ds4_gguf_metadata_summary(path: Path) -> GGUFMetadataSummary:
     """Read just enough GGUF metadata to decide if DS4 can expose a file."""
     with path.open("rb") as f:
-        if _read_exact(f, 4) != _GGUF_MAGIC:
-            raise GGUFMetadataError("missing GGUF magic")
+        # Check for minimum GGUF header size before attempting to read magic.
+        # A file with fewer than 4 bytes is not a valid GGUF file.
+        initial = f.read(4)
+        if len(initial) < 4:
+            raise GGUFMetadataError(
+                f"file too short to be a GGUF file ({len(initial)} bytes)"
+            )
+        if initial != _GGUF_MAGIC:
+            raise GGUFMetadataError(
+                "not a GGUF file (missing magic bytes)"
+            )
+        # Seek back so _read_exact can re-read for consistency.
+        f.seek(0)
         _read_u32(f)  # version
         _read_u64(f)  # tensor count
         kv_count = _read_u64(f)
