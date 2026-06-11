@@ -183,6 +183,7 @@ def _skip_gguf_value(f, value_type: int, file_size: int) -> None:
 
 def read_ds4_gguf_metadata_summary(path: Path) -> GGUFMetadataSummary:
     """Read just enough GGUF metadata to decide if DS4 can expose a file."""
+    path = Path(path)
     with path.open("rb") as f:
         # Check for minimum GGUF header size before attempting to read magic.
         # A file with fewer than 4 bytes is not a valid GGUF file.
