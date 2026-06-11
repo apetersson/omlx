@@ -264,6 +264,7 @@ class DS4ManagedProcess:
         self.log_path: Path | None = None
         self.last_kv_prune_result: DS4KVPruneResult | None = None
         self._log_tasks: list[asyncio.Task[None]] = []
+        self._log_file_handle: "TextIOWrapper | None" = None
         self._instance_id: str = _next_ds4_instance_id()
 
     @property
@@ -365,6 +366,14 @@ class DS4ManagedProcess:
     def _start_log_capture(self) -> None:
         if self.process is None:
             return
+        # Open a persistent log file handle so per-line writes do not
+        # open/close the file on every event-loop tick.
+        if self.log_path is not None:
+            try:
+                self._log_file_handle = self.log_path.open("a", encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Cannot open DS4 log %s: %s", self.log_path, exc)
+                self._log_file_handle = None
         if self.process.stdout is not None:
             self._log_tasks.append(
                 asyncio.create_task(self._capture_stream("stdout", self.process.stdout))
@@ -379,6 +388,13 @@ class DS4ManagedProcess:
             return
         await asyncio.gather(*self._log_tasks, return_exceptions=True)
         self._log_tasks.clear()
+        if self._log_file_handle is not None:
+            try:
+                self._log_file_handle.close()
+            except OSError:
+                pass
+            finally:
+                self._log_file_handle = None
 
     def _append_log_file_header(self) -> None:
         if self.log_path is None:
@@ -398,8 +414,14 @@ class DS4ManagedProcess:
             return
         timestamp = datetime.now(UTC).isoformat()
         try:
-            with self.log_path.open("a", encoding="utf-8") as handle:
+            handle = self._log_file_handle
+            if handle is not None:
                 handle.write(f"{timestamp} {line.stream}: {line.text}\n")
+                handle.flush()
+            else:
+                # Fallback: open/close if the persistent handle was unavailable.
+                with self.log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"{timestamp} {line.stream}: {line.text}\n")
         except OSError as exc:
             logger.warning("Failed to write DS4 log line to %s: %s", self.log_path, exc)
 
