@@ -55,7 +55,7 @@ _DS4_AUTO_ADMISSION_SETTLE_INTERVAL_SECONDS = 0.5
 # DS4 itself is a single-process backend. When a frontend switches models it
 # often cancels the old stream and immediately sends the new request; keep the
 # new request queued here until the old stream is officially inactive.
-_DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS = 300.0
+_DS4_SINGLETON_SWITCH_IDLE_WAIT_SECONDS = 10.0
 _DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS = 0.1
 
 
@@ -974,7 +974,12 @@ class EnginePool:
     async def _wait_for_ds4_conflict_idle(
         self, entry: EngineEntry, *, next_model_id: str
     ) -> bool:
-        """Wait for a just-cancelled DS4 stream to close before switching."""
+        """Wait for a just-cancelled DS4 stream to close before switching.
+
+        Releases the pool lock during the idle-poll loop so other pool
+        operations (serving requests from already-loaded models, loading
+        non-DS4 models) are not blocked for the full wait duration.
+        """
         if not self._ds4_entry_is_busy(entry):
             return True
 
@@ -986,28 +991,38 @@ class EnginePool:
             next_model_id,
             entry.model_id,
         )
-        while time.monotonic() < deadline:
-            await asyncio.sleep(_DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS)
-            if not self._ds4_entry_is_busy(entry):
-                logger.info(
-                    "DS4 model '%s' became idle after %.1fs; continuing "
-                    "switch to '%s'",
-                    entry.model_id,
-                    time.monotonic() - started,
-                    next_model_id,
-                )
-                return True
-        logger.info(
-            "Timed out after %.1fs waiting for DS4 model '%s' to become "
-            "idle before switching to '%s'",
-            time.monotonic() - started,
-            entry.model_id,
-            next_model_id,
-        )
-        return False
+        # Release the pool lock that the caller holds so other operations
+        # can proceed during the idle wait.
+        self._lock.release()
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(_DS4_SINGLETON_SWITCH_IDLE_POLL_SECONDS)
+                if not self._ds4_entry_is_busy(entry):
+                    logger.info(
+                        "DS4 model '%s' became idle after %.1fs; continuing "
+                        "switch to '%s'",
+                        entry.model_id,
+                        time.monotonic() - started,
+                        next_model_id,
+                    )
+                    return True
+            logger.info(
+                "Timed out after %.1fs waiting for DS4 model '%s' to become "
+                "idle before switching to '%s'",
+                time.monotonic() - started,
+                entry.model_id,
+                next_model_id,
+            )
+            return False
+        finally:
+            await self._lock.acquire()
 
     async def _prepare_ds4_singleton_for_load(self, entry: EngineEntry) -> bool:
-        """Unload an idle DS4 conflict before loading another DS4 model."""
+        """Unload an idle DS4 conflict before loading another DS4 model.
+
+        The idle-wait in _wait_for_ds4_conflict_idle releases the pool lock
+        so other operations are not blocked during the poll loop.
+        """
         if entry.engine_type != "ds4":
             return False
 
