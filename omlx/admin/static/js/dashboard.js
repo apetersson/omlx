@@ -10,6 +10,19 @@
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy']);
 
+    /**
+     * Format a FastAPI error detail response into a human-readable message.
+     * Handles both string details and structured (list-of-object) details.
+     */
+    function formatErrorDetail(data, fallback) {
+        if (Array.isArray(data.detail)) {
+            return data.detail
+                .map(function (e) { return (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e); })
+                .join(', ');
+        }
+        return data.detail || fallback;
+    }
+
     function dashboard() {
         return {
             // Theme
@@ -864,7 +877,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = formatErrorDetail(data, window.t('js.error.save_settings_failed'));
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -3867,7 +3880,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || 'Failed to save'));
+                        alert(formatErrorDetail(data, 'Failed to save'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
