@@ -26,6 +26,13 @@ from ..settings import DEFAULT_BASE_PATH, DS4Settings
 from .base import BaseEngine, GenerationOutput
 
 
+# DS4 backend HTTP timeouts (seconds).  The connect timeout is generous
+# enough for a cold-start fork on a loaded machine; the read timeout
+# must accommodate long streaming responses (e.g. max-token generations
+# on slow hardware).
+_DS4_CONNECT_TIMEOUT = 10.0
+_DS4_READ_TIMEOUT = 600.0
+
 class DS4ProxyError(RuntimeError):
     """Raised when OMLX cannot contact the managed DS4 backend."""
 
@@ -425,6 +432,7 @@ class DS4ProcessEngine(BaseEngine):
                 self._backend_url(path),
                 json=body,
                 stream=stream,
+                timeout=(_DS4_CONNECT_TIMEOUT, _DS4_READ_TIMEOUT),
                 headers={
                     "Content-Type": "application/json",
                     "Accept-Encoding": "identity",
