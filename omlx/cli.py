@@ -223,8 +223,16 @@ def serve_command(args):
     # Bind the socket before importing/initializing the server. Uvicorn's
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
-    bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
-    print(f"Binding server at http://{settings.server.host}:{settings.server.port}")
+    bind_hosts = [
+        h.strip() for h in settings.server.host.split(",") if h.strip()
+    ]
+    if not bind_hosts:
+        print("Error: no valid bind hosts configured", file=sys.stderr)
+        sys.exit(1)
+    display_urls = ", ".join(
+        f"http://{h}:{settings.server.port}" for h in bind_hosts
+    )
+    print(f"Binding server at {display_urls}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -238,16 +246,22 @@ def serve_command(args):
         log_level=uvicorn_level,
         access_log=show_access_log,
     )
-    serve_sockets = [uvicorn_config.bind_socket()]
-    for h in bind_hosts[1:]:
-        extra_config = uvicorn.Config(
-            "omlx.server:app",
-            host=h,
-            port=settings.server.port,
-            log_level=uvicorn_level,
-            access_log=show_access_log,
-        )
-        serve_sockets.append(extra_config.bind_socket())
+    serve_sockets: list = []
+    try:
+        serve_sockets = [uvicorn_config.bind_socket()]
+        for host in bind_hosts[1:]:
+            extra_config = uvicorn.Config(
+                "omlx.server:app",
+                host=host,
+                port=settings.server.port,
+                log_level=uvicorn_level,
+                access_log=show_access_log,
+            )
+            serve_sockets.append(extra_config.bind_socket())
+    except Exception:
+        for sock in serve_sockets:
+            sock.close()
+        raise
 
     try:
         # Import server and config after the port is known to be available.
@@ -351,9 +365,7 @@ def serve_command(args):
             global_settings=settings,
         )
 
-        print(
-            f"Starting server at http://{settings.server.host}:{settings.server.port}"
-        )
+        print(f"Starting server at {display_urls}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
@@ -396,7 +408,10 @@ def launch_command(args, extra_args: list[str] | None = None):
 
     # Resolve host/port: CLI args > env vars > settings.json > defaults
     settings = GlobalSettings.load()
-    host = args.host or settings.server.host
+    raw_host = args.host or settings.server.host
+    # settings.server.host may be comma-separated for multi-host binding;
+    # for client connections use only the first host.
+    host = raw_host.split(",")[0].strip() if raw_host else raw_host
     port = args.port or settings.server.port
 
     # 0.0.0.0 is a valid bind address but not a valid connect address.
