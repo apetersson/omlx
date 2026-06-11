@@ -261,11 +261,16 @@ class DS4ProcessEngine(BaseEngine):
             raise
 
     async def stop(self) -> None:
-        """Stop the managed DS4 subprocess."""
-        process = self.process
-        if process is not None:
-            await process.stop()
-        self.process = None
+        """Stop the managed DS4 subprocess.
+
+        Serialised with the lifecycle lock so that a concurrent request
+        cannot observe a half-stopped backend.
+        """
+        async with self._lifecycle_lock:
+            process = self.process
+            if process is not None:
+                await process.stop()
+            self.process = None
 
     def effective_context_tokens(self) -> int:
         """Return the context token count DS4 will launch with."""
