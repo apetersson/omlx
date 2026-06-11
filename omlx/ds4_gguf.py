@@ -97,8 +97,12 @@ def _read_u64(f) -> int:
     return struct.unpack("<Q", _read_exact(f, 8))[0]
 
 
-def _read_gguf_string(f) -> str:
+def _read_gguf_string(f, remaining: int | None = None) -> str:
     length = _read_u64(f)
+    if remaining is not None and length > remaining:
+        raise GGUFMetadataError(
+            f"GGUF string length {length} exceeds remaining file size {remaining}"
+        )
     return _read_exact(f, length).decode("utf-8", "replace")
 
 
@@ -112,9 +116,13 @@ def _read_gguf_scalar(f, value_type: int):
     return struct.unpack("<" + fmt, _read_exact(f, size))[0]
 
 
-def _skip_gguf_scalar(f, value_type: int) -> None:
+def _skip_gguf_scalar(f, value_type: int, file_size: int) -> None:
     if value_type == _GGUF_TYPE_STRING:
         length = _read_u64(f)
+        if length > file_size:
+            raise GGUFMetadataError(
+                f"GGUF string length {length} exceeds file size {file_size}"
+            )
         f.seek(length, 1)
         return
     fmt = _GGUF_SCALAR_FORMATS.get(value_type)
@@ -123,18 +131,28 @@ def _skip_gguf_scalar(f, value_type: int) -> None:
     f.seek(struct.calcsize("<" + fmt), 1)
 
 
-def _skip_gguf_value(f, value_type: int) -> None:
+def _skip_gguf_value(f, value_type: int, file_size: int) -> None:
     if value_type == _GGUF_TYPE_ARRAY:
         item_type = _read_u32(f)
         item_count = _read_u64(f)
+        if item_count > file_size:
+            raise GGUFMetadataError(
+                f"GGUF array item count {item_count} exceeds file size {file_size}"
+            )
         fmt = _GGUF_SCALAR_FORMATS.get(item_type)
         if fmt is not None:
-            f.seek(struct.calcsize("<" + fmt) * item_count, 1)
+            item_size = struct.calcsize("<" + fmt)
+            if item_count * item_size > file_size:
+                raise GGUFMetadataError(
+                    f"GGUF array byte length {item_count * item_size} "
+                    f"exceeds file size {file_size}"
+                )
+            f.seek(item_size * item_count, 1)
             return
         for _ in range(item_count):
-            _skip_gguf_scalar(f, item_type)
+            _skip_gguf_scalar(f, item_type, file_size)
         return
-    _skip_gguf_scalar(f, value_type)
+    _skip_gguf_scalar(f, value_type, file_size)
 
 
 def read_ds4_gguf_metadata_summary(path: Path) -> GGUFMetadataSummary:
@@ -146,11 +164,21 @@ def read_ds4_gguf_metadata_summary(path: Path) -> GGUFMetadataSummary:
         _read_u64(f)  # tensor count
         kv_count = _read_u64(f)
 
+        # Bound kv_count to avoid DoS via absurd metadata sizes.
+        if kv_count > 65536:
+            raise GGUFMetadataError(
+                f"GGUF metadata key-value count {kv_count} is implausibly large"
+            )
+
         architecture: str | None = None
         split_no: int | None = None
         split_count: int | None = None
+        file_size = path.stat().st_size
         for _ in range(kv_count):
-            key = _read_gguf_string(f)
+            remaining = file_size - f.tell()
+            if remaining <= 0:
+                raise GGUFMetadataError("GGUF metadata truncated (unexpected EOF)")
+            key = _read_gguf_string(f, remaining=remaining)
             value_type = _read_u32(f)
             if key == "general.architecture" and value_type == _GGUF_TYPE_STRING:
                 architecture = str(_read_gguf_scalar(f, value_type))
@@ -159,7 +187,7 @@ def read_ds4_gguf_metadata_summary(path: Path) -> GGUFMetadataSummary:
             elif key == "split.count" and value_type in _GGUF_SCALAR_FORMATS:
                 split_count = int(_read_gguf_scalar(f, value_type))
             else:
-                _skip_gguf_value(f, value_type)
+                _skip_gguf_value(f, value_type, file_size)
 
     return GGUFMetadataSummary(
         architecture=architecture,
@@ -172,13 +200,21 @@ def is_supported_ds4_gguf(path: Path) -> bool:
     """Return True when a GGUF is a DS4-supported primary DeepSeek V4 file."""
     try:
         metadata = read_ds4_gguf_metadata_summary(path)
+    except GGUFMetadataError as e:
+        # no-magic: not a real GGUF — keep extension-based compatibility
+        # for hand-made test stubs.
+        if "magic" in str(e).lower() or "missing" in str(e).lower():
+            logger.debug("Not a GGUF file (no magic), treating %s as supported "
+                         "by extension for stub compatibility", path)
+            return True
+        # bad-header: GGUF magic present but metadata is corrupt or
+        # unsupported — reject explicitly.
+        logger.info("Corrupt GGUF header in %s: %s", path, e)
+        return False
     except Exception as e:
-        # Several existing tests and some hand-made local stubs use a .gguf
-        # extension without a real GGUF header.  Keep extension-based discovery
-        # as a compatibility fallback when metadata cannot be inspected; real
-        # GGUFs with explicit unsupported metadata are rejected below.
-        logger.debug("Could not inspect GGUF metadata for %s: %s", path, e)
-        return True
+        # Unexpected I/O errors: treat as unsupported.
+        logger.info("Could not inspect GGUF metadata for %s: %s", path, e)
+        return False
 
     if metadata.split_no is not None and metadata.split_no > 0:
         logger.info(
