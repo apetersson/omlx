@@ -417,7 +417,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     # 0.0.0.0 is a valid bind address but not a valid connect address.
     # Fall back to localhost so launch can reach the server regardless
     # of which interface it was bound to.
-    connect_host = host if host and host != "0.0.0.0" else "127.0.0.1"
+    connect_host = host if host and host not in ("0.0.0.0", "::") else "127.0.0.1"
 
     # Check if oMLX server is running
     base_url = f"http://{connect_host}:{port}"
