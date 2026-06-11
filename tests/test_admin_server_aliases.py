@@ -869,3 +869,74 @@ class TestUpdateGlobalSettingsHostValidation:
 
         assert gs.server.host == "127.0.0.1"
         gs.save.assert_not_called()
+
+
+class TestUpdateGlobalSettingsBurstDecode:
+    """update_global_settings: save and hot-apply burst_decode_mode."""
+
+    def test_accepts_valid_mode_balanced(self):
+        gs = _make_global_settings()
+        gs.server.burst_decode_mode = "off"
+        request = GlobalSettingsRequest(burst_decode_mode="balanced")
+
+        with _patched_global_settings(gs):
+            result = asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert result["success"] is True
+        assert "burst_decode_mode" in result["runtime_applied"]
+        assert gs.server.burst_decode_mode == "balanced"
+        gs.save.assert_called_once()
+
+    def test_accepts_off_mode(self):
+        gs = _make_global_settings()
+        gs.server.burst_decode_mode = "balanced"
+        request = GlobalSettingsRequest(burst_decode_mode="off")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.burst_decode_mode == "off"
+
+    def test_accepts_aggressive_mode(self):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(burst_decode_mode="aggressive")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert gs.server.burst_decode_mode == "aggressive"
+
+    def test_rejects_invalid_mode_with_400(self):
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(burst_decode_mode="invalid")
+
+        with _patched_global_settings(gs):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    admin_routes.update_global_settings(request=request, is_admin=True)
+                )
+
+        assert exc_info.value.status_code == 400
+        assert "invalid" in exc_info.value.detail
+        gs.save.assert_not_called()
+
+    def test_sets_env_vars_on_apply(self):
+        """burst_decode_mode should seed OMLX_DECODE_BURST_* env vars."""
+        import os
+
+        gs = _make_global_settings()
+        request = GlobalSettingsRequest(burst_decode_mode="aggressive")
+
+        with _patched_global_settings(gs):
+            asyncio.run(
+                admin_routes.update_global_settings(request=request, is_admin=True)
+            )
+
+        assert os.environ.get("OMLX_DECODE_BURST_MAX_STEPS") == "64"
+        assert os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S") == "0.2"

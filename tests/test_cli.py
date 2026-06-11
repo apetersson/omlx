@@ -6,6 +6,7 @@ Tests CLI argument parsing, command setup, and help text.
 Note: Configuration validation tests are in test_config.py.
 """
 
+import os
 import argparse
 import socket
 import subprocess
@@ -1099,6 +1100,55 @@ class TestServeCommandFunctions:
             serve_command(args)
 
         assert len(closed_sockets) >= 1, "first socket should have been closed"
+
+    def test_serve_seeds_burst_decode_env_vars_before_engine_import(
+        self, tmp_path, monkeypatch
+    ):
+        """burst_decode_mode must seed OMLX_DECODE_BURST_* env vars before engines load."""
+        import uvicorn
+
+        from omlx.cli import serve_command
+        from omlx.settings import burst_decode_env
+
+        settings = self._make_settings(tmp_path, host="127.0.0.1", port=0)
+        settings.server.burst_decode_mode = "aggressive"
+        args = self._make_serve_args(tmp_path, host="127.0.0.1", port=0)
+
+        fake_server = ModuleType("omlx.server")
+        fake_server.app = ModuleType("app")
+        fake_server.init_server = MagicMock()
+        monkeypatch.setitem(sys.modules, "omlx.server", fake_server)
+
+        fake_mlx = ModuleType("mlx")
+        fake_mlx_core = ModuleType("mlx.core")
+        fake_mlx_core.device_info = lambda: {"memory_size": 0}
+        fake_mlx_core.set_cache_limit = MagicMock()
+        fake_mlx.core = fake_mlx_core
+        monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
+        monkeypatch.setitem(sys.modules, "mlx.core", fake_mlx_core)
+
+        monkeypatch.setattr("omlx.settings.init_settings", lambda **kwargs: settings)
+        monkeypatch.setattr(
+            "omlx.logging_config.configure_file_logging", lambda **kwargs: None
+        )
+        monkeypatch.setattr("faulthandler.enable", lambda *args, **kwargs: None)
+        monkeypatch.setattr("uvicorn.Config.bind_socket", MagicMock())
+        monkeypatch.setattr("uvicorn.Server.run", MagicMock())
+
+        # Clear env vars before the call so we can detect the seeding
+        for key in ("OMLX_DECODE_BURST_MAX_STEPS", "OMLX_DECODE_BURST_BUDGET_SINGLE_S"):
+            os.environ.pop(key, None)
+
+        serve_command(args)
+
+        expected = burst_decode_env("aggressive")
+        assert os.environ.get("OMLX_DECODE_BURST_MAX_STEPS") == expected[
+            "OMLX_DECODE_BURST_MAX_STEPS"
+        ]
+        assert os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S") == expected[
+            "OMLX_DECODE_BURST_BUDGET_SINGLE_S"
+        ]
+
 
 
 class TestHasCliOverrides:

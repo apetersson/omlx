@@ -3389,7 +3389,6 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
-
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
 
@@ -4519,7 +4518,12 @@ def _build_active_models_data() -> dict:
         if server_state is not None
         else None
     )
-    enforcer_status = enforcer.get_status() if enforcer is not None else None
+    enforcer_status = None
+    if enforcer is not None:
+        try:
+            enforcer_status = enforcer.get_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Memory enforcer status unavailable: %s", exc)
     models = []
     total_active = 0
     total_waiting = 0
@@ -4538,6 +4542,8 @@ def _build_active_models_data() -> dict:
 
         # Get per-model active/waiting request counts.
         # Follow the same pattern as server.py /api/status endpoint.
+        has_scheduler_snapshot = False
+        collector_request_ids: set = set()
         active_request_ids: set = set()
         entry = engine_pool._entries.get(model_id)
         if entry and entry.engine is not None:
@@ -4547,18 +4553,17 @@ def _build_active_models_data() -> dict:
                 if core is not None:
                     collectors = getattr(core, "_output_collectors", {})
                     try:
-                        active_request_ids = set(collectors.keys())
-                        active_requests = len(collectors)
+                        collector_request_ids = set(collectors.keys())
                     except RuntimeError:
                         # Scheduler state is mutated from the engine executor;
                         # keep the dashboard endpoint best-effort rather than
                         # failing on a concurrent dict resize.
-                        active_request_ids = set()
-                        active_requests = len(collectors)
+                        collector_request_ids = set()
 
                     sched = getattr(core, "scheduler", None)
                     if sched is not None and hasattr(sched, "snapshot_for_admin"):
                         snap = sched.snapshot_for_admin()
+                        has_scheduler_snapshot = True
                         running_by_id = snap["running_by_id"]
                         waiting_queue = snap["waiting"]
                         waiting_requests = len(waiting_queue)
@@ -4579,6 +4584,12 @@ def _build_active_models_data() -> dict:
 
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
+        if has_scheduler_snapshot:
+            active_request_ids = set(running_by_id) | prefilling_ids
+        elif collector_request_ids:
+            active_request_ids = collector_request_ids - waiting_ids
+        if has_scheduler_snapshot or collector_request_ids:
+            active_requests = len(active_request_ids)
 
         # Generating = active requests that finished prefill.
         generating = []
