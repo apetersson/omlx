@@ -122,7 +122,8 @@ class TestDS4KVPruning:
         assert new_kv.exists()
         assert non_kv.exists()
 
-    def test_prepare_directories_prunes_global_kv_root_budget(self, tmp_path):
+    def test_prepare_directories_no_longer_prunes_global_kv_root(self, tmp_path):
+        """Launch-time KV prune is removed — ds4-server handles its own eviction."""
         kv_root = tmp_path / "kv"
         old_dir = kv_root / "old-model"
         new_dir = kv_root / "new-model"
@@ -132,10 +133,6 @@ class TestDS4KVPruning:
         new_kv = new_dir / "new.kv"
         old_kv.write_bytes(b"a" * 800_000)
         new_kv.write_bytes(b"b" * 800_000)
-        old_mtime = 1_700_000_000
-        new_mtime = old_mtime + 100
-        os.utime(old_kv, (old_mtime, old_mtime))
-        os.utime(new_kv, (new_mtime, new_mtime))
         gguf = tmp_path / "model.gguf"
         gguf.write_bytes(b"gguf")
         settings = DS4Settings(
@@ -155,12 +152,11 @@ class TestDS4KVPruning:
         managed._prepare_directories()
 
         assert (kv_root / "current-model").is_dir()
-        assert not old_kv.exists()
+        # DS4 launch-time pruning is removed — ds4-server evicts its own
+        # directory at startup using its score-based policy.
+        assert old_kv.exists()
         assert new_kv.exists()
-        assert managed.last_kv_prune_result is not None
-        assert managed.last_kv_prune_result.max_bytes == 1024 * 1024
-        assert managed.last_kv_prune_result.deleted_files == (old_kv.resolve(),)
-        assert managed.last_kv_prune_result.bytes_after == 800_000
+        assert managed.last_kv_prune_result is None
 
 
 class TestDS4LaunchConfig:

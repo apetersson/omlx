@@ -350,10 +350,14 @@ class DS4ManagedProcess:
             kv_root = self.config.settings.get_kv_root(self.config.base_path)
             kv_root.mkdir(parents=True, exist_ok=True)
             self.config.kv_dir.mkdir(parents=True, exist_ok=True)
-            self.last_kv_prune_result = prune_ds4_kv_cache(
-                kv_root,
-                self.config.settings.kv_disk_space_mb * 1024 * 1024,
-            )
+            # DS4 launch-time KV pruning is intentionally omitted here.
+            # ds4-server's ds4_kvstore_open() already evicts the launching
+            # model's own directory to budget using its score-based policy
+            # (hit decay + token density).  A global mtime-based prune
+            # across all models would fight that policy, delete valuable
+            # checkpoints from other models, and duplicate work that the
+            # server does better at startup.
+            self.last_kv_prune_result = None
         if self.config.settings.trace_enabled:
             self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
         if self.config.settings.logs_to_disk:
