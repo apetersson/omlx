@@ -95,9 +95,9 @@ _DS4_KV_STORE_RE = re.compile(
 )
 _DS4_KV_HIT_RE = re.compile(
     r"ds4-server: kv cache hit "
-    r"text tokens=(?P<text_tokens>\d+) text=(?P<text_chars>\d+) "
+    r"text(?P<respproto> RESPPROTO)? tokens=(?P<text_tokens>\d+) text=(?P<text_chars>\d+) "
     r"quant=(?P<quant>\d+) key=(?P<key>\S+) "
-    r"load=(?P<load_ms>" + _DS4_NUMBER_RE + r") ms file=(?P<file>\S+)"
+    r"load=(?P<load_ms>" + _DS4_NUMBER_RE + r") ms (?:consumed )?file=(?P<file>\S+)"
 )
 _DS4_KV_EVICTED_RE = re.compile(
     r"ds4-server: kv cache evicted "
@@ -271,6 +271,19 @@ class DS4ProcessEngine(BaseEngine):
         self._recorded_crash_process_id: int | None = None
         self._active_requests = 0
         self._active_requests_lock = threading.Lock()
+        # Incremental KV cache stats — updated lazily in get_cache_stats().
+        self._kv_stats_process_key: int | None = None
+        self._kv_stats_cursor: int = 0
+        self._kv_hits: int = 0
+        self._kv_stores: int = 0
+        self._kv_evictions: int = 0
+        self._kv_load_failures: int = 0
+        self._kv_skips: int = 0
+        self._kv_tokens_stored: int = 0
+        self._kv_tokens_restored: int = 0
+        self._kv_bytes_stored: int = 0
+        self._kv_last_store_ms: float | None = None
+        self._kv_last_load_ms: float | None = None
 
     @property
     def model_name(self) -> str:
@@ -781,52 +794,68 @@ class DS4ProcessEngine(BaseEngine):
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        """Aggregate DS4 KV cache metrics from captured ds4-server logs."""
+        """Aggregate DS4 KV cache metrics from captured ds4-server logs.
+
+        Counters are accumulated incrementally so events that fell out of the
+        500-line ring buffer are not lost.  The cursor resets when the managed
+        process object changes (restart, context switch).
+        """
         process = self.process
         if process is None:
             return None
-        hits = 0
-        stores = 0
-        evictions = 0
-        load_failures = 0
-        skips = 0
-        tokens_stored = 0
-        tokens_restored = 0
-        bytes_stored = 0
-        last_store_ms: float | None = None
-        last_load_ms: float | None = None
-        for log_line in process.logs:
+        process_key = id(process)
+        log_total: int = getattr(process, "log_total", len(process.logs))
+        logs = process.logs
+        if process_key != self._kv_stats_process_key:
+            # New process — reset counters; skip lines already pruned from ring.
+            ring_start = log_total - len(logs)
+            self._kv_stats_process_key = process_key
+            self._kv_stats_cursor = ring_start
+            self._kv_hits = 0
+            self._kv_stores = 0
+            self._kv_evictions = 0
+            self._kv_load_failures = 0
+            self._kv_skips = 0
+            self._kv_tokens_stored = 0
+            self._kv_tokens_restored = 0
+            self._kv_bytes_stored = 0
+            self._kv_last_store_ms = None
+            self._kv_last_load_ms = None
+        ring_start = log_total - len(logs)
+        start_idx = max(0, self._kv_stats_cursor - ring_start)
+        for log_line in logs[start_idx:]:
             text = getattr(log_line, "text", "")
             parsed = parse_ds4_kv_log_line(str(text))
             if parsed is None:
                 continue
             event = parsed["event"]
             if event == "hit":
-                hits += 1
-                tokens_restored += parsed.get("text_tokens", 0)
-                last_load_ms = parsed.get("load_ms")
+                self._kv_hits += 1
+                self._kv_tokens_restored += parsed.get("text_tokens", 0)
+                self._kv_last_load_ms = parsed.get("load_ms")
             elif event == "store":
-                stores += 1
-                tokens_stored += parsed.get("tokens", 0)
-                bytes_stored += int(parsed.get("size_mb", 0) * 1024 * 1024)
-                last_store_ms = parsed.get("save_ms")
+                self._kv_stores += 1
+                self._kv_tokens_stored += parsed.get("tokens", 0)
+                self._kv_bytes_stored += int(parsed.get("size_mb", 0) * 1024 * 1024)
+                self._kv_last_store_ms = parsed.get("save_ms")
             elif event == "evicted":
-                evictions += 1
+                self._kv_evictions += 1
             elif event == "load_failed":
-                load_failures += 1
+                self._kv_load_failures += 1
             elif event == "skipped":
-                skips += 1
+                self._kv_skips += 1
+        self._kv_stats_cursor = log_total
         return {
-            "hits": hits,
-            "stores": stores,
-            "evictions": evictions,
-            "load_failures": load_failures,
-            "skips": skips,
-            "tokens_stored": tokens_stored,
-            "tokens_restored": tokens_restored,
-            "bytes_stored": bytes_stored,
-            "last_store_ms": last_store_ms,
-            "last_load_ms": last_load_ms,
+            "hits": self._kv_hits,
+            "stores": self._kv_stores,
+            "evictions": self._kv_evictions,
+            "load_failures": self._kv_load_failures,
+            "skips": self._kv_skips,
+            "tokens_stored": self._kv_tokens_stored,
+            "tokens_restored": self._kv_tokens_restored,
+            "bytes_stored": self._kv_bytes_stored,
+            "last_store_ms": self._kv_last_store_ms,
+            "last_load_ms": self._kv_last_load_ms,
         }
 
     def _protocol_not_implemented(self) -> RuntimeError:
