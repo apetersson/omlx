@@ -349,6 +349,7 @@ class DS4Settings:
     kv_root: str | None = None  # None means ~/.omlx/ds4-kv
     kv_disk_space_mb: int = 65_536
     kv_cache_continued_interval_tokens: int = 2_048
+    kv_cache_reject_different_quant: bool = False
     ssd_streaming: DS4SSDStreamingMode = "auto"
     power: int = 100
     trace_enabled: bool = False
@@ -414,6 +415,7 @@ class DS4Settings:
             "kv_cache_continued_interval_tokens": (
                 self.kv_cache_continued_interval_tokens
             ),
+            "kv_cache_reject_different_quant": self.kv_cache_reject_different_quant,
             "ssd_streaming": self.ssd_streaming,
             "power": self.power,
             "trace_enabled": self.trace_enabled,
@@ -436,6 +438,9 @@ class DS4Settings:
             kv_disk_space_mb=data.get("kv_disk_space_mb", 65_536),
             kv_cache_continued_interval_tokens=data.get(
                 "kv_cache_continued_interval_tokens", 2_048
+            ),
+            kv_cache_reject_different_quant=data.get(
+                "kv_cache_reject_different_quant", False
             ),
             ssd_streaming=data.get("ssd_streaming", "auto"),
             power=data.get("power", 100),

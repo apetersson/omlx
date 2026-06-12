@@ -163,6 +163,8 @@ class DS4LaunchConfig:
                     str(self.settings.kv_cache_continued_interval_tokens),
                 ]
             )
+            if self.settings.kv_cache_reject_different_quant:
+                args.append("--kv-cache-reject-different-quant")
         if self.should_enable_ssd_streaming():
             args.append("--ssd-streaming")
         if self.settings.trace_enabled:
