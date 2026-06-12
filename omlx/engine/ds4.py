@@ -451,7 +451,7 @@ class DS4ProcessEngine(BaseEngine):
         had_process = self.process is not None
         if had_process:
             self._record_crashed_process()
-            await self.stop()
+            await self._stop_locked()
         try:
             await self.start()
         except Exception as exc:  # noqa: BLE001 - normalize restart failures
