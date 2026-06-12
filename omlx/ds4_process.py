@@ -286,8 +286,10 @@ class DS4ManagedProcess:
         self.port: int | None = None
         self.command: list[str] | None = None
         self.logs: list[DS4LogLine] = []
+        self.log_total: int = 0
         self.log_path: Path | None = None
         self.last_kv_prune_result: DS4KVPruneResult | None = None
+        self._became_ready: bool = False
         self._log_tasks: list[asyncio.Task[None]] = []
         self._log_file_handle: "TextIOWrapper | None" = None
         self._instance_id: str = _next_ds4_instance_id()
@@ -301,6 +303,7 @@ class DS4ManagedProcess:
         """Launch ds4-server and wait for /v1/models readiness."""
         if self.is_running:
             return
+        self._became_ready = False
         self.config.support_status()
         port = self.config.resolve_port()
         self.port = port
@@ -345,6 +348,7 @@ class DS4ManagedProcess:
                 _readiness_probe, self.config.host, self.port
             )
             if ready:
+                self._became_ready = True
                 return
             await asyncio.sleep(0.1)
 
@@ -357,12 +361,12 @@ class DS4ManagedProcess:
     async def stop(self, *, timeout: float = 5.0) -> None:
         """Terminate the subprocess and stop log capture tasks.
 
-        When the KV disk cache is enabled the timeout is raised to 60s so
-        ds4-server has enough time to persist the live session (multi-GB
-        write + fflush) before SIGKILL.  Killing mid-persist defeats
-        warm-start and leaks orphaned .kv.tmp.* files.
+        When KV cache is enabled and the server reached readiness, the timeout
+        is raised to 60s so ds4-server can persist the live session before
+        SIGKILL.  The extended timeout is skipped for pre-readiness failures
+        (crash on load, readiness timeout) where no KV state exists to save.
         """
-        if self.config.settings.kv_cache_enabled:
+        if self.config.settings.kv_cache_enabled and self._became_ready:
             timeout = max(timeout, 60.0)
         process = self.process
         if process is not None and process.returncode is None:
@@ -393,8 +397,8 @@ class DS4ManagedProcess:
             self.last_kv_prune_result = None
             # Clean up orphaned .kv.tmp.<pid> files left behind when a
             # previous ds4-server was SIGKILLed mid persist.  The kvstore
-            # discards these files only if the embedded pid matches its
-            # own — stale orphans never match, so they leak forever.
+            # never scans for stale temp files — it only unlinks its own
+            # temp on a failed write — so these orphans leak forever.
             _cleanup_kv_tmp_files(self.config.kv_dir)
         if self.config.settings.trace_enabled:
             self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,6 +483,7 @@ class DS4ManagedProcess:
             text = line.decode("utf-8", errors="replace").rstrip("\r\n")
             log_line = DS4LogLine(stream, text, time.monotonic())
             self.logs.append(log_line)
+            self.log_total += 1
             self._append_log_file_line(log_line)
             logger.info("[%s] %s: %s", self._instance_id, stream, text)
             if len(self.logs) > self.max_log_lines:
