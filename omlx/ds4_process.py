@@ -209,6 +209,29 @@ def _scan_ds4_kv_files(root: Path) -> list[tuple[float, Path, int]]:
     return files
 
 
+def _cleanup_kv_tmp_files(kv_dir: Path) -> None:
+    """Delete orphaned .kv.tmp.<pid> files in *kv_dir*.
+
+    ds4-server writes KV checkpoints to ``<sha>.kv.tmp.<pid>`` and renames
+    on success.  If the server is SIGKILLed mid-persist the temp file
+    remains behind forever — the server's own scan only considers exact
+    ``<40-hex>.kv`` names and the ``*.kv`` pruner glob misses the ``.tmp``
+    suffix.  These orphans are safe to delete unconditionally: the rename
+    never happened so there is no consistent data to preserve, and a
+    running server only holds a temp file for its own pid.
+    """
+    if not kv_dir.exists():
+        return
+    for path in kv_dir.rglob("*.kv.tmp.*"):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            logger.debug("Cleaned up orphaned KV temp file: %s", path)
+        except OSError as exc:
+            logger.warning("Failed to clean up orphaned KV temp %s: %s", path, exc)
+
+
 def prune_ds4_kv_cache(root: Path, max_bytes: int) -> DS4KVPruneResult:
     """Prune oldest recursive DS4 `*.kv` files until the root is under budget."""
     root = Path(root).expanduser().resolve()
@@ -332,7 +355,15 @@ class DS4ManagedProcess:
         )
 
     async def stop(self, *, timeout: float = 5.0) -> None:
-        """Terminate the subprocess and stop log capture tasks."""
+        """Terminate the subprocess and stop log capture tasks.
+
+        When the KV disk cache is enabled the timeout is raised to 60s so
+        ds4-server has enough time to persist the live session (multi-GB
+        write + fflush) before SIGKILL.  Killing mid-persist defeats
+        warm-start and leaks orphaned .kv.tmp.* files.
+        """
+        if self.config.settings.kv_cache_enabled:
+            timeout = max(timeout, 60.0)
         process = self.process
         if process is not None and process.returncode is None:
             process.terminate()
@@ -360,6 +391,11 @@ class DS4ManagedProcess:
             # checkpoints from other models, and duplicate work that the
             # server does better at startup.
             self.last_kv_prune_result = None
+            # Clean up orphaned .kv.tmp.<pid> files left behind when a
+            # previous ds4-server was SIGKILLed mid persist.  The kvstore
+            # discards these files only if the embedded pid matches its
+            # own — stale orphans never match, so they leak forever.
+            _cleanup_kv_tmp_files(self.config.kv_dir)
         if self.config.settings.trace_enabled:
             self.config.trace_path.parent.mkdir(parents=True, exist_ok=True)
         if self.config.settings.logs_to_disk:
