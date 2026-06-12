@@ -86,6 +86,62 @@ def parse_ds4_progress_log_line(line: str) -> dict[str, Any] | None:
     return None
 
 
+# Regex patterns for DS4 KV cache log lines.
+_DS4_KV_STORE_RE = re.compile(
+    r"ds4-server: kv cache stored tokens=(?P<tokens>\d+) "
+    r"trimmed=(?P<trimmed>\d+) reason=(?P<reason>\S+) "
+    r"key=(?P<key>\S+) size=(?P<size_mb>" + _DS4_NUMBER_RE + r") MiB "
+    r"save=(?P<save_ms>" + _DS4_NUMBER_RE + r") ms"
+)
+_DS4_KV_HIT_RE = re.compile(
+    r"ds4-server: kv cache hit "
+    r"text tokens=(?P<text_tokens>\d+) text=(?P<text_chars>\d+) "
+    r"quant=(?P<quant>\d+) key=(?P<key>\S+) "
+    r"load=(?P<load_ms>" + _DS4_NUMBER_RE + r") ms file=(?P<file>\S+)"
+)
+_DS4_KV_EVICTED_RE = re.compile(
+    r"ds4-server: kv cache evicted "
+    r"reason=(?P<reason>\S+) tokens=(?P<tokens>\d+) "
+    r"hits=(?P<hits>\d+) size=(?P<size_mb>" + _DS4_NUMBER_RE + r") MiB "
+    r"file=(?P<file>\S+)"
+)
+_DS4_KV_LOAD_FAILED_RE = re.compile(
+    r"ds4-server: kv cache load failed"
+)
+_DS4_KV_SKIPPED_RE = re.compile(
+    r"ds4-server: kv cache skipped"
+)
+
+
+def parse_ds4_kv_log_line(line: str) -> dict[str, Any] | None:
+    """Parse one DS4 KV cache event line into structured metrics."""
+    if match := _DS4_KV_STORE_RE.search(line):
+        return {
+            "event": "store",
+            "tokens": int(match.group("tokens")),
+            "size_mb": _ds4_progress_float(match.group("size_mb")),
+            "save_ms": _ds4_progress_float(match.group("save_ms")),
+        }
+    if match := _DS4_KV_HIT_RE.search(line):
+        return {
+            "event": "hit",
+            "text_tokens": int(match.group("text_tokens")),
+            "load_ms": _ds4_progress_float(match.group("load_ms")),
+        }
+    if match := _DS4_KV_EVICTED_RE.search(line):
+        return {
+            "event": "evicted",
+            "tokens": int(match.group("tokens")),
+            "hits": int(match.group("hits")),
+            "size_mb": _ds4_progress_float(match.group("size_mb")),
+        }
+    if _DS4_KV_LOAD_FAILED_RE.search(line):
+        return {"event": "load_failed"}
+    if _DS4_KV_SKIPPED_RE.search(line):
+        return {"event": "skipped"}
+    return None
+
+
 @dataclass(frozen=True)
 class DS4ProxyResponse:
     """Raw non-streaming DS4 HTTP response."""
@@ -725,8 +781,53 @@ class DS4ProcessEngine(BaseEngine):
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        """DS4 cache metrics are not available until protocol metrics land."""
-        return None
+        """Aggregate DS4 KV cache metrics from captured ds4-server logs."""
+        process = self.process
+        if process is None:
+            return None
+        hits = 0
+        stores = 0
+        evictions = 0
+        load_failures = 0
+        skips = 0
+        tokens_stored = 0
+        tokens_restored = 0
+        bytes_stored = 0
+        last_store_ms: float | None = None
+        last_load_ms: float | None = None
+        for log_line in process.logs:
+            text = getattr(log_line, "text", "")
+            parsed = parse_ds4_kv_log_line(str(text))
+            if parsed is None:
+                continue
+            event = parsed["event"]
+            if event == "hit":
+                hits += 1
+                tokens_restored += parsed.get("text_tokens", 0)
+                last_load_ms = parsed.get("load_ms")
+            elif event == "store":
+                stores += 1
+                tokens_stored += parsed.get("tokens", 0)
+                bytes_stored += int(parsed.get("size_mb", 0) * 1024 * 1024)
+                last_store_ms = parsed.get("save_ms")
+            elif event == "evicted":
+                evictions += 1
+            elif event == "load_failed":
+                load_failures += 1
+            elif event == "skipped":
+                skips += 1
+        return {
+            "hits": hits,
+            "stores": stores,
+            "evictions": evictions,
+            "load_failures": load_failures,
+            "skips": skips,
+            "tokens_stored": tokens_stored,
+            "tokens_restored": tokens_restored,
+            "bytes_stored": bytes_stored,
+            "last_store_ms": last_store_ms,
+            "last_load_ms": last_load_ms,
+        }
 
     def _protocol_not_implemented(self) -> RuntimeError:
         return RuntimeError(
