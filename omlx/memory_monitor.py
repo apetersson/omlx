@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
@@ -34,12 +34,14 @@ except ImportError:
     HAS_MLX_METAL = False
     mx = None
 
-# MLX >= 0.31 no longer materializes the full fp32 score matrix for
-# head_dim > 128, but local peak measurements still show a tiled score/scratch
-# term. Model it as one fp16 query tile plus the fp32 output buffer.
-_SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD = 128
-_SDPA_TILED_SCRATCH_QUERY_TOKENS = 512
-_SDPA_TILED_SCRATCH_DTYPE_SIZE = 2
+# Mirrors MLX Metal ScaledDotProductAttention::use_fallback for the
+# generation/inference path. Full prefill and short vector kernels support
+# different head dimensions; unsupported cases fall back to an unfused fp32
+# score matrix allocation.
+_SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
+_SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 80, 128})
+_SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
+_SDPA_FALLBACK_SCORE_DTYPE_SIZE = 4
 
 
 @dataclass
@@ -412,19 +414,39 @@ class MemoryMonitor:
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
         return num_tokens * per_token
 
+    def _uses_fused_sdpa(self, query_tokens: int, kv_len: int) -> bool:
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+        n_kv = self._num_kv_heads or n_q
+        if n_q <= 0 or n_kv <= 0 or hd <= 0 or query_tokens <= 0:
+            return False
+        if kv_len < query_tokens:
+            return False
+
+        if query_tokens <= _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD:
+            gqa_factor = max(1, n_q // n_kv)
+            return (
+                hd in _SDPA_VECTOR_SUPPORTED_HEAD_DIMS
+                and query_tokens * gqa_factor <= 32
+            )
+
+        return hd in _SDPA_FULL_SUPPORTED_HEAD_DIMS
+
     def _estimate_sdpa_activation_bytes(self, query_tokens: int, kv_len: int) -> int:
         hd = self._head_dim or 0
         n_q = self._num_attention_heads or 0
         if n_q == 0 or hd == 0 or query_tokens <= 0:
             return 0
 
+        query_tokens = int(query_tokens)
+        kv_len = max(int(kv_len), 0)
+
         output = n_q * query_tokens * hd * 4
-        if hd <= _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD:
+        if self._uses_fused_sdpa(query_tokens, kv_len):
             return output
 
-        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
-        scratch = n_q * tiled_query * max(kv_len, 0) * _SDPA_TILED_SCRATCH_DTYPE_SIZE
-        return scratch + output
+        scores = n_q * query_tokens * kv_len * _SDPA_FALLBACK_SCORE_DTYPE_SIZE
+        return scores + output
 
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
@@ -439,9 +461,10 @@ class MemoryMonitor:
         cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA avoids the old full fp32 score-matrix allocation for
-        head_dim > 128, but high-head-dim kernels still need a tiled scratch
-        term that spans the full key/value context. With prefix-cache hits,
+        MLX SDPA only uses fused full-attention kernels for the head dimensions
+        supported by ``ScaledDotProductAttention::use_fallback``. Unsupported
+        prefill chunks fall back to an unfused fp32 score matrix whose K
+        dimension spans the full key/value context. With prefix-cache hits,
         that context is ``new_tokens + cached_tokens``, not just the new suffix.
         Passing only ``new_tokens`` here silently under-counts long-context
         prefill, exactly where prefix caching makes such requests possible.
@@ -464,7 +487,7 @@ class MemoryMonitor:
         Returns:
             Per-request peak contribution in bytes (KV + SDPA). Returns 0 if
             model info is not available. Caller compares this against
-            `(hard_threshold * max_bytes) - max(active, phys_footprint())` —
+            `(hard_threshold * max_bytes) - current_usage_bytes` —
             the margin handles cache pool / python heap / compressed memory.
         """
         hd = self._head_dim or 0
@@ -480,14 +503,14 @@ class MemoryMonitor:
         # prompts (smaller than chunk_size) would otherwise be charged the
         # full chunk_size width in the scores tensor, over-estimating by
         # chunk_size / new_tokens — a constant-factor over-count that
-        # raised false-positive 413s on small prompts.
+        # raised false-positive 400s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
         attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
-        # The cached portion is already counted via the baseline
-        # mx.get_active_memory() reading on the caller side.
+        # The cached portion is already counted in the caller's current-usage
+        # baseline.
         kv = self.estimate_prompt_kv_bytes(new_tokens)
         return attn + kv
 
@@ -501,10 +524,9 @@ class MemoryMonitor:
         in the caller's ``current`` baseline once eval'd); it is the quantity
         the adaptive throttle must keep under the remaining headroom.
 
-        MLX fused SDPA uses the output-buffer estimate for head_dim <= 128.
-        For larger head_dim values, current MLX avoids the old full fp32
-        score matrix but still needs a bounded query-tile scratch term that
-        scales with total ``kv_len``.
+        Fused MLX SDPA uses the output-buffer estimate. Unsupported
+        query/head-dim combinations use the unfused fp32 score-matrix fallback
+        and scale with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
         """
@@ -581,3 +603,217 @@ class MemoryMonitor:
             f"MemoryMonitor(max_kv_cache={format_bytes(self._max_kv_cache_memory)}, "
             f"used={format_bytes(info.used_bytes)})"
         )
+
+
+def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
+    """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
+
+    The engine-agnostic baseline used by engines that bypass the
+    ``Scheduler`` (currently ``DFlashEngine``'s primary speculative path) so
+    they can run the same prefill-peak estimate the scheduler-driven engines
+    get. Best-effort: on any extraction failure the monitor is left dim-less
+    and ``estimate_prefill_peak_bytes`` returns 0, making the guard a no-op
+    rather than raising spuriously.
+
+    Note this populates the *uncompressed* (base-dtype) KV size — it does not
+    apply the TurboQuant fractional-byte adjustment that
+    ``Scheduler._set_model_info_for_monitor`` layers on, because that depends
+    on scheduler-side TurboQuant configuration. For a memory *guard* the
+    uncompressed estimate is the conservative (never-under-count) choice.
+    """
+    try:
+        # Try to get model config
+        config = None
+        if hasattr(model, "config"):
+            config = model.config
+        elif hasattr(model, "args"):
+            config = model.args
+
+        if config is None:
+            logger.debug("Could not extract model config for memory estimation")
+            return
+
+        def _cfg_get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        # VLM / multimodal configs (e.g. Qwen3.6-VL, Gemma-4) nest the
+        # language-model dimensions under a sub-config. Prefer
+        # ``text_config`` / ``language_config`` / ``llm_config`` when ANY of
+        # them exposes the LM layer count, even if the top-level config also
+        # has one — on some VLM packs the top-level field refers to the
+        # *vision encoder*, not the LM, and accepting it silently miscalibrates
+        # the SDPA-peak estimate. Probe ``num_hidden_layers`` and the legacy
+        # ``n_layer`` alias. Falls back to the top-level config only when no
+        # sub-config has either field.
+        for sub_attr in ("text_config", "language_config", "llm_config"):
+            sub = _cfg_get(config, sub_attr)
+            if sub is not None and (
+                _cfg_get(sub, "num_hidden_layers") or _cfg_get(sub, "n_layer")
+            ):
+                config = sub
+                break
+
+        # Extract KV cache dimensions
+        num_layers = _cfg_get(config, "num_hidden_layers") or _cfg_get(
+            config, "n_layer"
+        )
+        num_kv_heads = (
+            _cfg_get(config, "num_key_value_heads")
+            or _cfg_get(config, "num_attention_heads")
+            or _cfg_get(config, "n_head")
+        )
+        head_dim = _cfg_get(config, "head_dim")
+        hidden_size = _cfg_get(config, "hidden_size") or _cfg_get(config, "n_embd")
+
+        # Calculate head_dim if not directly available
+        if head_dim is None and hidden_size and num_kv_heads:
+            num_heads = _cfg_get(config, "num_attention_heads") or num_kv_heads
+            head_dim = hidden_size // num_heads
+
+        # Determine dtype size
+        dtype_size = 2  # Default float16
+        if hasattr(model, "dtype"):
+            if model.dtype == mx.float32:
+                dtype_size = 4
+            elif model.dtype == mx.bfloat16:
+                dtype_size = 2
+
+        # Extract num_attention_heads (query heads) for SDPA peak estimation
+        num_attention_heads = (
+            _cfg_get(config, "num_attention_heads")
+            or _cfg_get(config, "n_head")
+            or num_kv_heads
+        )
+
+        # Count KVCache layers for hybrid models. Mirrors
+        # Scheduler._set_model_info_for_monitor: recurse into CacheList so
+        # wrapped full-attention layers are counted, not just bare KVCache.
+        num_kv_cache_layers = num_layers
+        if hasattr(model, "make_cache"):
+            try:
+                cache_list = model.make_cache()
+                from mlx_lm.models.cache import CacheList, KVCache
+
+                def _count_kv(c: Any) -> int:
+                    if type(c) is KVCache:
+                        return 1
+                    if isinstance(c, CacheList):
+                        return sum(_count_kv(inner) for inner in c.caches)
+                    return 0
+
+                num_kv_cache_layers = sum(_count_kv(c) for c in cache_list)
+                if num_kv_cache_layers == 0:
+                    num_kv_cache_layers = num_layers  # fallback
+            except Exception:
+                pass
+
+        # Truthiness alone isn't enough — MagicMock proxies leaking through the
+        # descent (test scaffolds that don't fully spec ``model.config``) are
+        # truthy but fail any later numeric comparison (``> 128`` etc.) deep
+        # inside MemoryMonitor. Insist on real positive integers before calling.
+        def _pos_int(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+        if _pos_int(num_layers) and _pos_int(num_kv_heads) and _pos_int(head_dim):
+            monitor.set_model_info(
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                dtype_size=dtype_size,
+                num_attention_heads=num_attention_heads,
+                num_kv_cache_layers=num_kv_cache_layers,
+            )
+            logger.debug(
+                f"Model info for memory estimation: "
+                f"layers={num_layers} ({num_kv_cache_layers} KVCache), "
+                f"kv_heads={num_kv_heads}, q_heads={num_attention_heads}, "
+                f"head_dim={head_dim}, dtype_size={dtype_size}"
+            )
+        else:
+            logger.debug(
+                f"Incomplete model info: layers={num_layers}, "
+                f"kv_heads={num_kv_heads}, head_dim={head_dim}"
+            )
+
+    except Exception as e:
+        logger.debug(f"Failed to extract model info: {e}")
+
+
+def raise_if_prefill_exceeds(
+    monitor: "MemoryMonitor | None",
+    *,
+    prefill_memory_guard: bool,
+    hard_limit_bytes: int,
+    current_usage_bytes: int,
+    prefill_step_size: int,
+    num_prompt_tokens: int,
+    cached_tokens: int = 0,
+    request_id: str | None = None,
+) -> None:
+    """Raise ``PrefillMemoryExceededError`` if a prompt's prefill peak would
+    push memory past ``hard_limit_bytes``.
+
+    The shared front-door guard, taking token counts + watermarks directly so
+    an engine without a ``Scheduler`` (``DFlashEngine``) enforces with the
+    same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
+    disabled, no limit is set, the monitor is missing, or the request fits.
+    The caller supplies ``current_usage_bytes`` so HTTP/event-loop preflight
+    paths can use cached executor telemetry plus physical footprint without
+    calling MLX directly. Maps to HTTP 400 via the server's
+    ``prefill_memory_exceeded_handler``.
+
+    ``cached_tokens`` means prompt KV *already resident in current memory*
+    (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
+    a cache". A cache whose hits re-allocate KV (DFlash prefix snapshots)
+    must pass 0.
+    """
+    if not prefill_memory_guard:
+        return
+    if hard_limit_bytes <= 0:
+        return
+    if monitor is None:
+        return
+
+    new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+    if new_tokens == 0:
+        return
+
+    peak = monitor.estimate_prefill_peak_bytes(
+        new_tokens, prefill_step_size, cached_tokens=cached_tokens
+    )
+    if peak == 0:
+        return
+
+    current = max(0, int(current_usage_bytes))
+    if current + peak <= hard_limit_bytes:
+        return
+
+    from omlx.exceptions import PrefillMemoryExceededError
+
+    usage_gb = current / (1024**3)
+    ceiling_gb = hard_limit_bytes / (1024**3)
+    message = (
+        f"Prefill would require ~{format_bytes(current + peak)} peak "
+        f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
+        f"but ceiling is {format_bytes(hard_limit_bytes)} "
+        f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+        f"Reduce context length, free system memory, or loosen "
+        f"memory_guard_tier (safe → balanced → aggressive)."
+    )
+
+    if not request_id:
+        import uuid as _uuid
+
+        request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
+    logger.warning(
+        "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
+        num_prompt_tokens, cached_tokens, request_id, message,
+    )
+    raise PrefillMemoryExceededError(
+        message=message,
+        request_id=request_id,
+        estimated_bytes=int(current + peak),
+        limit_bytes=int(hard_limit_bytes),
+    )

@@ -654,8 +654,8 @@ def test_dashboard_saves_ds4_supported_settings_only():
         encoding="utf-8"
     )
 
-    assert "max_context_window: settings.max_context_window || null" in js
-    assert "model_type_override: model.engine_type === 'ds4' ? ''" in js
+    assert "max_context_window: s.max_context_window || null" in js
+    assert "model_type_override: model?.engine_type === 'ds4' ? ''" in js
     assert "const isDs4 = this.selectedModel?.engine_type === 'ds4'" in js
     assert "if (isDs4)" in js
     assert "max_context_window: this.modelSettings.max_context_window || null" in js

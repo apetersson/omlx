@@ -73,6 +73,28 @@ class BatchedEngine(BaseEngine):
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
 
+    async def _preflight_or_raise_with_eviction(
+        self,
+        scheduler: Any,
+        *,
+        num_prompt_tokens: int,
+        request_id: str | None,
+    ) -> None:
+        eviction_request = scheduler.preflight_eviction_request(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+        if eviction_request is not None and self._prefill_eviction_callback is not None:
+            logger.info(
+                "Running preflight LRU eviction for request %s",
+                eviction_request.request_id,
+            )
+            await self._prefill_eviction_callback(eviction_request)
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=num_prompt_tokens,
+            request_id=request_id,
+        )
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -210,8 +232,8 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import (
-            maybe_load_custom_quantization,
             maybe_apply_pre_load_patches,
+            maybe_load_custom_quantization,
         )
 
         # Build tokenizer config with model-specific fixes
@@ -303,15 +325,17 @@ class BatchedEngine(BaseEngine):
         await self._engine.engine.start()
 
         # TurboQuant KV cache: propagate bits to scheduler
+        scheduler = self._engine.engine.scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
-                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
-                self._engine.engine.scheduler._set_model_info_for_monitor()
+                scheduler._set_model_info_for_monitor()
+        scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:
@@ -774,8 +798,8 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
             return
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def preflight_completion(
@@ -804,8 +828,8 @@ class BatchedEngine(BaseEngine):
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
             return
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        await self._preflight_or_raise_with_eviction(
+            scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
     async def stream_chat(

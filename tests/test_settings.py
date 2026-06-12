@@ -52,6 +52,7 @@ class TestServerSettings:
         assert settings.sse_keepalive_mode == "chunk"
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
+        assert settings.preserve_mid_system_cache is True
 
     def test_custom_values(self):
         """Test custom values."""
@@ -79,6 +80,7 @@ class TestServerSettings:
             "sse_keepalive_mode": "chunk",
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
+            "preserve_mid_system_cache": True,
         }
 
     def test_from_dict_sse_keepalive_mode(self):
@@ -99,6 +101,17 @@ class TestServerSettings:
         """A settings.json without burst_decode_mode falls back to the default."""
         settings = ServerSettings.from_dict({})
         assert settings.burst_decode_mode == DEFAULT_BURST_DECODE_MODE
+
+    def test_from_dict_preserve_mid_system_cache(self):
+        """preserve_mid_system_cache round-trips through from_dict / to_dict."""
+        settings = ServerSettings.from_dict({"preserve_mid_system_cache": False})
+        assert settings.preserve_mid_system_cache is False
+        assert settings.to_dict()["preserve_mid_system_cache"] is False
+
+    def test_from_dict_preserve_mid_system_cache_default(self):
+        """Missing preserve_mid_system_cache keeps the cache-friendly default."""
+        settings = ServerSettings.from_dict({})
+        assert settings.preserve_mid_system_cache is True
 
     def test_from_dict_auto_start_on_launch(self):
         """auto_start_on_launch round-trips through from_dict / to_dict."""
@@ -1800,8 +1813,9 @@ class TestHelperFunctions:
                 return 4096
             raise ValueError(name)
 
-        with patch.dict("sys.modules", {"psutil": BrokenPsutil}), patch(
-            "omlx.settings.os.sysconf", side_effect=fake_sysconf
+        with (
+            patch.dict("sys.modules", {"psutil": BrokenPsutil}),
+            patch("omlx.settings.os.sysconf", side_effect=fake_sysconf),
         ):
             assert get_system_memory() == 123 * 4096
 
@@ -1814,8 +1828,9 @@ class TestHelperFunctions:
             def virtual_memory():
                 return FakeVirtualMemory()
 
-        with patch.dict("sys.modules", {"psutil": FakePsutil}), patch(
-            "omlx.settings.os.sysconf", side_effect=ValueError("unsupported")
+        with (
+            patch.dict("sys.modules", {"psutil": FakePsutil}),
+            patch("omlx.settings.os.sysconf", side_effect=ValueError("unsupported")),
         ):
             assert get_system_memory() == 32 * 1024**3
 
@@ -1981,9 +1996,7 @@ class TestSamplingSettings:
         d = unset.to_dict()
         assert d["max_context_window_policy"] is None
         # Setting an explicit value round-trips
-        with_policy = SamplingSettings.from_dict(
-            {"max_context_window_policy": 128_000}
-        )
+        with_policy = SamplingSettings.from_dict({"max_context_window_policy": 128_000})
         assert with_policy.max_context_window_policy == 128_000
         assert with_policy.to_dict()["max_context_window_policy"] == 128_000
 
@@ -2139,9 +2152,7 @@ class TestIntegrationSettings:
 
     def test_from_dict_explicit_null_overrides_default(self):
         """Explicit None for a *_model field must be preserved."""
-        settings = IntegrationSettings.from_dict(
-            {"codex_model": None, "pi_model": "x"}
-        )
+        settings = IntegrationSettings.from_dict({"codex_model": None, "pi_model": "x"})
         assert settings.codex_model is None
         assert settings.pi_model == "x"
 

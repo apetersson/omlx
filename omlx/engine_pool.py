@@ -492,6 +492,11 @@ class EnginePool:
         path = Path(entry.model_path)
         return path.suffix.lower() == ".gguf" and not path.is_dir()
 
+    @staticmethod
+    def _entry_is_diffusion_model(entry: EngineEntry) -> bool:
+        model_type = (entry.config_model_type or "").lower().replace("-", "_")
+        return model_type == "diffusion_gemma"
+
     def apply_settings_overrides(
         self, settings_manager: "ModelSettingsManager"
     ) -> None:
@@ -1165,6 +1170,28 @@ class EnginePool:
                 await self._unload_engine(victim)
                 evicted_any = True
 
+    def _other_entries_serving(self, model_id: str) -> bool:
+        """True when any loaded entry other than ``model_id`` is serving.
+
+        Used by the settle barrier in ``_unload_engine``: the barrier's
+        freed-memory check is a delta of the process-global
+        ``mx.get_active_memory()`` gauge, which only measures THIS unload
+        while no other engine is allocating concurrently.
+        """
+        # Snapshot the items: admin unload routes call _unload_engine without
+        # the pool lock, so discover_models() can mutate _entries mid-iteration.
+        for mid, e in list(self._entries.items()):
+            if mid == model_id or e.engine is None:
+                continue
+            if e.in_use > 0:
+                return True
+            try:
+                if e.engine.has_active_requests():
+                    return True
+            except AttributeError:
+                pass
+        return False
+
     async def _unload_engine(self, model_id: str) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
@@ -1261,6 +1288,7 @@ class EnginePool:
         settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
         min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
         settled = False
+        settle_indeterminate = False
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
@@ -1270,6 +1298,23 @@ class EnginePool:
                     f"Settle round {_settle_round + 1} for '{model_id}': "
                     f"freed={format_size(actual_freed)} "
                     f"(need>={format_size(min_expected_freed)}) - settled"
+                )
+                break
+            if self._other_entries_serving(model_id):
+                # actual_freed is a delta of the process-global MLX gauge,
+                # so while another engine allocates (prefill/KV growth) the
+                # amount freed by THIS unload is unmeasurable — the delta can
+                # even read negative. Burning settle rounds here serializes
+                # gc/synchronize/clear_cache against live decode for seconds,
+                # under memory pressure, with the enforcer holding the pool
+                # lock. Bail out instead: pre-load admission re-reads the
+                # live gauge, so nothing downstream trusts this sample.
+                settle_indeterminate = True
+                logger.info(
+                    f"Settle for '{model_id}' indeterminate under concurrent "
+                    f"activity (freed={format_size(actual_freed)}, "
+                    f"need>={format_size(min_expected_freed)}); skipping "
+                    f"settle wait"
                 )
                 break
             logger.debug(
@@ -1293,6 +1338,16 @@ class EnginePool:
                 f"(expected>={format_size(min_expected_freed)}), "
                 f"active_memory: {format_size(active_now)} (settled)"
             )
+        elif settle_indeterminate:
+            # Settle wait skipped (logged above). Emergency reclaim is
+            # deliberately skipped too: its gc + synchronize + clear_cache
+            # rounds would stall the live engines that made the measurement
+            # indeterminate in the first place. Recovery is not lost:
+            # _wake_process_memory_enforcer() below triggers an immediate
+            # enforcer re-poll, and pre-load admission re-reads the live gauge
+            # alongside the tracked accumulator (the #1623 max() in
+            # get_engine), so any unreleased memory stays visible to both.
+            pass
         else:
             # Barrier timed out - try emergency reclaim
             logger.warning(
@@ -1437,7 +1492,17 @@ class EnginePool:
             elif model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if dflash_enabled and dflash_draft:
+                if (
+                    dflash_enabled
+                    and dflash_draft
+                    and self._entry_is_diffusion_model(entry)
+                ):
+                    logger.warning(
+                        "DFlash is not supported for diffusion models; "
+                        "loading %s with its native VLM engine",
+                        model_id,
+                    )
+                elif dflash_enabled and dflash_draft:
                     try:
                         from .engine.dflash import DFlashEngine
 
@@ -1691,7 +1756,7 @@ class EnginePool:
             self._current_model_memory += entry.estimated_size
             load_completed = True
 
-            # VLM MTP: load gemma4_assistant drafter and attach to engine.
+            # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
             if (
                 model_settings is not None

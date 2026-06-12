@@ -278,15 +278,18 @@ class TestCheckAndEnforce:
         """Stops eviction when all models are pinned (no victim)."""
         enforcer._engine_pool._find_lru_victim.return_value = None
         # Add a pinned loaded model so the log says "pinned"
-        entry = _make_entry("pinned-model", engine=MagicMock(), is_pinned=True)
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("pinned-model", engine=engine, is_pinned=True)
         enforcer._engine_pool._entries = {"pinned-model": entry}
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = _cycling([
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # Re-check in loop
+                11 * 1024**3,  # Initial check, over ceiling but not emergency
+                11 * 1024**3,  # Re-check in loop
             ])
             await enforcer._check_and_enforce()
         enforcer._engine_pool._unload_engine.assert_not_called()
+        engine.abort_all_requests.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_evicts_multiple_models(self, enforcer):
@@ -1419,6 +1422,26 @@ class TestUnresolvableSchedulerWarning:
             f"got {len(warnings)}"
         )
 
+    def test_diffusion_engine_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """Diffusion VLMs intentionally bypass AsyncEngineCore schedulers."""
+        engine = MagicMock(spec=["is_diffusion_model"])
+        engine.is_diffusion_model = True
+        entry = _make_entry("model-diffusion", engine=engine)
+        enforcer._engine_pool._entries = {"model-diffusion": entry}
+
+        with caplog.at_level(
+            "WARNING", logger="omlx.process_memory_enforcer"
+        ):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
     def test_unresolvable_does_not_block_other_engines(self, enforcer):
         """If engine A is unresolvable but engine B has a real scheduler,
         B must still receive the propagation."""
@@ -1471,6 +1494,25 @@ class TestUnresolvableSchedulerWarning:
         assert warnings == [], (
             f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
         )
+
+    def test_no_warning_for_stopped_engine_during_unload(self, enforcer, caplog):
+        """During EnginePool unload there is a short window where the engine
+        object still sits on the entry but its scheduler has already been
+        released. That is teardown, not a broken wrapper chain.
+        """
+        engine = MagicMock(spec=["_loaded"])
+        engine._loaded = False
+        entry = _make_entry("model-stopped", engine=engine)
+        enforcer._engine_pool._entries = {"model-stopped": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
 
     def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
         """DFlash normal mode has no scheduler until fallback is started."""
@@ -1796,13 +1838,13 @@ class TestTwoWatermarkPressureLevels:
         assert scheduler._prefill_abort_margin == 0.95
 
     @pytest.mark.asyncio
-    async def test_hard_aborts_in_flight_when_all_pinned(self, enforcer_2wm, pool):
+    async def test_hard_below_ceiling_does_not_abort_all_pinned(
+        self, enforcer_2wm, pool
+    ):
         engine = MagicMock()
         engine.abort_all_requests = AsyncMock(return_value=3)
         entry = _make_entry("pinned", engine=engine, is_pinned=True)
         pool._entries = {"pinned": entry}
-        pool._find_lru_victim.return_value = "pinned"  # single non-pinned would route through abort_all; here all pinned route through loading abort. We test the single-non-pinned hard branch separately below.
-
         # Single pinned model means find_lru_victim returns None (pinned not victim).
         pool._find_lru_victim.return_value = None
 
@@ -1815,6 +1857,56 @@ class TestTwoWatermarkPressureLevels:
         # No in-progress loads to abort, all pinned → enforcer just logs warning,
         # doesn't crash.
         assert enforcer_2wm._pressure_level == "hard"
+        engine.abort_all_requests.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emergency_margin_aborts_all_pinned_requests(
+        self, enforcer_2wm, pool
+    ):
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("pinned", engine=engine, is_pinned=True)
+        pool._entries = {"pinned": entry}
+        pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 103 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        pool._unload_engine.assert_not_awaited()
+        assert entry.engine is engine
+
+    @pytest.mark.asyncio
+    async def test_emergency_consecutive_over_ceiling_polls_abort_all_pinned(
+        self, enforcer_2wm, pool
+    ):
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=2)
+        entry = _make_entry("pinned", engine=engine, is_pinned=True)
+        pool._entries = {"pinned": entry}
+        pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 101 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        engine.abort_all_requests.assert_not_awaited()
+        engine.abort_all_requests.reset_mock()
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
+             patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
+            mock_mx.get_active_memory.return_value = 60 * 1024**3
+            gpf.return_value = 101 * 1024**3
+            await enforcer_2wm._check_and_enforce()
+
+        engine.abort_all_requests.assert_awaited_once()
+        pool._unload_engine.assert_not_awaited()
+        assert entry.engine is engine
 
     @pytest.mark.asyncio
     async def test_soft_does_not_abort_loading(self, enforcer_2wm, pool):
@@ -1856,3 +1948,49 @@ class TestTwoWatermarkPressureLevels:
         assert status["current_bytes"] == 88 * 1024**3
         # Utilization computed against the max value
         assert abs(status["utilization"] - 0.88) < 0.01
+
+
+class TestDFlashGuardPropagation:
+    """The enforcer must reach DFlash's primary-mode guard target.
+
+    DFlash bypasses the scheduler: in primary mode it exposes a lightweight
+    ``_prefill_guard``; in fallback mode its ``scheduler`` property resolves
+    the fallback engine's real scheduler (covered by test_dflash_engine.py).
+    Without the ``_prefill_guard`` arm in ``_resolve_scheduler`` the watermarks
+    never reach a primary-mode DFlash and the prefill guard stays dead.
+    """
+
+    def test_resolves_primary_guard(self, enforcer):
+        guard = MagicMock(spec=[])
+        engine = MagicMock(spec=["_prefill_guard"])
+        engine._prefill_guard = guard
+        entry = _make_entry("dflash", engine=engine)
+        enforcer._engine_pool._entries = {"dflash": entry}
+
+        assert enforcer._resolve_scheduler(entry) is guard
+
+        enforcer._propagate_memory_limit()
+        assert guard._memory_hard_limit_bytes == 10 * 1024**3
+        assert guard._prefill_memory_guard == enforcer._prefill_memory_guard
+
+    def test_dflash_primary_does_not_warn(self, enforcer, caplog):
+        engine = MagicMock(spec=["_prefill_guard"])
+        engine._prefill_guard = MagicMock(spec=[])
+        entry = _make_entry("dflash", engine=engine)
+        enforcer._engine_pool._entries = {"dflash": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        assert not [
+            r for r in caplog.records if "could not resolve scheduler" in r.message
+        ]
+
+    def test_non_dflash_resolution_unchanged(self, enforcer):
+        """A standard engine with a direct ``.scheduler`` still resolves via the
+        existing chain — the DFlash arm must not interfere."""
+        scheduler = MagicMock(spec=[])
+        engine = MagicMock(spec=["scheduler"])
+        engine.scheduler = scheduler
+        entry = _make_entry("model-a", engine=engine)
+        assert enforcer._resolve_scheduler(entry) is scheduler

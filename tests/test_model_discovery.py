@@ -246,6 +246,24 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_diffusion_gemma_as_vlm(self, tmp_path):
+        """DiffusionGemma is served by mlx-vlm even without vision_config."""
+        config = {
+            "model_type": "diffusion_gemma",
+            "canvas_length": 256,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
+        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
+        config = {
+            "model_type": "cohere2_moe",
+            "architectures": ["Cohere2MoeForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_vlm_by_architecture(self, tmp_path):
         """Test detection of VLM model by architecture name."""
         config = {
@@ -314,14 +332,14 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
-    def test_detect_text_only_gemma4_unified_as_llm(self, tmp_path):
-        """Gemma4 unified without vision_config should not be forced to VLM."""
+    def test_detect_gemma4_unified_without_vision_config_as_vlm(self, tmp_path):
+        """Gemma4 unified is always VLM even without vision_config."""
         config = {
             "model_type": "gemma4_unified",
             "architectures": ["Gemma4UnifiedForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "llm"
+        assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_vlm_qwen3_5_moe(self, tmp_path):
         """Test detection of Qwen3.5 MoE as VLM."""

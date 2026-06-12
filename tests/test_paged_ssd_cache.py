@@ -2083,6 +2083,36 @@ class TestPreloadMatchedBlocks:
 
         manager2.close()
 
+    def test_clean_promoted_block_eviction_skips_ssd_write(self, tmp_path, mx):
+        """Blocks loaded from SSD are clean and should not be re-written."""
+        entry_size = 2 * 2 * 1 * 4 * 64 * 64 * 4
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+            hot_cache_max_bytes=512 * 1024**2,
+        )
+        manager2, hashes = self._save_test_blocks(
+            manager,
+            mx,
+            count=2,
+            hot_cache_max_bytes=entry_size + 1024,
+        )
+
+        try:
+            assert manager2.load_block(hashes[0]) is not None
+            first_entry = manager2._hot_cache_get(hashes[0])
+            assert first_entry is not None
+            assert first_entry["dirty"] is False
+
+            with patch.object(manager2, "_enqueue_ssd_write") as enqueue_write:
+                assert manager2.load_block(hashes[1]) is not None
+                enqueue_write.assert_not_called()
+
+            assert manager2._hot_cache_get(hashes[0]) is None
+            assert manager2._hot_cache_get(hashes[1]) is not None
+        finally:
+            manager2.close()
+
     def test_preload_partial_failure(self, tmp_path, mx):
         """If one block file is missing, others still load."""
         manager = PagedSSDCacheManager(
@@ -2442,7 +2472,7 @@ class TestComputeMaxPendingWrites:
                 block_size_tokens=2048,
                 kv_bytes_per_token=200_000,
             )
-        assert cap == 24
+        assert cap == 32
 
     def test_hard_budget_bounds_soft_floor(self):
         """The soft floor must not force the pending pool above 30%
@@ -2783,11 +2813,11 @@ class TestInlineLRUUnlinks:
             layer_cache_types=["KVCache"] * num_layers,
         )
 
-    def test_save_waits_on_full_queue_before_drop(self, tmp_path, mx):
+    def test_save_waits_on_full_queue_before_inline_fallback(self, tmp_path, mx):
         """A full queue must not short-circuit before tensor extraction.
 
         The bounded wait gives the writer a chance to drain transient bursts;
-        only sustained saturation should drop the block.
+        sustained saturation writes the block inline.
         """
         mgr = PagedSSDCacheManager(
             cache_dir=tmp_path / "full_queue_wait",
@@ -2805,10 +2835,16 @@ class TestInlineLRUUnlinks:
             mgr._write_queue.full = lambda: True  # type: ignore[method-assign]
             mgr._write_queue.put = fake_put  # type: ignore[method-assign]
 
-            assert self._save_block(mgr, mx, b"full_queue_wait") is False
+            block_hash = b"full_queue_wait"
+            assert self._save_block(mgr, mx, block_hash) is True
 
             assert calls == [1.0]
-            assert mgr.get_stats().ssd_write_drops == 1
+            stats = mgr.get_stats()
+            assert stats.ssd_write_drops == 0
+            assert stats.ssd_inline_write_fallbacks == 1
+            assert stats.saves == 1
+            assert stats.saves_persisted == 1
+            assert mgr.load_block(block_hash) is not None
         finally:
             mgr._write_queue.put = original_put  # type: ignore[method-assign]
             mgr._write_queue.full = original_full  # type: ignore[method-assign]
@@ -3027,3 +3063,382 @@ class TestSharedHotCacheBudgetClearAllOwners:
 
     def test_empty_budget_is_noop(self):
         assert SharedHotCacheBudget(1 << 20).clear_all_owners() == 0
+
+
+class TestLayerSignatureSweep:
+    """Tests for ``adopt_layer_signature_if_unset`` /
+    ``invalidate_stale_layer_signature``.
+
+    The bug: blocks saved before a cache-config change (e.g., TurboQuant
+    toggle) carry stale ``layer_cache_types`` metadata, and the
+    per-block compatibility check in ``reconstruct_cache`` uses block 0
+    as the reference — so a stale block 0 defines the reference forever
+    and every newer correctly-typed block trips the mismatch.
+    """
+
+    def _make_meta(
+        self,
+        *,
+        block_hash: bytes,
+        model_name: str,
+        layer_cache_types: list[str] | None,
+        num_layers: int = 40,
+        block_size: int = 2048,
+    ) -> PagedSSDBlockMetadata:
+        now = time.time()
+        return PagedSSDBlockMetadata(
+            block_hash=block_hash,
+            file_path=Path("/tmp/never-touched.safetensors"),
+            file_size=1024,
+            token_count=block_size,
+            created_at=now,
+            last_access=now,
+            num_layers=num_layers,
+            model_name=model_name,
+            block_size=block_size,
+            layer_cache_types=layer_cache_types,
+        )
+
+    def _make_manager(
+        self,
+        tmp_path: Path,
+        *,
+        model_name: str = "test-model",
+        expected_layer_cache_types: list[str] | None = None,
+    ) -> PagedSSDCacheManager:
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1 << 30,
+            expected_model_name=model_name,
+            expected_num_layers=40,
+            expected_block_size=2048,
+            expected_layer_cache_types=expected_layer_cache_types,
+        )
+
+    def test_adopt_sets_signature_first_call(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path)
+        assert mgr._expected_layer_cache_types is None
+
+        sig = ["ArraysCache", "ArraysCache", "ArraysCache", "TurboQuantKVCache"]
+        adopted = mgr.adopt_layer_signature_if_unset(sig)
+
+        assert adopted is True
+        assert mgr._expected_layer_cache_types == sig
+
+    def test_adopt_noop_when_already_set(self, tmp_path: Path):
+        original = ["ArraysCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=original)
+
+        adopted = mgr.adopt_layer_signature_if_unset(
+            ["ArraysCache", "TurboQuantKVCache"]
+        )
+
+        assert adopted is False
+        assert mgr._expected_layer_cache_types == original
+
+    def test_adopt_noop_when_empty(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path)
+        assert mgr.adopt_layer_signature_if_unset(None) is False
+        assert mgr.adopt_layer_signature_if_unset([]) is False
+        assert mgr._expected_layer_cache_types is None
+
+    def test_sweep_drops_blocks_with_stale_signature(self, tmp_path: Path):
+        stock = ["ArraysCache", "ArraysCache", "ArraysCache", "KVCache"]
+        turbo = [
+            "ArraysCache",
+            "ArraysCache",
+            "ArraysCache",
+            "TurboQuantKVCache",
+        ]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=turbo)
+
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"01" * 10,
+                model_name="test-model",
+                layer_cache_types=stock,
+                num_layers=4,
+            )
+        )
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"02" * 10,
+                model_name="test-model",
+                layer_cache_types=turbo,
+                num_layers=4,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 1
+        assert mgr._index.get(b"01" * 10) is None
+        assert mgr._index.get(b"02" * 10) is not None
+
+    def test_sweep_canonicalizes_sized_arrays_cache(self, tmp_path: Path):
+        # SizedArraysCache and ArraysCache must compare equal — both are
+        # the same on-disk format. The sweep must NOT drop blocks just
+        # because one side uses the wrapper class name.
+        a = ["ArraysCache", "ArraysCache", "KVCache"]
+        b = ["SizedArraysCache", "SizedArraysCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=a)
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"aa" * 10,
+                model_name="test-model",
+                layer_cache_types=b,
+                num_layers=3,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 0
+        assert mgr._index.get(b"aa" * 10) is not None
+
+    def test_sweep_canonicalizes_prefill_ready_rotating_cache(
+        self, tmp_path: Path
+    ):
+        expected = ["KVCache", "RotatingKVCache", "KVCache"]
+        stored = ["KVCache", "PrefillReadyRotatingKVCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"ac" * 10,
+                model_name="test-model",
+                layer_cache_types=stored,
+                num_layers=3,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 0
+        assert mgr._index.get(b"ac" * 10) is not None
+
+    def test_startup_compat_canonicalizes_sized_arrays_cache(self, tmp_path: Path):
+        expected = ["ArraysCache", "ArraysCache", "KVCache"]
+        stored = ["SizedArraysCache", "SizedArraysCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        meta = self._make_meta(
+            block_hash=b"ab" * 10,
+            model_name="test-model",
+            layer_cache_types=stored,
+            num_layers=40,
+        )
+        meta.cache_signature = _cache_compat_signature(
+            model_name="test-model",
+            num_layers=40,
+            block_size=2048,
+            layer_cache_types=stored,
+        )
+
+        assert mgr._is_compatible_block(meta) is True
+
+    def test_startup_compat_canonicalizes_prefill_ready_rotating_cache(
+        self, tmp_path: Path
+    ):
+        expected = ["KVCache", "RotatingKVCache", "KVCache"]
+        stored = ["KVCache", "PrefillReadyRotatingKVCache", "KVCache"]
+        mgr = self._make_manager(tmp_path, expected_layer_cache_types=expected)
+        meta = self._make_meta(
+            block_hash=b"ad" * 10,
+            model_name="test-model",
+            layer_cache_types=stored,
+            num_layers=40,
+        )
+        meta.cache_signature = _cache_compat_signature(
+            model_name="test-model",
+            num_layers=40,
+            block_size=2048,
+            layer_cache_types=stored,
+        )
+
+        assert mgr._is_compatible_block(meta) is True
+
+    def test_set_expected_layer_signature_replaces_existing(self, tmp_path: Path):
+        mgr = self._make_manager(
+            tmp_path,
+            expected_layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(["ArraysCache", "TurboQuantKVCache"])
+
+        assert changed is True
+        assert mgr._expected_layer_cache_types == [
+            "ArraysCache",
+            "TurboQuantKVCache",
+        ]
+        assert mgr._signature_sweep_completed is False
+
+    def test_set_expected_layer_signature_noop_for_canonical_match(
+        self, tmp_path: Path
+    ):
+        mgr = self._make_manager(
+            tmp_path,
+            expected_layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(["SizedArraysCache", "KVCache"])
+
+        assert changed is False
+        assert mgr._expected_layer_cache_types == ["SizedArraysCache", "KVCache"]
+        assert mgr._signature_sweep_completed is True
+
+    def test_set_expected_layer_signature_noop_for_prefill_ready_rotating_match(
+        self, tmp_path: Path
+    ):
+        mgr = self._make_manager(
+            tmp_path,
+            expected_layer_cache_types=["KVCache", "RotatingKVCache"],
+        )
+        mgr._signature_sweep_completed = True
+
+        changed = mgr.set_expected_layer_signature(
+            ["KVCache", "PrefillReadyRotatingKVCache"]
+        )
+
+        assert changed is False
+        assert mgr._expected_layer_cache_types == [
+            "KVCache",
+            "PrefillReadyRotatingKVCache",
+        ]
+        assert mgr._signature_sweep_completed is True
+
+    def test_sweep_leaves_other_models_alone(self, tmp_path: Path):
+        turbo = ["ArraysCache", "TurboQuantKVCache"]
+        stock = ["ArraysCache", "KVCache"]
+        mgr = self._make_manager(
+            tmp_path, model_name="model-A", expected_layer_cache_types=turbo
+        )
+
+        # Other-model block with the "wrong" signature for THIS manager
+        # but perfectly valid for model-B.
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"bb" * 10,
+                model_name="model-B",
+                layer_cache_types=stock,
+                num_layers=2,
+            )
+        )
+        # Same-model stale block.
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"cc" * 10,
+                model_name="model-A",
+                layer_cache_types=stock,
+                num_layers=2,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 1
+        assert mgr._index.get(b"bb" * 10) is not None, (
+            "model-B block must not be touched by model-A's sweep"
+        )
+        assert mgr._index.get(b"cc" * 10) is None
+
+    def test_sweep_skips_legacy_unnamed_blocks(self, tmp_path: Path):
+        turbo = ["ArraysCache", "TurboQuantKVCache"]
+        mgr = self._make_manager(
+            tmp_path, model_name="model-A", expected_layer_cache_types=turbo
+        )
+        # No model_name — cannot safely attribute.
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"dd" * 10,
+                model_name="",
+                layer_cache_types=["ArraysCache", "KVCache"],
+                num_layers=2,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 0
+        assert mgr._index.get(b"dd" * 10) is not None
+
+    def test_sweep_skips_blocks_without_layer_metadata(self, tmp_path: Path):
+        turbo = ["ArraysCache", "TurboQuantKVCache"]
+        mgr = self._make_manager(
+            tmp_path, model_name="model-A", expected_layer_cache_types=turbo
+        )
+        # Pre-signature block: no layer_cache_types recorded.
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"ee" * 10,
+                model_name="model-A",
+                layer_cache_types=None,
+                num_layers=2,
+            )
+        )
+
+        dropped = mgr.invalidate_stale_layer_signature()
+
+        assert dropped == 0
+        assert mgr._index.get(b"ee" * 10) is not None
+
+    def test_sweep_idempotent(self, tmp_path: Path):
+        turbo = ["ArraysCache", "TurboQuantKVCache"]
+        mgr = self._make_manager(
+            tmp_path, model_name="model-A", expected_layer_cache_types=turbo
+        )
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"ff" * 10,
+                model_name="model-A",
+                layer_cache_types=["ArraysCache", "KVCache"],
+                num_layers=2,
+            )
+        )
+
+        assert mgr.invalidate_stale_layer_signature() == 1
+        # Subsequent calls do nothing — flag is set.
+        assert mgr.invalidate_stale_layer_signature() == 0
+
+    def test_sweep_noop_without_signature(self, tmp_path: Path):
+        mgr = self._make_manager(tmp_path)  # signature unset
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"99" * 10,
+                model_name="test-model",
+                layer_cache_types=["ArraysCache", "KVCache"],
+                num_layers=2,
+            )
+        )
+        assert mgr.invalidate_stale_layer_signature() == 0
+        assert mgr._index.get(b"99" * 10) is not None
+
+    def test_sweep_noop_without_model_name(self, tmp_path: Path):
+        # Without an expected_model_name we cannot scope safely.
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1 << 30,
+            expected_model_name="",  # explicit unset
+            expected_layer_cache_types=["ArraysCache", "KVCache"],
+        )
+        mgr._index.add(
+            self._make_meta(
+                block_hash=b"77" * 10,
+                model_name="some-model",
+                layer_cache_types=["ArraysCache", "TurboQuantKVCache"],
+                num_layers=2,
+            )
+        )
+        assert mgr.invalidate_stale_layer_signature() == 0
+        assert mgr._index.get(b"77" * 10) is not None
+
+    def test_adopt_resets_sweep_flag(self, tmp_path: Path):
+        # If a previous signature got adopted-and-swept, but somehow a new
+        # signature gets adopted later (currently the manager treats this
+        # as a no-op; we still want the flag to reset if it ever does).
+        mgr = self._make_manager(tmp_path)
+        mgr.adopt_layer_signature_if_unset(["ArraysCache", "KVCache"])
+        mgr._signature_sweep_completed = True
+        # Same call signature — already set, returns False, flag stays.
+        assert mgr.adopt_layer_signature_if_unset(["ArraysCache", "KVCache"]) is False
+        assert mgr._signature_sweep_completed is True
