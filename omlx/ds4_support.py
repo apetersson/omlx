@@ -983,11 +983,13 @@ def copy_ds4_support_files(
         copied.append(dst)
 
     manifest_src = source / DS4_SUPPORT_MANIFEST
+    manifest_dst = destination / DS4_SUPPORT_MANIFEST
     if manifest_src.is_file():
-        manifest_dst = destination / DS4_SUPPORT_MANIFEST
         if overwrite or not manifest_dst.exists():
             shutil.copy2(manifest_src, manifest_dst)
             copied.append(manifest_dst)
+    elif overwrite and manifest_dst.exists():
+        manifest_dst.unlink()
 
     return DS4SupportCopyResult(
         source_dir=source,

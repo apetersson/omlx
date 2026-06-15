@@ -35,6 +35,7 @@ def test_build_script_embeds_and_signs_ds4_support_files():
     assert "OMLX_DS4_BUNDLE_SOURCE" in build_script
     assert "DS4Support" in build_script
     assert "copy_ds4_support_files" in build_script
+    assert "${OMLX_REQUIRE_DS4_BUNDLE:-1}" in build_script
     assert '_sign_embedded_mach_o_files "$RESOURCES_DIR/DS4Support"' in build_script
 
 

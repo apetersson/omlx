@@ -44,7 +44,7 @@ To prepare the app-bundle support tree, run:
 
 ```bash
 scripts/build-ds4-support.sh
-OMLX_REQUIRE_DS4_BUNDLE=1 apps/omlx-mac/Scripts/build.sh release
+apps/omlx-mac/Scripts/build.sh release
 ```
 
 The helper shallow-fetches the pinned DS4 commit, runs the manifest
@@ -52,9 +52,9 @@ The helper shallow-fetches the pinned DS4 commit, runs the manifest
 `packaging/DS4Support/`. The bundle step copies that same validated tree into
 `Contents/Resources/DS4Support`, so release and auto-update artifacts carry the
 prebuilt support files and end users do not need Xcode or a runtime network
-fetch. `OMLX_REQUIRE_DS4_BUNDLE=1` makes release builds fail instead of silently
-shipping without DS4 support; if no staged tree exists, `build.sh` invokes the
-helper automatically.
+fetch. App-bundle builds require DS4 support by default; if no staged tree
+exists, `build.sh` invokes the helper automatically. Local/dev bundles can opt
+out with `OMLX_REQUIRE_DS4_BUNDLE=0`.
 
 Custom maintainers can override the source pin without adding binaries to git:
 

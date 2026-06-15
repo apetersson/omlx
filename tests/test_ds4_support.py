@@ -802,6 +802,28 @@ class TestDS4SupportCopy:
         assert (destination / "metal" / "fork_attention.metal").is_file()
         assert not (destination / "metal" / "flash_attn.metal").exists()
 
+    def test_copy_overwrite_removes_stale_manifest_when_source_has_none(self, tmp_path):
+        """Manifest-less prebuilt support should not inherit old Metal metadata."""
+        source = tmp_path / "resources" / "ds4"
+        destination = tmp_path / "support" / "ds4"
+        _write_complete_support_tree(source, metal_files=("fork_attention.metal",))
+        _write_complete_support_tree(destination)
+        (destination / "manifest.json").write_text(
+            json.dumps({"metal_files": ["metal/flash_attn.metal"]})
+        )
+
+        copy_ds4_support_files(source, destination, overwrite=True)
+        status = inspect_ds4_support(
+            DS4Settings(support_dir=str(destination)),
+            base_path=tmp_path,
+            system="Darwin",
+            machine="arm64",
+        )
+
+        assert not (destination / "manifest.json").exists()
+        assert status.ready is True
+        assert status.missing_files == ()
+
     def test_copy_rejects_incomplete_source_tree(self, tmp_path):
         """Missing bundled files fail clearly; no fetch/build is attempted."""
         source = tmp_path / "resources" / "ds4"

@@ -47,7 +47,7 @@
 #                                         (release builds set this per macOS target)
 #   OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4   # prebuilt DS4 support tree to embed
 #                                         (ds4-server, LICENSE, README.md, metal/)
-#   OMLX_REQUIRE_DS4_BUNDLE=1             # build/fail if no DS4 support source is found
+#   OMLX_REQUIRE_DS4_BUNDLE=0             # skip building DS4 support for local/dev bundles
 #   OMLX_NEXT_OUT=/path/to/output_dir     # final stage location
 #   PYTHON_BIN=/path/to/python3           # python used for venvstacks driver
 #                                         (default: PATH lookup of python3)
@@ -377,7 +377,7 @@ if [ -n "$DS4_SUPPORT_SOURCE" ]; then
     [ -d "$DS4_SUPPORT_SOURCE" ] || die "OMLX_DS4_BUNDLE_SOURCE not found: $DS4_SUPPORT_SOURCE"
 elif [ -f "$PACKAGING_DIR/DS4Support/ds4-server" ]; then
     DS4_SUPPORT_SOURCE="$PACKAGING_DIR/DS4Support"
-elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-0}" = "1" ]; then
+elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-1}" = "1" ]; then
     log "Building DS4 support tree from pinned source for bundle…"
     "$REPO_ROOT/scripts/build-ds4-support.sh" --out "$PACKAGING_DIR/DS4Support" \
         || die "failed to build DS4 support tree"
@@ -400,7 +400,7 @@ PY
         die "failed to copy DS4 support files from $DS4_SUPPORT_SOURCE"
     fi
     ok "  + DS4Support"
-elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-0}" = "1" ]; then
+elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-1}" = "1" ]; then
     die "No DS4 support source found; set OMLX_DS4_BUNDLE_SOURCE or provide packaging/DS4Support."
 else
     warn "No DS4 support source found; bundle will rely on an existing user support directory."
