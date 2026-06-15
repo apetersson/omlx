@@ -140,31 +140,6 @@ def serve_command(args):
     # Ensure required directories exist
     settings.ensure_directories()
 
-    # In bundled app installs, seed the user support directory with the
-    # DS4 runtime files shipped in Contents/Resources/DS4Support.  Failures are
-    # logged but do not block non-DS4 server usage; DS4 launch validation still
-    # reports a concrete missing-file error if support remains unavailable.
-    try:
-        from .ds4_support import DS4SupportError, install_bundled_ds4_support_files
-
-        ds4_copy = None
-        if ds4_settings := getattr(settings, "ds4", None):
-            ds4_copy = install_bundled_ds4_support_files(
-                ds4_settings,
-                base_path=settings.base_path,
-            )
-        if ds4_copy is not None and ds4_copy.copied_files:
-            logging.getLogger("omlx.ds4_support").info(
-                "Installed bundled DS4 support files from %s to %s",
-                ds4_copy.source_dir,
-                ds4_copy.destination_dir,
-            )
-    except (DS4SupportError, OSError) as exc:
-        logging.getLogger("omlx.ds4_support").warning(
-            "Bundled DS4 support files are unavailable: %s",
-            exc,
-        )
-
     # Apply HuggingFace endpoint if configured
     if settings.huggingface.endpoint:
         os.environ["HF_ENDPOINT"] = settings.huggingface.endpoint
@@ -198,6 +173,12 @@ def serve_command(args):
         for error in errors:
             print(f"Configuration error: {error}")
         sys.exit(1)
+
+    # In app installs, seed from Contents/Resources/DS4Support.  Source-clone
+    # installs can build the same support tree from the pinned manifest commit.
+    # Failures are logged but do not block non-DS4 server usage; DS4 launch
+    # validation still reports a concrete missing-file/build-prerequisite error.
+    seed_ds4_support(settings)
 
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
@@ -781,6 +762,90 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def seed_ds4_support(settings) -> None:
+    """Seed default DS4 support files from bundle or pinned source."""
+    import logging
+
+    from .ds4_support import (
+        DS4SupportError,
+        build_ds4_support_from_source,
+        inspect_ds4_support,
+        install_bundled_ds4_support_files,
+    )
+
+    logger = logging.getLogger("omlx.ds4_support")
+    ds4_settings = getattr(settings, "ds4", None)
+    if ds4_settings is None:
+        return
+
+    try:
+        ds4_copy = install_bundled_ds4_support_files(
+            ds4_settings,
+            base_path=settings.base_path,
+        )
+        if ds4_copy is not None and ds4_copy.copied_files:
+            logger.info(
+                "Installed bundled DS4 support files from %s to %s",
+                ds4_copy.source_dir,
+                ds4_copy.destination_dir,
+            )
+    except (DS4SupportError, OSError) as exc:
+        logger.warning("Bundled DS4 support files are unavailable: %s", exc)
+
+    status = inspect_ds4_support(ds4_settings, base_path=settings.base_path)
+    if (
+        status.ready
+        or status.unsupported_platform
+        or ds4_settings.support_dir is not None
+    ):
+        return
+
+    try:
+        build = build_ds4_support_from_source(
+            ds4_settings,
+            base_path=settings.base_path,
+        )
+        logger.info(
+            "Built DS4 support files from %s to %s",
+            build.source_dir,
+            build.destination_dir,
+        )
+    except (DS4SupportError, OSError) as exc:
+        logger.warning("DS4 support auto-build is unavailable: %s", exc)
+
+
+def ds4_command(args) -> int:
+    """Dispatch 'omlx ds4 <target>' support-management commands."""
+    target = getattr(args, "target", None)
+    if target != "install":
+        print("Unknown ds4 target. Available: install", file=sys.stderr)
+        return 1
+
+    from .ds4_support import DS4SupportError, build_ds4_support_from_source
+    from .settings import init_settings
+
+    settings = init_settings(base_path=args.base_path)
+    if args.support_dir:
+        settings.ds4.support_dir = args.support_dir
+
+    try:
+        result = build_ds4_support_from_source(
+            settings.ds4,
+            base_path=settings.base_path,
+            source=args.source,
+            commit=args.commit,
+            skip_build=args.skip_build,
+            overwrite=True,
+        )
+    except DS4SupportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"DS4 support installed at {result.destination_dir}")
+    print(f"Source: {result.source_dir}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -821,6 +886,53 @@ Examples:
                 action="store_true",
                 help="Return after sending the request without waiting for server health",
             )
+
+    ds4_parser = subparsers.add_parser(
+        "ds4",
+        help="Manage DS4/GGUF backend support files",
+        description="Build or inspect DS4/GGUF backend support files.",
+    )
+    ds4_subparsers = ds4_parser.add_subparsers(dest="target", help="DS4 commands")
+    ds4_install_parser = ds4_subparsers.add_parser(
+        "install",
+        help="Build ds4-server from the pinned source commit",
+        description=(
+            "Build ds4-server from the pinned manifest source commit and install "
+            "the validated support tree into the configured DS4 support directory."
+        ),
+    )
+    ds4_install_parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Custom ds4 source checkout or git URL (default: manifest source_repo)",
+    )
+    ds4_install_parser.add_argument(
+        "--commit",
+        type=str,
+        default=None,
+        help="Custom ds4 source commit (default: manifest source_commit)",
+    )
+    ds4_install_parser.add_argument(
+        "--support-dir",
+        type=str,
+        default=None,
+        help=(
+            "Destination support directory (default: configured ds4.support_dir "
+            "or ~/.omlx/support/ds4)"
+        ),
+    )
+    ds4_install_parser.add_argument(
+        "--base-path",
+        type=str,
+        default=None,
+        help="Base directory for oMLX data (default: ~/.omlx)",
+    )
+    ds4_install_parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Validate/copy an already-built ds4-server from --source",
+    )
 
     # Serve command (multi-model)
     serve_parser = subparsers.add_parser(
@@ -1103,6 +1215,8 @@ Example directory structure:
             parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
         if args.command == "serve":
             serve_command(args)
+        elif args.command == "ds4":
+            sys.exit(ds4_command(args))
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))
         elif args.command == "diagnose":

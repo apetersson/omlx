@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Setuptools hooks for platform-tagged wheels.
 
-The oMLX package vendors a tiny macOS arm64 DS4 executable.  Keep the Python
-code pure, but mark built wheels as platform-specific so installers never treat
-that Mach-O binary as portable ``py3-none-any`` data.
+Release builds may stage a macOS arm64 DS4 support tree into the wheel.  Keep
+the Python/ABI tags generic, but mark built wheels as platform-specific so
+installers never treat staged native files as portable ``py3-none-any`` data.
 """
 
 from setuptools import setup

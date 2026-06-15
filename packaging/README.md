@@ -36,27 +36,42 @@ apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
 ```
 
-DS4/GGUF backend releases include a vendored macOS arm64 support tree under
-`omlx/vendor/ds4/darwin-arm64` containing `ds4-server`, `LICENSE`, `README.md`,
-`manifest.json`, and `metal/*.metal` files. The app bundle step uses that tree
-by default and copies only the validated runtime files into
-`Contents/Resources/DS4Support`. To override it with a freshly staged local
-build, run:
+DS4/GGUF backend releases are built from the pinned source commit recorded in
+`omlx/vendor/ds4/darwin-arm64/manifest.json`. Git tracks only the manifest plus
+`LICENSE` and `README.md`; the `ds4-server` Mach-O binary and `metal/*.metal`
+runtime files are staged by build jobs and are not present in source archives.
+To prepare the app-bundle support tree, run:
 
 ```bash
-scripts/build-ds4-support.sh --source ../ds4
+scripts/build-ds4-support.sh
 OMLX_REQUIRE_DS4_BUNDLE=1 apps/omlx-mac/Scripts/build.sh release
 ```
 
-The helper writes `packaging/DS4Support/`, which the bundle step picks up before
-the vendored fallback. Alternatively, point the bundle step at another validated
-tree with `OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4-support` (and set
-`OMLX_REQUIRE_DS4_BUNDLE=1` in release jobs). Validation probes
-`ds4-server --help` and rejects stale binaries that lack the current OMLX launch
-flags such as `--ssd-streaming`. On first server start from the app bundle, oMLX
-seeds the user support directory (`~/Library/Application Support/oMLX` /
-`~/.omlx` base path `support/ds4`) from that bundled resource. No DS4 build or
-network fetch happens at runtime.
+The helper shallow-fetches the pinned DS4 commit, runs the manifest
+`build_command`, validates `ds4-server --help`, and writes
+`packaging/DS4Support/`. The bundle step copies that same validated tree into
+`Contents/Resources/DS4Support`, so release and auto-update artifacts carry the
+prebuilt support files and end users do not need Xcode or a runtime network
+fetch. `OMLX_REQUIRE_DS4_BUNDLE=1` makes release builds fail instead of silently
+shipping without DS4 support; if no staged tree exists, `build.sh` invokes the
+helper automatically.
+
+Custom maintainers can override the source pin without adding binaries to git:
+
+```bash
+scripts/build-ds4-support.sh \
+  --source https://github.com/example/ds4.git \
+  --commit <sha>
+OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4-support apps/omlx-mac/Scripts/build.sh release
+```
+
+Homebrew builds DS4 from the formula's pinned `resource "ds4"` during
+`def install` and installs `ds4-server` plus `metal/` into the package support
+directory. Source-clone users can run `omlx ds4 install` to build the same
+support tree into `~/.omlx/support/ds4`; missing `make`/Apple Command Line
+Tools produce a hint to run `xcode-select --install`. Air-gapped or custom
+prebuilt deployments keep using `ds4.support_dir` / `OMLX_DS4_SUPPORT_DIR` and
+`ds4.binary_path` / `OMLX_DS4_BINARY_PATH`.
 
 ## Output
 

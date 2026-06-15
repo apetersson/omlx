@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for DS4 support-file validation and copy helpers."""
 
+import json
 import os
 from pathlib import Path
 
@@ -13,12 +14,14 @@ from omlx.ds4_support import (
     DS4_REQUIRED_CLI_FLAGS,
     DS4_SERVER_BINARY,
     DS4SupportError,
+    build_ds4_support_from_source,
     copy_ds4_support_files,
     ensure_ds4_support,
     find_bundled_ds4_support_dir,
     inspect_ds4_support,
     install_bundled_ds4_support_files,
     is_ds4_supported_platform,
+    load_ds4_support_manifest,
     require_ds4_support,
     required_ds4_support_relative_paths,
 )
@@ -36,11 +39,11 @@ def _write_complete_support_tree(
     if supports_required_flags:
         flag_lines = "\n".join(f"echo '{flag}'" for flag in DS4_REQUIRED_CLI_FLAGS)
         binary.write_text(
-            f"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n{flag_lines}\nfi\n"
+            f'#!/bin/sh\nif [ "$1" = "--help" ]; then\n{flag_lines}\nfi\n'
         )
     else:
         binary.write_text(
-            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\necho stale-ds4\nfi\n"
+            '#!/bin/sh\nif [ "$1" = "--help" ]; then\necho stale-ds4\nfi\n'
         )
     binary.chmod(0o755 if executable else 0o644)
     (root / "LICENSE").write_text("MIT\n")
@@ -49,6 +52,44 @@ def _write_complete_support_tree(
     metal_dir.mkdir()
     for name in DS4_METAL_FILES:
         (metal_dir / name).write_text("// metal\n")
+
+
+def _write_buildable_ds4_source(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "LICENSE").write_text("MIT\n")
+    (root / "README.md").write_text("DS4\n")
+    metal_dir = root / "metal"
+    metal_dir.mkdir()
+    for name in DS4_METAL_FILES:
+        (metal_dir / name).write_text("// metal\n")
+    (root / "Makefile").write_text(
+        "\n".join(
+            [
+                "ds4-server:",
+                "\tprintf '%s\\n' '#!/bin/sh' "
+                '\'if [ "$$1" = "--help" ]; then echo --ssd-streaming; fi\' '
+                "> ds4-server",
+                "\tchmod +x ds4-server",
+                "",
+            ]
+        )
+    )
+
+
+def _write_manifest(path: Path, *, source_repo: str, build_command: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "name": "ds4",
+                "source_repo": source_repo,
+                "source_commit": "local-test",
+                "platform": "darwin-arm64",
+                "binary": "ds4-server",
+                "build_command": build_command,
+                "required_cli_flags": list(DS4_REQUIRED_CLI_FLAGS),
+            }
+        )
+    )
 
 
 class TestDS4SupportInspection:
@@ -139,7 +180,7 @@ class TestDS4SupportInspection:
         override.parent.mkdir()
         flag_lines = "\n".join(f"echo '{flag}'" for flag in DS4_REQUIRED_CLI_FLAGS)
         override.write_text(
-            f"#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n{flag_lines}\nfi\n"
+            f'#!/bin/sh\nif [ "$1" = "--help" ]; then\n{flag_lines}\nfi\n'
         )
         override.chmod(0o755)
         settings = DS4Settings(
@@ -291,6 +332,49 @@ class TestDS4BundledSupport:
         assert status.support_dir == (base_path / "support" / "ds4").resolve()
         assert (status.support_dir / DS4_SERVER_BINARY).is_file()
         assert os.access(status.support_dir / DS4_SERVER_BINARY, os.X_OK)
+
+
+class TestDS4SourceBuild:
+    """Tests for build-from-source DS4 staging."""
+
+    def test_load_manifest_reads_source_pin_without_binary_hash(self, tmp_path):
+        manifest = tmp_path / "manifest.json"
+        _write_manifest(
+            manifest,
+            source_repo="https://example.invalid/ds4.git",
+            build_command="make ds4-server",
+        )
+
+        loaded = load_ds4_support_manifest(manifest)
+
+        assert loaded.source_repo == "https://example.invalid/ds4.git"
+        assert loaded.source_commit == "local-test"
+        assert loaded.binary_sha256 is None
+        assert "--ssd-streaming" in loaded.required_cli_flags
+
+    def test_build_from_local_source_stages_validated_support_tree(self, tmp_path):
+        source = tmp_path / "ds4-source"
+        destination = tmp_path / "support" / "ds4"
+        manifest = tmp_path / "manifest.json"
+        _write_buildable_ds4_source(source)
+        _write_manifest(
+            manifest, source_repo=str(source), build_command="make ds4-server"
+        )
+
+        result = build_ds4_support_from_source(
+            destination_dir=destination,
+            source=source,
+            manifest_path=manifest,
+            validate_environment=False,
+        )
+
+        assert result.destination_dir == destination.resolve()
+        assert (destination / DS4_SERVER_BINARY).is_file()
+        assert os.access(destination / DS4_SERVER_BINARY, os.X_OK)
+        assert (destination / "metal" / "flash_attn.metal").is_file()
+        staged_manifest = json.loads((destination / "manifest.json").read_text())
+        assert staged_manifest["source_repo"] == str(source.resolve())
+        assert staged_manifest["source_path"] == str(source.resolve())
 
 
 class TestDS4SupportCopy:

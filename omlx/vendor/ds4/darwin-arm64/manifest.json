@@ -4,7 +4,6 @@
   "source_commit": "5b95fa1c4f2371013dc6be3745321bdc080d7c61",
   "platform": "darwin-arm64",
   "binary": "ds4-server",
-  "binary_sha256": "2772e1ca2613b30c5a5d34ef9a1902896d0e586615f13872d2a386a117321738",
   "build_command": "make ds4-server",
   "required_cli_flags": ["--ssd-streaming"]
 }

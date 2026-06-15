@@ -783,7 +783,7 @@
   "settings.ds4.logs_to_disk": "Write DS4 logs to disk",
   "settings.ds4.logs_to_disk_hint": "Also persist captured DS4 stdout/stderr to ~/.omlx/logs/ds4-debug/<model>/ds4.log. Disable to keep only in-memory/admin capture and regular oMLX log output.",
   "settings.ds4.support_dir": "Support Files Directory",
-  "settings.ds4.support_dir_hint": "Directory containing ds4-server, README, LICENSE, and metal runtime files.",
+  "settings.ds4.support_dir_hint": "Directory containing ds4-server, README, LICENSE, and metal runtime files. Custom source builds can be installed with omlx ds4 install --source ... --commit ...",
   "settings.ds4.support_dir_placeholder": "Default ~/.omlx/support/ds4",
   "settings.ds4.context_default": "Default Context Tokens",
   "settings.ds4.context_hint": "Blank uses adaptive auto context. Current auto:",

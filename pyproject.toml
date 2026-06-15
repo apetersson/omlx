@@ -194,11 +194,9 @@ include = ["omlx*"]
 [tool.setuptools.package-data]
 "omlx" = [
     "oq_calibration_data.json",
-    "vendor/ds4/darwin-arm64/ds4-server",
     "vendor/ds4/darwin-arm64/LICENSE",
     "vendor/ds4/darwin-arm64/README.md",
     "vendor/ds4/darwin-arm64/manifest.json",
-    "vendor/ds4/darwin-arm64/metal/*.metal",
 ]
 "omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]

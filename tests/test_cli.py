@@ -93,6 +93,20 @@ class TestCLIHelp:
         assert "start" in stdout_lower
         assert "stop" in stdout_lower
         assert "restart" in stdout_lower
+        assert "ds4" in stdout_lower
+
+    def test_ds4_install_help(self):
+        """Test DS4 support install help output."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "ds4", "install", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0
+        assert "--source" in result.stdout
+        assert "--commit" in result.stdout
+        assert "--support-dir" in result.stdout
 
 
 class TestLifecycleCommand:
@@ -534,7 +548,9 @@ class TestLaunchCommandFunction:
 
         args = argparse.Namespace(
             tool="opencode",
-            model="model-a", host=None, port=None,
+            model="model-a",
+            host=None,
+            port=None,
             api_key="test-key",
         )
 
@@ -973,7 +989,6 @@ class TestServeCommandFunctions:
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0
 
-
     def test_serve_binds_multiple_sockets_for_multi_host(self, tmp_path, monkeypatch):
         """Comma-separated server.host should bind one socket per host."""
         import uvicorn
@@ -1035,7 +1050,6 @@ class TestServeCommandFunctions:
         assert events == ["bind", "bind", "init", "run"]
         assert captured["socket_count"] == 2
 
-
     def test_serve_exits_on_empty_bind_hosts(self, tmp_path, monkeypatch, capsys):
         """Empty/whitespace-only host should exit cleanly with an error message."""
         from omlx.cli import serve_command
@@ -1058,7 +1072,6 @@ class TestServeCommandFunctions:
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "no valid bind hosts" in captured.err
-
 
     def test_serve_closes_sockets_on_partial_multi_host_bind_failure(
         self, tmp_path, monkeypatch
@@ -1154,13 +1167,14 @@ class TestServeCommandFunctions:
         serve_command(args)
 
         expected = burst_decode_env("aggressive")
-        assert os.environ.get("OMLX_DECODE_BURST_MAX_STEPS") == expected[
-            "OMLX_DECODE_BURST_MAX_STEPS"
-        ]
-        assert os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S") == expected[
-            "OMLX_DECODE_BURST_BUDGET_SINGLE_S"
-        ]
-
+        assert (
+            os.environ.get("OMLX_DECODE_BURST_MAX_STEPS")
+            == expected["OMLX_DECODE_BURST_MAX_STEPS"]
+        )
+        assert (
+            os.environ.get("OMLX_DECODE_BURST_BUDGET_SINGLE_S")
+            == expected["OMLX_DECODE_BURST_BUDGET_SINGLE_S"]
+        )
 
 
 class TestHasCliOverrides:

@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import os
 import platform
+import json
 import shutil
+import shlex
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +61,72 @@ class DS4SupportError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DS4SupportManifest:
+    """Pinned DS4 source/build metadata shipped with oMLX."""
+
+    name: str
+    source_repo: str
+    source_commit: str
+    platform: str
+    binary: str
+    build_command: str
+    required_cli_flags: tuple[str, ...]
+    binary_sha256: str | None = None
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, object]) -> "DS4SupportManifest":
+        """Build a typed manifest from parsed JSON."""
+        required = (
+            "name",
+            "source_repo",
+            "source_commit",
+            "platform",
+            "binary",
+            "build_command",
+        )
+        missing = [key for key in required if not str(data.get(key) or "").strip()]
+        if missing:
+            raise DS4SupportError(
+                "DS4 support manifest is missing required field(s): "
+                + ", ".join(missing)
+            )
+        flags = data.get("required_cli_flags", ())
+        if not isinstance(flags, list):
+            raise DS4SupportError(
+                "DS4 support manifest required_cli_flags must be a list"
+            )
+        return cls(
+            name=str(data["name"]),
+            source_repo=str(data["source_repo"]),
+            source_commit=str(data["source_commit"]),
+            platform=str(data["platform"]),
+            binary=str(data["binary"]),
+            build_command=str(data["build_command"]),
+            required_cli_flags=tuple(str(flag) for flag in flags),
+            binary_sha256=(
+                str(data["binary_sha256"])
+                if str(data.get("binary_sha256") or "").strip()
+                else None
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Return a JSON-serializable manifest mapping."""
+        data: dict[str, object] = {
+            "name": self.name,
+            "source_repo": self.source_repo,
+            "source_commit": self.source_commit,
+            "platform": self.platform,
+            "binary": self.binary,
+            "build_command": self.build_command,
+            "required_cli_flags": list(self.required_cli_flags),
+        }
+        if self.binary_sha256:
+            data["binary_sha256"] = self.binary_sha256
+        return data
+
+
+@dataclass(frozen=True)
 class DS4SupportStatus:
     """Result of inspecting the configured DS4 support directory."""
 
@@ -100,7 +169,9 @@ class DS4SupportStatus:
             )
         if self.missing_files:
             missing = ", ".join(self.missing_files)
-            problems.append(f"missing DS4 support files under {self.support_dir}: {missing}")
+            problems.append(
+                f"missing DS4 support files under {self.support_dir}: {missing}"
+            )
         if not problems:
             return None
         return "; ".join(problems)
@@ -130,7 +201,9 @@ def is_ds4_supported_platform(
     return system == "darwin" and machine in {"arm64", "aarch64"}
 
 
-def required_ds4_support_relative_paths(*, include_binary: bool = True) -> tuple[str, ...]:
+def required_ds4_support_relative_paths(
+    *, include_binary: bool = True
+) -> tuple[str, ...]:
     """Return required support paths relative to the DS4 support directory."""
     paths: list[str] = []
     if include_binary:
@@ -140,8 +213,111 @@ def required_ds4_support_relative_paths(*, include_binary: bool = True) -> tuple
     return tuple(paths)
 
 
-def _missing_relative_paths(root: Path, relative_paths: Iterable[str]) -> tuple[str, ...]:
+def _missing_relative_paths(
+    root: Path, relative_paths: Iterable[str]
+) -> tuple[str, ...]:
     return tuple(rel for rel in relative_paths if not (root / rel).is_file())
+
+
+def default_ds4_support_manifest_path(*, module_file: str | Path | None = None) -> Path:
+    """Return the in-tree DS4 source pin manifest path."""
+    module_path = Path(module_file or __file__).expanduser().resolve()
+    return module_path.parent / VENDORED_DS4_SUPPORT_RELATIVE_DIR / DS4_SUPPORT_MANIFEST
+
+
+def load_ds4_support_manifest(
+    manifest_path: str | Path | None = None,
+) -> DS4SupportManifest:
+    """Load the pinned DS4 source/build manifest."""
+    path = (
+        Path(manifest_path).expanduser().resolve()
+        if manifest_path is not None
+        else default_ds4_support_manifest_path()
+    )
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError as exc:
+        raise DS4SupportError(f"DS4 support manifest not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise DS4SupportError(
+            f"DS4 support manifest is invalid JSON: {path}: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise DS4SupportError(
+            f"DS4 support manifest must contain a JSON object: {path}"
+        )
+    return DS4SupportManifest.from_mapping(data)
+
+
+def _xcode_select_available() -> bool:
+    try:
+        completed = subprocess.run(
+            ["xcode-select", "-p"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def ds4_build_environment_errors(
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    require_git: bool = True,
+    require_make: bool = True,
+) -> tuple[str, ...]:
+    """Return missing prerequisite messages for building DS4 locally."""
+    errors: list[str] = []
+    if not is_ds4_supported_platform(system, machine):
+        errors.append(
+            "DS4 support can be built only on macOS Apple Silicon "
+            f"(detected {_platform_name(system, machine)})"
+        )
+    if require_git and shutil.which("git") is None:
+        errors.append("missing git")
+    if require_make and shutil.which("make") is None:
+        errors.append("missing make")
+    if (
+        require_make
+        and (system or platform.system()).lower() == "darwin"
+        and not _xcode_select_available()
+    ):
+        errors.append("missing Apple Command Line Tools")
+    return tuple(errors)
+
+
+def ds4_build_environment_hint(errors: Iterable[str]) -> str:
+    """Format an actionable DS4 build-prerequisite hint."""
+    problem_list = ", ".join(errors)
+    hint = (
+        "Install Apple Command Line Tools with `xcode-select --install`, "
+        "then retry. If you already have a prebuilt DS4 tree, set "
+        "OMLX_DS4_SUPPORT_DIR or ds4.support_dir; for a custom binary, set "
+        "OMLX_DS4_BINARY_PATH or ds4.binary_path."
+    )
+    return f"Cannot build DS4 support files: {problem_list}. {hint}"
+
+
+def _raise_if_ds4_build_environment_unavailable(
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    require_git: bool = True,
+    require_make: bool = True,
+) -> None:
+    errors = ds4_build_environment_errors(
+        system=system,
+        machine=machine,
+        require_git=require_git,
+        require_make=require_make,
+    )
+    if errors:
+        raise DS4SupportError(ds4_build_environment_hint(errors))
 
 
 def _inspect_ds4_binary_capabilities(binary_path: Path) -> str | None:
@@ -168,6 +344,214 @@ def _inspect_ds4_binary_capabilities(binary_path: Path) -> str | None:
     return None
 
 
+def _source_is_local_dir(source: str | Path) -> bool:
+    return Path(source).expanduser().is_dir()
+
+
+def _git_head(source_dir: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def _clone_ds4_source(repo: str, commit: str, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    commands = (
+        ["git", "init", str(destination)],
+        ["git", "-C", str(destination), "remote", "add", "origin", repo],
+        ["git", "-C", str(destination), "fetch", "--depth", "1", "origin", commit],
+        ["git", "-C", str(destination), "checkout", "--detach", "FETCH_HEAD"],
+    )
+    for command in commands:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if completed.returncode != 0:
+            output = (completed.stderr or completed.stdout).strip()
+            raise DS4SupportError(
+                "Failed to clone pinned DS4 source "
+                f"{repo}@{commit}: {' '.join(command)}: {output}"
+            )
+    return destination
+
+
+def _run_ds4_build_command(source_dir: Path, build_command: str) -> None:
+    argv = shlex.split(build_command)
+    if not argv:
+        raise DS4SupportError("DS4 support manifest build_command is empty")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=source_dir,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except OSError as exc:
+        raise DS4SupportError(
+            f"Failed to run DS4 build command {build_command!r}: {exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DS4SupportError(
+            f"Timed out while running DS4 build command {build_command!r}"
+        ) from exc
+    if completed.returncode != 0:
+        output = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )
+        raise DS4SupportError(
+            f"DS4 build command failed with status {completed.returncode}: "
+            f"{build_command}\n{output}"
+        )
+
+
+def _write_staged_manifest(
+    destination: Path,
+    manifest: DS4SupportManifest,
+    *,
+    source_repo: str,
+    source_commit: str,
+    source_dir: Path,
+) -> Path:
+    data = manifest.to_mapping()
+    data["source_repo"] = source_repo
+    data["source_commit"] = source_commit
+    if source_repo == str(source_dir):
+        data["source_path"] = str(source_dir)
+    manifest_path = destination / DS4_SUPPORT_MANIFEST
+    manifest_path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    return manifest_path
+
+
+def _build_and_copy_ds4_support(
+    source_dir: Path,
+    destination: Path,
+    manifest: DS4SupportManifest,
+    *,
+    source_repo: str,
+    source_commit: str,
+    skip_build: bool,
+    overwrite: bool,
+) -> DS4SupportCopyResult:
+    if not skip_build:
+        _run_ds4_build_command(source_dir, manifest.build_command)
+    result = copy_ds4_support_files(source_dir, destination, overwrite=overwrite)
+    manifest_path = _write_staged_manifest(
+        result.destination_dir,
+        manifest,
+        source_repo=source_repo,
+        source_commit=source_commit,
+        source_dir=source_dir,
+    )
+    copied = tuple(result.copied_files) + (
+        (manifest_path,) if manifest_path not in result.copied_files else ()
+    )
+    return DS4SupportCopyResult(
+        source_dir=result.source_dir,
+        destination_dir=result.destination_dir,
+        copied_files=copied,
+    )
+
+
+def build_ds4_support_from_source(
+    settings: DS4Settings | None = None,
+    *,
+    base_path: str | Path | None = None,
+    destination_dir: str | Path | None = None,
+    source: str | Path | None = None,
+    commit: str | None = None,
+    manifest_path: str | Path | None = None,
+    work_dir: str | Path | None = None,
+    skip_build: bool = False,
+    overwrite: bool = True,
+    validate_environment: bool = True,
+    system: str | None = None,
+    machine: str | None = None,
+) -> DS4SupportCopyResult:
+    """Build DS4 from a pinned/custom source and stage the support tree."""
+    settings = settings or DS4Settings()
+    base = Path(base_path).expanduser().resolve() if base_path else DEFAULT_BASE_PATH
+    destination = (
+        Path(destination_dir).expanduser().resolve()
+        if destination_dir is not None
+        else settings.get_support_dir(base)
+    )
+    manifest = load_ds4_support_manifest(manifest_path)
+    source_value = str(source) if source is not None else manifest.source_repo
+    source_commit = commit or manifest.source_commit
+    source_is_local = source is not None and _source_is_local_dir(source)
+
+    if validate_environment:
+        _raise_if_ds4_build_environment_unavailable(
+            system=system,
+            machine=machine,
+            require_git=not source_is_local,
+            require_make=not skip_build,
+        )
+
+    if source_is_local:
+        source_dir = Path(source).expanduser().resolve()
+        if commit:
+            current_head = _git_head(source_dir)
+            if current_head and current_head != commit:
+                raise DS4SupportError(
+                    f"Local DS4 source {source_dir} is at {current_head}, "
+                    f"not requested commit {commit}"
+                )
+        return _build_and_copy_ds4_support(
+            source_dir,
+            destination,
+            manifest,
+            source_repo=str(source_dir),
+            source_commit=commit or _git_head(source_dir) or source_commit,
+            skip_build=skip_build,
+            overwrite=overwrite,
+        )
+
+    repo = source_value
+    if work_dir is not None:
+        checkout = Path(work_dir).expanduser().resolve() / "ds4-source"
+        source_dir = _clone_ds4_source(repo, source_commit, checkout)
+        return _build_and_copy_ds4_support(
+            source_dir,
+            destination,
+            manifest,
+            source_repo=repo,
+            source_commit=source_commit,
+            skip_build=skip_build,
+            overwrite=overwrite,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="omlx-ds4-build-") as temp_dir:
+        source_dir = _clone_ds4_source(repo, source_commit, Path(temp_dir) / "ds4")
+        return _build_and_copy_ds4_support(
+            source_dir,
+            destination,
+            manifest,
+            source_repo=repo,
+            source_commit=source_commit,
+            skip_build=skip_build,
+            overwrite=overwrite,
+        )
+
+
 def inspect_ds4_support(
     settings: DS4Settings | None = None,
     *,
@@ -186,7 +570,9 @@ def inspect_ds4_support(
         required_ds4_support_relative_paths(include_binary=not binary_override),
     )
     binary_missing = not binary_path.is_file()
-    binary_not_executable = binary_path.is_file() and not os.access(binary_path, os.X_OK)
+    binary_not_executable = binary_path.is_file() and not os.access(
+        binary_path, os.X_OK
+    )
     platform_name = _platform_name(system, machine)
     unsupported_platform = not is_ds4_supported_platform(system, machine)
     binary_capability_error = None

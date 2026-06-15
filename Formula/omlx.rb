@@ -21,6 +21,11 @@ class Omlx < Formula
       revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
   end
 
+  resource "ds4" do
+    url "https://github.com/antirez/ds4.git",
+      revision: "5b95fa1c4f2371013dc6be3745321bdc080d7c61"
+  end
+
   service do
     run [opt_bin/"omlx", "serve"]
     keep_alive true
@@ -55,6 +60,22 @@ class Omlx < Formula
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
+
+    site_packages = Utils.safe_popen_read(libexec/"bin/python", "-c",
+      "import site; print(site.getsitepackages()[0])").chomp
+    ds4_support = Pathname.new(site_packages)/"omlx/vendor/ds4/darwin-arm64"
+    resource("ds4").stage do
+      system "make", "ds4-server"
+      ds4_support.mkpath
+      rm_rf ds4_support/"metal"
+      (ds4_support/"metal").mkpath
+      cp "ds4-server", ds4_support/"ds4-server"
+      cp Dir["metal/*.metal"], ds4_support/"metal"
+      chmod 0755, ds4_support/"ds4-server"
+
+      help_text = Utils.safe_popen_read(ds4_support/"ds4-server", "--help")
+      odie "ds4-server is missing --ssd-streaming support" unless help_text.include?("--ssd-streaming")
+    end
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end
