@@ -121,9 +121,7 @@ class DS4LaunchConfig:
     @property
     def trace_path(self) -> Path:
         """Trace path for this launch when tracing is enabled."""
-        timestamp = self.trace_timestamp or datetime.now(UTC).strftime(
-            "%Y%m%d-%H%M%S"
-        )
+        timestamp = self.trace_timestamp or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         filename = f"{safe_ds4_fs_name(self.model_id)}-{timestamp}.trace"
         return self.settings.get_trace_dir(self.base_path) / filename
 
@@ -304,7 +302,8 @@ class DS4ManagedProcess:
         if self.is_running:
             return
         self._became_ready = False
-        self.config.support_status()
+        logger.info("[%s] Provisioning DS4 engine support if needed", self._instance_id)
+        await asyncio.to_thread(self.config.support_status)
         port = self.config.resolve_port()
         self.port = port
         self.command = self.config.build_command(port)
@@ -325,7 +324,9 @@ class DS4ManagedProcess:
             message = str(error)
             if "logs=" in message:
                 prefix = message.split("logs=", 1)[0]
-                raise DS4ProcessError(f"{prefix}logs={self.recent_log_text()}") from error
+                raise DS4ProcessError(
+                    f"{prefix}logs={self.recent_log_text()}"
+                ) from error
             raise
         except Exception:
             await self.stop()
@@ -453,7 +454,9 @@ class DS4ManagedProcess:
                 if self.command:
                     handle.write(f"command: {' '.join(self.command)}\n")
         except OSError as exc:
-            logger.warning("Failed to write DS4 log header to %s: %s", self.log_path, exc)
+            logger.warning(
+                "Failed to write DS4 log header to %s: %s", self.log_path, exc
+            )
 
     def _append_log_file_line(self, line: DS4LogLine) -> None:
         if self.log_path is None or not self.config.settings.logs_to_disk:

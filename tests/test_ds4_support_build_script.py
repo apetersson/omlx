@@ -129,3 +129,22 @@ def test_build_ds4_support_artifacts_are_gitignored():
     ignore_text = Path("packaging/.gitignore").read_text(encoding="utf-8")
 
     assert "DS4Support/" in ignore_text
+
+
+def test_vendor_ds4_runtime_artifacts_are_gitignored():
+    """Generated vendor DS4 runtime files are not accidentally re-added."""
+    result = subprocess.run(
+        [
+            "git",
+            "check-ignore",
+            "omlx/vendor/ds4/darwin-arm64/ds4-server",
+            "omlx/vendor/ds4/darwin-arm64/metal/flash_attn.metal",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    ignored = set(result.stdout.splitlines())
+    assert "omlx/vendor/ds4/darwin-arm64/ds4-server" in ignored
+    assert "omlx/vendor/ds4/darwin-arm64/metal/flash_attn.metal" in ignored

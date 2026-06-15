@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ def _write_complete_support_tree(
     *,
     executable: bool = True,
     supports_required_flags: bool = True,
+    metal_files: tuple[str, ...] = DS4_METAL_FILES,
 ) -> None:
     binary = root / DS4_SERVER_BINARY
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -52,18 +54,26 @@ def _write_complete_support_tree(
     (root / "README.md").write_text("DS4\n")
     metal_dir = root / "metal"
     metal_dir.mkdir()
-    for name in DS4_METAL_FILES:
-        (metal_dir / name).write_text("// metal\n")
+    for name in metal_files:
+        metal_path = metal_dir / name
+        metal_path.parent.mkdir(parents=True, exist_ok=True)
+        metal_path.write_text("// metal\n")
 
 
-def _write_buildable_ds4_source(root: Path) -> None:
+def _write_buildable_ds4_source(
+    root: Path,
+    *,
+    metal_files: tuple[str, ...] = DS4_METAL_FILES,
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "LICENSE").write_text("MIT\n")
     (root / "README.md").write_text("DS4\n")
     metal_dir = root / "metal"
     metal_dir.mkdir()
-    for name in DS4_METAL_FILES:
-        (metal_dir / name).write_text("// metal\n")
+    for name in metal_files:
+        metal_path = metal_dir / name
+        metal_path.parent.mkdir(parents=True, exist_ok=True)
+        metal_path.write_text("// metal\n")
     (root / "Makefile").write_text(
         "\n".join(
             [
@@ -132,6 +142,25 @@ class TestDS4SupportInspection:
         assert status.support_dir == support.resolve()
         assert status.binary_path == (support / DS4_SERVER_BINARY).resolve()
 
+    def test_custom_support_tree_can_use_discovered_metal_files(self, tmp_path):
+        """Custom DS4 forks can change the Metal kernel file set."""
+        support = tmp_path / "support" / "ds4"
+        _write_complete_support_tree(
+            support,
+            metal_files=("fork_attention.metal", "experimental/block.metal"),
+        )
+        settings = DS4Settings(support_dir=str(support))
+
+        status = inspect_ds4_support(
+            settings,
+            base_path=tmp_path,
+            system="Darwin",
+            machine="arm64",
+        )
+
+        assert status.ready is True
+        assert status.missing_files == ()
+
     def test_incompatible_binary_missing_required_flags_is_not_ready(self, tmp_path):
         """Stale ds4-server binaries are rejected before launch."""
         support = tmp_path / "support" / "ds4"
@@ -166,7 +195,7 @@ class TestDS4SupportInspection:
         assert status.ready is False
         assert status.binary_missing is True
         assert "LICENSE" in status.missing_files
-        assert "metal/flash_attn.metal" in status.missing_files
+        assert "metal/*.metal" in status.missing_files
         message = status.error_message()
         assert message is not None
         assert "missing DS4 binary" in message
@@ -430,6 +459,70 @@ class TestDS4SourceBuild:
         assert staged_manifest["source_commit"] == source_commit
         assert staged_manifest["source_path"] == str(source.resolve())
 
+    def test_build_from_custom_remote_without_commit_uses_default_head(
+        self, tmp_path, monkeypatch
+    ):
+        checkout_source = tmp_path / "checkout-source"
+        destination = tmp_path / "support" / "ds4"
+        manifest = tmp_path / "manifest.json"
+        repo = "https://example.invalid/fork.git"
+        _write_buildable_ds4_source(checkout_source)
+        _write_manifest(
+            manifest,
+            source_repo="https://example.invalid/manifest-default.git",
+            build_command="make ds4-server",
+        )
+        clone_calls: list[tuple[str, str | None]] = []
+
+        def fake_clone(clone_repo, clone_commit, checkout):
+            clone_calls.append((clone_repo, clone_commit))
+            shutil.copytree(checkout_source, checkout)
+            return checkout
+
+        monkeypatch.setattr(ds4_support, "_clone_ds4_source", fake_clone)
+        monkeypatch.setattr(ds4_support, "_git_head", lambda _source_dir: "fork-head")
+
+        build_ds4_support_from_source(
+            DS4Settings(source_repo=repo),
+            destination_dir=destination,
+            manifest_path=manifest,
+            work_dir=tmp_path,
+            validate_environment=False,
+        )
+
+        staged_manifest = json.loads((destination / "manifest.json").read_text())
+        assert clone_calls == [(repo, None)]
+        assert staged_manifest["source_repo"] == repo
+        assert staged_manifest["source_commit"] == "fork-head"
+
+    def test_build_from_custom_source_stages_discovered_metal_files(
+        self, tmp_path, monkeypatch
+    ):
+        source = tmp_path / "ds4-source"
+        destination = tmp_path / "support" / "ds4"
+        manifest = tmp_path / "manifest.json"
+        metal_files = ("fork_attention.metal", "nested/custom_kernel.metal")
+        _write_buildable_ds4_source(source, metal_files=metal_files)
+        _write_manifest(
+            manifest, source_repo=str(source), build_command="make ds4-server"
+        )
+        monkeypatch.setattr(ds4_support, "_git_head", lambda _source_dir: "fork-head")
+
+        build_ds4_support_from_source(
+            destination_dir=destination,
+            source=source,
+            manifest_path=manifest,
+            validate_environment=False,
+        )
+
+        staged_manifest = json.loads((destination / "manifest.json").read_text())
+        assert (destination / "metal" / "fork_attention.metal").is_file()
+        assert (destination / "metal" / "nested" / "custom_kernel.metal").is_file()
+        assert staged_manifest["metal_files"] == [
+            "metal/fork_attention.metal",
+            "metal/nested/custom_kernel.metal",
+        ]
+
     def test_build_from_local_source_rejects_unverified_commit(self, tmp_path):
         source = tmp_path / "ds4-source"
         destination = tmp_path / "support" / "ds4"
@@ -584,6 +677,21 @@ class TestDS4SupportCopy:
         assert os.access(destination / DS4_SERVER_BINARY, os.X_OK)
         assert (destination / "metal" / "flash_attn.metal").is_file()
         assert not (destination / "ignored.txt").exists()
+
+    def test_copy_discovers_custom_metal_files(self, tmp_path):
+        """Custom support trees copy their actual Metal kernels."""
+        source = tmp_path / "resources" / "ds4"
+        destination = tmp_path / "support" / "ds4"
+        _write_complete_support_tree(
+            source,
+            metal_files=("fork_attention.metal", "nested/custom_kernel.metal"),
+        )
+
+        copy_ds4_support_files(source, destination)
+
+        assert (destination / "metal" / "fork_attention.metal").is_file()
+        assert (destination / "metal" / "nested" / "custom_kernel.metal").is_file()
+        assert not (destination / "metal" / "flash_attn.metal").exists()
 
     def test_copy_skips_existing_files_without_overwrite(self, tmp_path):
         """Existing files are preserved unless overwrite is requested."""

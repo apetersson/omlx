@@ -2,9 +2,9 @@
 """Support-file checks for the managed DS4/GGUF backend.
 
 The DS4 process backend is launched from a user support directory rather than
-built or fetched at runtime.  This module owns the small, testable pieces that
-validate/copy those support files before later process-launch code consumes
-those paths.
+from package resources.  This module owns the small, testable pieces that
+validate, copy, or lazily build those support files before later process-launch
+code consumes those paths.
 """
 
 from __future__ import annotations
@@ -94,6 +94,7 @@ class DS4SupportManifest:
     build_command: str
     required_cli_flags: tuple[str, ...]
     binary_sha256: str | None = None
+    metal_files: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object]) -> "DS4SupportManifest":
@@ -117,6 +118,11 @@ class DS4SupportManifest:
             raise DS4SupportError(
                 "DS4 support manifest required_cli_flags must be a list"
             )
+        metal_files = data.get("metal_files")
+        if metal_files is None:
+            metal_files = []
+        elif not isinstance(metal_files, list):
+            raise DS4SupportError("DS4 support manifest metal_files must be a list")
         return cls(
             name=str(data["name"]),
             source_repo=str(data["source_repo"]),
@@ -129,6 +135,13 @@ class DS4SupportManifest:
                 str(data["binary_sha256"])
                 if str(data.get("binary_sha256") or "").strip()
                 else None
+            ),
+            metal_files=tuple(
+                rel
+                for rel in (
+                    _normalize_ds4_metal_relative_path(item) for item in metal_files
+                )
+                if rel is not None
             ),
         )
 
@@ -145,6 +158,8 @@ class DS4SupportManifest:
         }
         if self.binary_sha256:
             data["binary_sha256"] = self.binary_sha256
+        if self.metal_files:
+            data["metal_files"] = list(self.metal_files)
         return data
 
 
@@ -227,12 +242,65 @@ def required_ds4_support_relative_paths(
     *, include_binary: bool = True
 ) -> tuple[str, ...]:
     """Return required support paths relative to the DS4 support directory."""
+    paths = _base_ds4_support_relative_paths(include_binary=include_binary)
+    paths.extend(f"metal/{name}" for name in DS4_METAL_FILES)
+    return tuple(paths)
+
+
+def _base_ds4_support_relative_paths(*, include_binary: bool = True) -> list[str]:
+    """Return non-Metal support paths relative to the DS4 support directory."""
     paths: list[str] = []
     if include_binary:
         paths.append(DS4_SERVER_BINARY)
     paths.extend(DS4_SUPPORT_FILES)
-    paths.extend(f"metal/{name}" for name in DS4_METAL_FILES)
-    return tuple(paths)
+    return paths
+
+
+def _normalize_ds4_metal_relative_path(value: object) -> str | None:
+    rel = str(value).strip().replace("\\", "/")
+    parts = rel.split("/")
+    if (
+        len(parts) < 2
+        or parts[0] != "metal"
+        or not rel.endswith(".metal")
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return None
+    return rel
+
+
+def _discover_ds4_metal_relative_paths(root: Path) -> tuple[str, ...]:
+    metal_dir = root / "metal"
+    if not metal_dir.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            path.relative_to(root).as_posix()
+            for path in metal_dir.rglob("*.metal")
+            if path.is_file()
+        )
+    )
+
+
+def _manifest_ds4_metal_relative_paths(root: Path) -> tuple[str, ...]:
+    manifest_path = root / DS4_SUPPORT_MANIFEST
+    if not manifest_path.is_file():
+        return ()
+    try:
+        with manifest_path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return ()
+    if not isinstance(data, dict):
+        return ()
+    metal_files = data.get("metal_files", ())
+    if not isinstance(metal_files, list):
+        return ()
+    return tuple(
+        rel
+        for rel in (_normalize_ds4_metal_relative_path(item) for item in metal_files)
+        if rel is not None
+    )
 
 
 def _missing_relative_paths(
@@ -386,14 +454,20 @@ def _git_head(source_dir: Path) -> str | None:
     return completed.stdout.strip() or None
 
 
-def _clone_ds4_source(repo: str, commit: str, destination: Path) -> Path:
-    destination.mkdir(parents=True, exist_ok=True)
-    commands = (
-        ["git", "init", str(destination)],
-        ["git", "-C", str(destination), "remote", "add", "origin", repo],
-        ["git", "-C", str(destination), "fetch", "--depth", "1", "origin", commit],
-        ["git", "-C", str(destination), "checkout", "--detach", "FETCH_HEAD"],
-    )
+def _clone_ds4_source(repo: str, commit: str | None, destination: Path) -> Path:
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if commit:
+        destination.mkdir(parents=True, exist_ok=True)
+        commands = (
+            ["git", "init", str(destination)],
+            ["git", "-C", str(destination), "remote", "add", "origin", repo],
+            ["git", "-C", str(destination), "fetch", "--depth", "1", "origin", commit],
+            ["git", "-C", str(destination), "checkout", "--detach", "FETCH_HEAD"],
+        )
+    else:
+        commands = (["git", "clone", "--depth", "1", repo, str(destination)],)
     for command in commands:
         completed = subprocess.run(
             command,
@@ -404,9 +478,10 @@ def _clone_ds4_source(repo: str, commit: str, destination: Path) -> Path:
         )
         if completed.returncode != 0:
             output = (completed.stderr or completed.stdout).strip()
+            source_label = f"{repo}@{commit}" if commit else repo
             raise DS4SupportError(
-                "Failed to clone pinned DS4 source "
-                f"{repo}@{commit}: {' '.join(command)}: {output}"
+                "Failed to clone DS4 source "
+                f"{source_label}: {' '.join(command)}: {output}"
             )
     return destination
 
@@ -457,6 +532,7 @@ def _write_staged_manifest(
     data["source_commit"] = source_commit
     if source_repo == str(source_dir):
         data["source_path"] = str(source_dir)
+    data["metal_files"] = list(_discover_ds4_metal_relative_paths(destination))
     manifest_path = destination / DS4_SUPPORT_MANIFEST
     manifest_path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
     return manifest_path
@@ -521,27 +597,32 @@ def build_ds4_support_from_source(
         if source is not None
         else (settings.source_repo or manifest.source_repo)
     )
-    source_commit = commit or settings.source_commit or manifest.source_commit
+    source_override = source is not None or bool(settings.source_repo)
+    requested_commit = commit or settings.source_commit
+    source_commit = (
+        requested_commit
+        if requested_commit
+        else (None if source_override else manifest.source_commit)
+    )
     source_is_local = _source_is_local_dir(source_value)
 
     if validate_environment:
         _raise_if_ds4_build_environment_unavailable(
             system=system,
             machine=machine,
-            require_git=not source_is_local,
+            require_git=True,
             require_make=not skip_build,
         )
 
     if source_is_local:
         source_dir = Path(source_value).expanduser().resolve()
         current_head = _git_head(source_dir)
+        if not current_head:
+            raise DS4SupportError(
+                f"Cannot verify local DS4 source {source_dir}; use a git checkout "
+                "so oMLX can record the built source commit"
+            )
         if source_commit:
-            if not current_head:
-                raise DS4SupportError(
-                    f"Cannot verify local DS4 source {source_dir} against "
-                    f"requested commit {source_commit}; use a git checkout or "
-                    "clear the commit override"
-                )
             if current_head != source_commit:
                 raise DS4SupportError(
                     f"Local DS4 source {source_dir} is at {current_head}, "
@@ -552,7 +633,7 @@ def build_ds4_support_from_source(
             destination,
             manifest,
             source_repo=str(source_dir),
-            source_commit=source_commit or current_head,
+            source_commit=current_head,
             skip_build=skip_build,
             overwrite=overwrite,
         )
@@ -561,24 +642,34 @@ def build_ds4_support_from_source(
     if work_dir is not None:
         checkout = Path(work_dir).expanduser().resolve() / "ds4-source"
         source_dir = _clone_ds4_source(repo, source_commit, checkout)
+        current_head = _git_head(source_dir)
+        if not current_head:
+            raise DS4SupportError(
+                f"Cannot verify cloned DS4 source {repo}; git did not report HEAD"
+            )
         return _build_and_copy_ds4_support(
             source_dir,
             destination,
             manifest,
             source_repo=repo,
-            source_commit=source_commit,
+            source_commit=current_head,
             skip_build=skip_build,
             overwrite=overwrite,
         )
 
     with tempfile.TemporaryDirectory(prefix="omlx-ds4-build-") as temp_dir:
         source_dir = _clone_ds4_source(repo, source_commit, Path(temp_dir) / "ds4")
+        current_head = _git_head(source_dir)
+        if not current_head:
+            raise DS4SupportError(
+                f"Cannot verify cloned DS4 source {repo}; git did not report HEAD"
+            )
         return _build_and_copy_ds4_support(
             source_dir,
             destination,
             manifest,
             source_repo=repo,
-            source_commit=source_commit,
+            source_commit=current_head,
             skip_build=skip_build,
             overwrite=overwrite,
         )
@@ -597,10 +688,19 @@ def inspect_ds4_support(
     support_dir = settings.get_support_dir(base)
     binary_path = settings.get_binary_path(base)
     binary_override = settings.binary_path is not None
-    missing_files = _missing_relative_paths(
-        support_dir,
-        required_ds4_support_relative_paths(include_binary=not binary_override),
+    missing_files = list(
+        _missing_relative_paths(
+            support_dir,
+            _base_ds4_support_relative_paths(include_binary=not binary_override),
+        )
     )
+    metal_files = _manifest_ds4_metal_relative_paths(
+        support_dir
+    ) or _discover_ds4_metal_relative_paths(support_dir)
+    if metal_files:
+        missing_files.extend(_missing_relative_paths(support_dir, metal_files))
+    else:
+        missing_files.append("metal/*.metal")
     binary_missing = not binary_path.is_file()
     binary_not_executable = binary_path.is_file() and not os.access(
         binary_path, os.X_OK
@@ -614,7 +714,7 @@ def inspect_ds4_support(
     return DS4SupportStatus(
         support_dir=support_dir,
         binary_path=binary_path,
-        missing_files=missing_files,
+        missing_files=tuple(missing_files),
         binary_missing=binary_missing,
         binary_not_executable=binary_not_executable,
         unsupported_platform=unsupported_platform,
@@ -810,14 +910,20 @@ def copy_ds4_support_files(
 ) -> DS4SupportCopyResult:
     """Copy required DS4 support files from a bundled resource directory.
 
-    The copy is intentionally deterministic: only the required binary, license,
-    README, and Metal source files are copied.  Missing bundled inputs raise a
-    clear error instead of attempting to rebuild or fetch DS4.
+    The copy is intentionally deterministic: only the required binary,
+    license, README, and discovered Metal source files are copied. Missing
+    bundled inputs raise a clear error instead of attempting to rebuild or fetch
+    DS4.
     """
     source = Path(source_dir).expanduser().resolve()
     destination = Path(destination_dir).expanduser().resolve()
-    required = required_ds4_support_relative_paths(include_binary=True)
+    required = _base_ds4_support_relative_paths(include_binary=True)
     missing = _missing_relative_paths(source, required)
+    metal_files = _discover_ds4_metal_relative_paths(source)
+    if metal_files:
+        required.extend(metal_files)
+    else:
+        missing = missing + ("metal/*.metal",)
     if missing:
         raise DS4SupportError(
             "Bundled DS4 support files are incomplete under "

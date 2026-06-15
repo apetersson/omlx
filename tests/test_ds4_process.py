@@ -7,11 +7,13 @@ import logging
 import os
 import re
 import sys
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
+import omlx.ds4_process as ds4_process
 from omlx.ds4_process import (
     DS4_HOST,
     DS4LaunchConfig,
@@ -207,8 +209,7 @@ class TestDS4LaunchConfig:
         assert command[command.index("--ctx") + 1] == "100000"
         assert command[command.index("--kv-disk-space-mb") + 1] == "1234"
         assert (
-            command[command.index("--kv-cache-continued-interval-tokens") + 1]
-            == "4096"
+            command[command.index("--kv-cache-continued-interval-tokens") + 1] == "4096"
         )
         assert command[command.index("--power") + 1] == "77"
         assert "--ssd-streaming" in command
@@ -276,7 +277,9 @@ class TestDS4ManagedProcess:
     """Tests for managed DS4 subprocess lifecycle."""
 
     @pytest.mark.asyncio
-    async def test_start_waits_for_models_readiness_and_captures_logs(self, tmp_path, caplog):
+    async def test_start_waits_for_models_readiness_and_captures_logs(
+        self, tmp_path, caplog
+    ):
         """A fake ds4-server is started, probed, and terminated cleanly."""
         support = tmp_path / "support" / "ds4"
         _write_support_tree(support, _ready_server_script())
@@ -319,6 +322,44 @@ class TestDS4ManagedProcess:
         assert "stdout: fake ds4 argv" in log_text
         assert re.search(r"\[DS4-\d+\] Loading model: model", caplog.text)
         assert re.search(r"\[DS4-\d+\] stdout: fake ds4 argv", caplog.text)
+
+    @pytest.mark.asyncio
+    async def test_start_validates_support_off_event_loop(self, tmp_path, monkeypatch):
+        """Lazy DS4 provisioning must not block the asyncio server loop."""
+        support = tmp_path / "support" / "ds4"
+        _write_support_tree(support, _ready_server_script())
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"gguf")
+        settings = DS4Settings(
+            support_dir=str(support),
+            ready_timeout_ms=2_000,
+        )
+        managed = DS4ManagedProcess(
+            DS4LaunchConfig(
+                model_id="model",
+                gguf_path=gguf,
+                settings=settings,
+                base_path=tmp_path,
+                platform_system="Darwin",
+                platform_machine="arm64",
+            )
+        )
+        event_loop_thread = threading.current_thread().ident
+        support_threads: list[int | None] = []
+        original_ensure = ds4_process.ensure_ds4_support
+
+        def fake_ensure(*args, **kwargs):
+            support_threads.append(threading.current_thread().ident)
+            return original_ensure(*args, **kwargs)
+
+        monkeypatch.setattr(ds4_process, "ensure_ds4_support", fake_ensure)
+
+        await managed.start()
+        try:
+            assert support_threads
+            assert all(thread_id != event_loop_thread for thread_id in support_threads)
+        finally:
+            await managed.stop()
 
     @pytest.mark.asyncio
     async def test_start_can_disable_ds4_debug_log_file(self, tmp_path, caplog):
