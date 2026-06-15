@@ -4,6 +4,8 @@
 import json
 import os
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -597,6 +599,54 @@ class TestDS4SourceBuild:
         )
 
         assert status.ready is True
+        assert calls == 1
+
+    def test_ensure_ds4_support_single_flights_concurrent_auto_build(
+        self, tmp_path, monkeypatch
+    ):
+        """Concurrent first loads share one default support-dir auto-build."""
+        base_path = tmp_path / "base"
+        calls = 0
+        build_started = threading.Event()
+        release_build = threading.Event()
+        second_build_started = threading.Event()
+
+        def fake_build(settings, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                second_build_started.set()
+            build_started.set()
+            assert release_build.wait(timeout=2)
+            destination = settings.get_support_dir(kwargs["base_path"])
+            _write_complete_support_tree(destination)
+            return None
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+        settings = DS4Settings(auto_build=True)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                ensure_ds4_support,
+                settings,
+                base_path=base_path,
+                system="Darwin",
+                machine="arm64",
+            )
+            assert build_started.wait(timeout=1)
+            second = executor.submit(
+                ensure_ds4_support,
+                settings,
+                base_path=base_path,
+                system="Darwin",
+                machine="arm64",
+            )
+            assert not second_build_started.wait(timeout=0.2)
+            release_build.set()
+
+            assert first.result(timeout=2).ready is True
+            assert second.result(timeout=2).ready is True
+
         assert calls == 1
 
     def test_ensure_ds4_support_auto_build_disabled_fails_without_build(

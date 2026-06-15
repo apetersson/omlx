@@ -16,6 +16,7 @@ import shutil
 import shlex
 import subprocess
 import tempfile
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,8 @@ DS4_METAL_FILES: tuple[str, ...] = (
     "set_rows.metal",
 )
 _DS4_AUTO_BUILD_FAILURES: dict[tuple[str, str, str], str] = {}
+_DS4_SUPPORT_LOCKS: dict[str, threading.Lock] = {}
+_DS4_SUPPORT_LOCKS_GUARD = threading.Lock()
 
 
 class DS4SupportError(RuntimeError):
@@ -80,6 +83,16 @@ def _ds4_auto_build_failure_key(
         settings.source_repo or "",
         settings.source_commit or "",
     )
+
+
+def _ds4_support_lock(settings: DS4Settings, base_path: Path) -> threading.Lock:
+    key = str(settings.get_support_dir(base_path))
+    with _DS4_SUPPORT_LOCKS_GUARD:
+        lock = _DS4_SUPPORT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DS4_SUPPORT_LOCKS[key] = lock
+        return lock
 
 
 @dataclass(frozen=True)
@@ -786,38 +799,7 @@ def ensure_ds4_support(
     # support dir is oMLX-owned and can be repaired from bundled resources or
     # built from the pinned source commit.
     if settings.support_dir is None:
-        install_bundled_ds4_support_files(
-            settings,
-            base_path=base,
-            source_dir=source_dir,
-            overwrite=True,
-        )
-        status = inspect_ds4_support(
-            settings,
-            base_path=base,
-            system=system,
-            machine=machine,
-        )
-        if status.ready:
-            return status
-        if settings.auto_build:
-            failure_key = _ds4_auto_build_failure_key(settings, base)
-            if failure_key in _DS4_AUTO_BUILD_FAILURES:
-                raise DS4SupportError(
-                    (status.error_message() or "DS4 support is unavailable")
-                    + "; DS4 auto-build previously failed: "
-                    + _DS4_AUTO_BUILD_FAILURES[failure_key]
-                )
-            try:
-                build_ds4_support_from_source(
-                    settings,
-                    base_path=base,
-                    system=system,
-                    machine=machine,
-                )
-            except DS4SupportError as exc:
-                _DS4_AUTO_BUILD_FAILURES[failure_key] = str(exc)
-                raise
+        with _ds4_support_lock(settings, base):
             status = inspect_ds4_support(
                 settings,
                 base_path=base,
@@ -825,19 +807,63 @@ def ensure_ds4_support(
                 machine=machine,
             )
             if status.ready:
-                _DS4_AUTO_BUILD_FAILURES.pop(failure_key, None)
                 return status
-            failure_message = (
-                status.error_message() or "built DS4 support is unavailable"
+            if status.unsupported_platform:
+                raise DS4SupportError(
+                    status.error_message() or "DS4 support is unavailable"
+                )
+            install_bundled_ds4_support_files(
+                settings,
+                base_path=base,
+                source_dir=source_dir,
+                overwrite=True,
             )
-            _DS4_AUTO_BUILD_FAILURES[failure_key] = failure_message
-            raise DS4SupportError(failure_message)
-        else:
-            raise DS4SupportError(
-                (status.error_message() or "DS4 support is unavailable")
-                + "; DS4 auto-build is disabled. Run `omlx ds4 install` or "
-                "configure ds4.support_dir / OMLX_DS4_SUPPORT_DIR."
+            status = inspect_ds4_support(
+                settings,
+                base_path=base,
+                system=system,
+                machine=machine,
             )
+            if status.ready:
+                return status
+            if settings.auto_build:
+                failure_key = _ds4_auto_build_failure_key(settings, base)
+                if failure_key in _DS4_AUTO_BUILD_FAILURES:
+                    raise DS4SupportError(
+                        (status.error_message() or "DS4 support is unavailable")
+                        + "; DS4 auto-build previously failed: "
+                        + _DS4_AUTO_BUILD_FAILURES[failure_key]
+                    )
+                try:
+                    build_ds4_support_from_source(
+                        settings,
+                        base_path=base,
+                        system=system,
+                        machine=machine,
+                    )
+                except DS4SupportError as exc:
+                    _DS4_AUTO_BUILD_FAILURES[failure_key] = str(exc)
+                    raise
+                status = inspect_ds4_support(
+                    settings,
+                    base_path=base,
+                    system=system,
+                    machine=machine,
+                )
+                if status.ready:
+                    _DS4_AUTO_BUILD_FAILURES.pop(failure_key, None)
+                    return status
+                failure_message = (
+                    status.error_message() or "built DS4 support is unavailable"
+                )
+                _DS4_AUTO_BUILD_FAILURES[failure_key] = failure_message
+                raise DS4SupportError(failure_message)
+            else:
+                raise DS4SupportError(
+                    (status.error_message() or "DS4 support is unavailable")
+                    + "; DS4 auto-build is disabled. Run `omlx ds4 install` or "
+                    "configure ds4.support_dir / OMLX_DS4_SUPPORT_DIR."
+                )
 
     raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
 

@@ -783,7 +783,7 @@
   "settings.ds4.logs_to_disk": "DS4 로그를 디스크에 기록",
   "settings.ds4.logs_to_disk_hint": "캡처한 DS4 표준 출력/표준 오류도 ~/.omlx/logs/ds4-debug/<model>/ds4.log에 저장합니다. 비활성화하면 메모리/관리 화면 캡처와 일반 oMLX 로그 출력만 유지합니다.",
   "settings.ds4.support_dir": "지원 파일 디렉터리",
-  "settings.ds4.support_dir_hint": "ds4-server, README, LICENSE 및 Metal 런타임 파일이 들어 있는 디렉터리입니다.",
+  "settings.ds4.support_dir_hint": "ds4-server, README, LICENSE 및 Metal 런타임 파일이 들어 있는 디렉터리입니다. 사용자 지정 소스 코드 빌드는 omlx ds4 install --source ... --commit ...로 설치할 수 있습니다.",
   "settings.ds4.support_dir_placeholder": "기본값 ~/.omlx/support/ds4",
   "settings.ds4.binary_path": "DS4 실행 파일 경로",
   "settings.ds4.binary_path_hint": "선택 사항인 사전 빌드 ds4-server 경로입니다. 비워 두면 지원 디렉터리의 실행 파일을 사용합니다.",

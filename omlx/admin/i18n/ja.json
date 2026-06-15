@@ -783,7 +783,7 @@
   "settings.ds4.logs_to_disk": "DS4 ログをディスクに書き込む",
   "settings.ds4.logs_to_disk_hint": "キャプチャした DS4 の標準出力と標準エラーも ~/.omlx/logs/ds4-debug/<model>/ds4.log に保存します。無効にすると、メモリ/管理画面のキャプチャと通常の oMLX ログ出力のみを保持します。",
   "settings.ds4.support_dir": "補助ファイルディレクトリ",
-  "settings.ds4.support_dir_hint": "ds4-server、README、LICENSE、Metal 実行時ファイルを含むディレクトリ。",
+  "settings.ds4.support_dir_hint": "ds4-server、README、LICENSE、Metal 実行時ファイルを含むディレクトリ。カスタムソースコードからのビルドは omlx ds4 install --source ... --commit ... でインストールできます。",
   "settings.ds4.support_dir_placeholder": "既定 ~/.omlx/support/ds4",
   "settings.ds4.binary_path": "DS4 実行ファイルパス",
   "settings.ds4.binary_path_hint": "任意の事前ビルド済み ds4-server パス。空欄の場合は補助ファイルディレクトリの実行ファイルを使用します。",

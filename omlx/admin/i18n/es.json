@@ -783,7 +783,7 @@
   "settings.ds4.logs_to_disk": "Guardar registros DS4 en disco",
   "settings.ds4.logs_to_disk_hint": "También guarda la salida estándar y los errores estándar capturados de DS4 en ~/.omlx/logs/ds4-debug/<model>/ds4.log. Desactívalo para conservar solo la captura en memoria/panel de administración y la salida normal de registros de oMLX.",
   "settings.ds4.support_dir": "Directorio de archivos auxiliares",
-  "settings.ds4.support_dir_hint": "Directorio que contiene ds4-server, README, LICENSE y los archivos de tiempo de ejecución de Metal.",
+  "settings.ds4.support_dir_hint": "Directorio que contiene ds4-server, README, LICENSE y los archivos de tiempo de ejecución de Metal. Las compilaciones desde código fuente personalizado se pueden instalar con omlx ds4 install --source ... --commit ...",
   "settings.ds4.support_dir_placeholder": "Predeterminado ~/.omlx/support/ds4",
   "settings.ds4.binary_path": "Ruta del ejecutable DS4",
   "settings.ds4.binary_path_hint": "Ruta opcional a un ds4-server precompilado. En blanco usa el ejecutable del directorio auxiliar.",

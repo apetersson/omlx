@@ -783,7 +783,7 @@
   "settings.ds4.logs_to_disk": "Écrire les journaux DS4 sur disque",
   "settings.ds4.logs_to_disk_hint": "Persiste aussi la sortie standard et les erreurs standard DS4 capturées dans ~/.omlx/logs/ds4-debug/<model>/ds4.log. Désactivez cette option pour ne garder que la capture en mémoire/panneau d'administration et la sortie de journal oMLX normale.",
   "settings.ds4.support_dir": "Répertoire des fichiers de prise en charge",
-  "settings.ds4.support_dir_hint": "Répertoire contenant ds4-server, README, LICENSE et les fichiers d'exécution Metal.",
+  "settings.ds4.support_dir_hint": "Répertoire contenant ds4-server, README, LICENSE et les fichiers d'exécution Metal. Les compilations depuis une source personnalisée peuvent être installées avec omlx ds4 install --source ... --commit ...",
   "settings.ds4.support_dir_placeholder": "Par défaut ~/.omlx/support/ds4",
   "settings.ds4.binary_path": "Chemin du binaire DS4",
   "settings.ds4.binary_path_hint": "Chemin optionnel vers un ds4-server précompilé. Vide, utilise le binaire du répertoire de prise en charge.",

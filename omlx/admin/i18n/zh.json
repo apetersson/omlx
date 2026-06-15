@@ -783,7 +783,7 @@
   "settings.ds4.logs_to_disk": "将 DS4 日志写入磁盘",
   "settings.ds4.logs_to_disk_hint": "同时将捕获的 DS4 标准输出和标准错误持久保存到 ~/.omlx/logs/ds4-debug/<model>/ds4.log。禁用后仅保留内存/管理页捕获和常规 oMLX 日志输出。",
   "settings.ds4.support_dir": "支持文件目录",
-  "settings.ds4.support_dir_hint": "包含 ds4-server、README、LICENSE 和 Metal 运行时文件的目录。",
+  "settings.ds4.support_dir_hint": "包含 ds4-server、README、LICENSE 和 Metal 运行时文件的目录。可使用 omlx ds4 install --source ... --commit ... 安装自定义源码构建。",
   "settings.ds4.support_dir_placeholder": "默认 ~/.omlx/support/ds4",
   "settings.ds4.binary_path": "DS4 可执行文件路径",
   "settings.ds4.binary_path_hint": "可选的预构建 ds4-server 路径。留空则使用支持目录中的可执行文件。",
