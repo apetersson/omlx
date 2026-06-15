@@ -8,7 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from omlx.ds4_support import DS4_METAL_FILES, DS4_REQUIRED_CLI_FLAGS, DS4_SERVER_BINARY
+from ds4_support_fixtures import PINNED_DS4_METAL_FILES
+from omlx.ds4_support import DS4_REQUIRED_CLI_FLAGS, DS4_SERVER_BINARY
 
 _SCRIPT = Path("scripts/build-ds4-support.sh")
 
@@ -19,7 +20,7 @@ def _write_support_scaffold(source: Path, *, with_binary: bool = False) -> None:
     (source / "README.md").write_text("# DS4\n", encoding="utf-8")
     metal = source / "metal"
     metal.mkdir()
-    for name in DS4_METAL_FILES:
+    for name in PINNED_DS4_METAL_FILES:
         (metal / name).write_text("// metal\n", encoding="utf-8")
     if with_binary:
         binary = source / DS4_SERVER_BINARY
@@ -90,7 +91,7 @@ def test_build_ds4_support_script_copies_existing_support_tree(tmp_path):
     assert (output / DS4_SERVER_BINARY).is_file()
     assert os.access(output / DS4_SERVER_BINARY, os.X_OK)
     assert (output / "LICENSE").read_text(encoding="utf-8") == "DS4 license\n"
-    assert (output / "metal" / DS4_METAL_FILES[0]).is_file()
+    assert (output / "metal" / PINNED_DS4_METAL_FILES[0]).is_file()
 
 
 def test_build_ds4_support_script_builds_ds4_server_with_make(tmp_path):

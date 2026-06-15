@@ -11,10 +11,13 @@ from pathlib import Path
 import pytest
 
 import omlx.ds4_support as ds4_support
+from ds4_support_fixtures import (
+    PINNED_DS4_METAL_FILES,
+    pinned_ds4_support_relative_paths,
+)
 from omlx.ds4_support import (
     BUNDLED_DS4_SUPPORT_DIR_NAME,
     BUNDLED_DS4_SUPPORT_ENV,
-    DS4_METAL_FILES,
     DS4_REQUIRED_CLI_FLAGS,
     DS4_SERVER_BINARY,
     DS4SupportError,
@@ -28,7 +31,6 @@ from omlx.ds4_support import (
     is_ds4_supported_platform,
     load_ds4_support_manifest,
     require_ds4_support,
-    required_ds4_support_relative_paths,
 )
 from omlx.settings import DS4Settings
 
@@ -38,7 +40,7 @@ def _write_complete_support_tree(
     *,
     executable: bool = True,
     supports_required_flags: bool = True,
-    metal_files: tuple[str, ...] = DS4_METAL_FILES,
+    metal_files: tuple[str, ...] = PINNED_DS4_METAL_FILES,
 ) -> None:
     binary = root / DS4_SERVER_BINARY
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +67,7 @@ def _write_complete_support_tree(
 def _write_buildable_ds4_source(
     root: Path,
     *,
-    metal_files: tuple[str, ...] = DS4_METAL_FILES,
+    metal_files: tuple[str, ...] = PINNED_DS4_METAL_FILES,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "LICENSE").write_text("MIT\n")
@@ -111,7 +113,7 @@ class TestDS4SupportInspection:
 
     def test_required_paths_include_binary_license_readme_and_metal(self):
         """Required relative paths match unpatched DS4 runtime needs."""
-        paths = required_ds4_support_relative_paths()
+        paths = pinned_ds4_support_relative_paths()
 
         assert DS4_SERVER_BINARY in paths
         assert "LICENSE" in paths
@@ -752,7 +754,7 @@ class TestDS4SupportCopy:
 
         assert result.source_dir == source.resolve()
         assert result.destination_dir == destination.resolve()
-        assert len(result.copied_files) == len(required_ds4_support_relative_paths())
+        assert len(result.copied_files) == len(pinned_ds4_support_relative_paths())
         assert (destination / DS4_SERVER_BINARY).is_file()
         assert os.access(destination / DS4_SERVER_BINARY, os.X_OK)
         assert (destination / "metal" / "flash_attn.metal").is_file()

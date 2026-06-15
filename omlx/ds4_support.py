@@ -34,27 +34,6 @@ DS4_SUPPORT_FILES: tuple[str, ...] = (
     "README.md",
 )
 DS4_REQUIRED_CLI_FLAGS: tuple[str, ...] = ("--ssd-streaming",)
-DS4_METAL_FILES: tuple[str, ...] = (
-    "flash_attn.metal",
-    "dense.metal",
-    "moe.metal",
-    "dsv4_hc.metal",
-    "unary.metal",
-    "dsv4_kv.metal",
-    "dsv4_rope.metal",
-    "dsv4_misc.metal",
-    "argsort.metal",
-    "cpy.metal",
-    "concat.metal",
-    "get_rows.metal",
-    "sum_rows.metal",
-    "softmax.metal",
-    "repeat.metal",
-    "glu.metal",
-    "norm.metal",
-    "bin.metal",
-    "set_rows.metal",
-)
 _DS4_AUTO_BUILD_FAILURES: dict[tuple[str, str, str], str] = {}
 _DS4_SUPPORT_LOCKS: dict[str, threading.Lock] = {}
 _DS4_SUPPORT_LOCKS_GUARD = threading.Lock()
@@ -249,15 +228,6 @@ def is_ds4_supported_platform(
     system = (system or platform.system()).lower()
     machine = (machine or platform.machine()).lower()
     return system == "darwin" and machine in {"arm64", "aarch64"}
-
-
-def required_ds4_support_relative_paths(
-    *, include_binary: bool = True
-) -> tuple[str, ...]:
-    """Return required support paths relative to the DS4 support directory."""
-    paths = _base_ds4_support_relative_paths(include_binary=include_binary)
-    paths.extend(f"metal/{name}" for name in DS4_METAL_FILES)
-    return tuple(paths)
 
 
 def _base_ds4_support_relative_paths(*, include_binary: bool = True) -> list[str]:

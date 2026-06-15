@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from ds4_support_fixtures import PINNED_DS4_METAL_FILES
 import omlx.ds4_process as ds4_process
 from omlx.ds4_process import (
     DS4_HOST,
@@ -22,7 +23,7 @@ from omlx.ds4_process import (
     prune_ds4_kv_cache,
     safe_ds4_fs_name,
 )
-from omlx.ds4_support import DS4_METAL_FILES, DS4_SERVER_BINARY, DS4SupportError
+from omlx.ds4_support import DS4_SERVER_BINARY, DS4SupportError
 from omlx.settings import DS4Settings
 
 
@@ -35,7 +36,7 @@ def _write_support_tree(root: Path, script: str) -> Path:
     (root / "README.md").write_text("DS4\n")
     metal_dir = root / "metal"
     metal_dir.mkdir()
-    for name in DS4_METAL_FILES:
+    for name in PINNED_DS4_METAL_FILES:
         (metal_dir / name).write_text("// metal\n")
     return binary
 
