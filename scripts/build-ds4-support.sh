@@ -97,10 +97,12 @@ if [ -z "${PYTHON_BIN:-}" ]; then
 fi
 [ -x "$PYTHON_BIN" ] || die "PYTHON_BIN is not executable: $PYTHON_BIN"
 
-if [ -n "$SOURCE" ]; then
-    log "Building DS4 support from $SOURCE"
+if [ "$SKIP_BUILD" = "1" ]; then
+    log "Skipping DS4 build; using existing ds4-server from ${SOURCE:-manifest source}"
+elif [ -n "$SOURCE" ]; then
+    log "Building ds4-server from $SOURCE"
 else
-    log "Building DS4 support from pinned manifest source"
+    log "Building ds4-server from pinned manifest source"
 fi
 rm -rf "$OUT_DIR"
 PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
