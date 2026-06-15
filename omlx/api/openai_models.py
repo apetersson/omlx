@@ -301,7 +301,7 @@ class ChatCompletionRequest(BaseModel):
     # Thinking effort for DS4/OpenAI reasoning-compatible backends
     reasoning_effort: Optional[str] = None
     # Thinking budget (max thinking tokens, None = unlimited)
-    thinking_budget: Optional[int] = None
+    thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
@@ -402,6 +402,8 @@ class CompletionRequest(BaseModel):
     reasoning_effort: Optional[str] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
+    thinking_budget: Optional[int] = Field(default=None, ge=0)
 
     @field_validator("stop", mode="before")
     @classmethod

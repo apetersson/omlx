@@ -2446,6 +2446,10 @@
                 return this._launchCmd('codex');
             },
 
+            get codexAppCommand() {
+                return this._launchCmd('codex_app');
+            },
+
             get copilotCommand() {
                 return this._launchCmd('copilot');
             },

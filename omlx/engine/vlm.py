@@ -82,6 +82,8 @@ OCR_EXTRA_STOP_SEQUENCES: List[str] = [
 VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
+MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
+MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -118,6 +120,23 @@ def _read_config_model_type(model_path: str | Path) -> str | None:
         return None
     model_type = data.get("model_type")
     return model_type if isinstance(model_type, str) else None
+
+
+def _apply_minimax_m3_thinking_mode(
+    model_type: str | None,
+    template_kwargs: dict[str, Any],
+) -> None:
+    """Map oMLX enable_thinking to MiniMax M3's thinking_mode template kwarg."""
+    if model_type not in MINIMAX_M3_MODEL_TYPES:
+        return
+    enable_thinking = template_kwargs.pop("enable_thinking", None)
+    if "thinking_mode" in template_kwargs:
+        return
+
+    if enable_thinking is True:
+        template_kwargs["thinking_mode"] = "enabled"
+    elif enable_thinking is False:
+        template_kwargs["thinking_mode"] = "disabled"
 
 
 def _attach_vlm_tokenizer_runtime(tokenizer: Any, model_path: Path, eos_token_id: Any):
@@ -557,6 +576,131 @@ _VISION_TOWER_PREFIX = "vision_tower."
 
 
 @contextlib.contextmanager
+def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
+    """Force mlx-vlm's MiniMax M3 MoE sanitize path for MLX-format checkpoints.
+
+    mlx-vlm's MiniMax M3 loader can pack ``shared_experts`` into the routed
+    ``switch_mlp`` when ``Model.sanitize`` runs.  MLX-format checkpoints skip
+    sanitize upstream, but current MiniMax-M3-4bit weights are still stored in
+    the unpacked MoE layout, so strict loading sees those tensors as unknown.
+    Hide only the safetensors ``format=mlx`` metadata during this load so the
+    upstream sanitize path runs before quantization and load_weights.
+    """
+    if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
+        yield
+        return
+
+    import safetensors
+    from mlx_vlm.models.minimax_m3_vl import minimax_m3_vl as _minimax_m3_vl
+
+    original_safe_open = safetensors.safe_open
+    original_sanitize_moe_weights = _minimax_m3_vl._sanitize_moe_weights
+    target_dir = model_dir.resolve()
+
+    class _SafeOpenMetadataWrapper:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def metadata(self):
+            metadata = self._inner.metadata()
+            if isinstance(metadata, dict) and metadata.get("format") == "mlx":
+                metadata = dict(metadata)
+                metadata.pop("format", None)
+            return metadata
+
+    def _patched_safe_open(filename, *args, **kwargs):
+        handle = original_safe_open(filename, *args, **kwargs)
+        try:
+            path = Path(filename).resolve()
+        except TypeError:
+            return handle
+        if path.parent == target_dir and path.suffix == ".safetensors":
+            return _SafeOpenMetadataWrapper(handle)
+        return handle
+
+    def _pack_mlx_unpacked_moe_weights(weights: dict, args: Any) -> int:
+        pack_shared = (
+            args.n_shared_experts == 1
+            and args.shared_intermediate_size == args.intermediate_size
+        )
+        if not pack_shared:
+            return 0
+
+        packed = 0
+        for layer_idx in range(args.num_hidden_layers):
+            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+            for suffix in ("weight", "scales", "biases", "bias"):
+                gate_key = f"{prefix}.switch_mlp.gate_proj.{suffix}"
+                up_key = f"{prefix}.switch_mlp.up_proj.{suffix}"
+                shared_gate_key = f"{prefix}.shared_experts.gate_proj.{suffix}"
+                shared_up_key = f"{prefix}.shared_experts.up_proj.{suffix}"
+                gate_up_key = f"{prefix}.switch_mlp.gate_up_proj.{suffix}"
+
+                if (
+                    gate_up_key not in weights
+                    and gate_key in weights
+                    and up_key in weights
+                    and shared_gate_key in weights
+                    and shared_up_key in weights
+                ):
+                    gate = weights.pop(gate_key)
+                    up = weights.pop(up_key)
+                    shared_gate = weights.pop(shared_gate_key)
+                    shared_up = weights.pop(shared_up_key)
+                    routed_gate_up = mx.concatenate([gate, up], axis=1)
+                    shared_gate_up = mx.expand_dims(
+                        mx.concatenate([shared_gate, shared_up], axis=0), axis=0
+                    )
+                    weights[gate_up_key] = mx.concatenate(
+                        [routed_gate_up, shared_gate_up], axis=0
+                    )
+                    packed += 1
+
+                down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+                shared_down_key = f"{prefix}.shared_experts.down_proj.{suffix}"
+                packed_down_key = f"{prefix}.switch_mlp.down_proj.{suffix}"
+                if down_key in weights and shared_down_key in weights:
+                    down = weights.pop(down_key)
+                    shared_down = mx.expand_dims(weights.pop(shared_down_key), axis=0)
+                    weights[packed_down_key] = mx.concatenate(
+                        [down, shared_down], axis=0
+                    )
+                    packed += 1
+        return packed
+
+    def _patched_sanitize_moe_weights(weights: dict, args: Any) -> None:
+        original_sanitize_moe_weights(weights, args)
+        packed = _pack_mlx_unpacked_moe_weights(weights, args)
+        if packed:
+            logger.info(
+                "MiniMax M3 MLX-format MoE sanitize packed %d tensor groups",
+                packed,
+            )
+
+    safetensors.safe_open = _patched_safe_open
+    _minimax_m3_vl._sanitize_moe_weights = _patched_sanitize_moe_weights
+    try:
+        logger.info(
+            "MiniMax M3 MLX-format MoE sanitize patch active for %s",
+            model_dir.name,
+        )
+        yield
+    finally:
+        safetensors.safe_open = original_safe_open
+        _minimax_m3_vl._sanitize_moe_weights = original_sanitize_moe_weights
+
+
+@contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
     """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
     ``load_model`` for MLX-format models where sanitize is skipped.
@@ -801,8 +945,9 @@ class VLMBatchedEngine(BaseEngine):
 
     @property
     def model_type(self) -> str | None:
-        if self._vlm_model is not None and hasattr(self._vlm_model, "config"):
-            config = self._vlm_model.config
+        vlm_model = getattr(self, "_vlm_model", None)
+        if vlm_model is not None and hasattr(vlm_model, "config"):
+            config = vlm_model.config
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
@@ -827,8 +972,27 @@ class VLMBatchedEngine(BaseEngine):
         return getattr(self, "_diffusion_family", None) == "block"
 
     @property
+    def supports_tool_calling(self) -> bool:
+        """True when a tool parser was injected into the tokenizer.
+
+        Tool calling is prompt-driven plus output parsing — it does not
+        require grammar-constrained decoding, so it works on any lane
+        (autoregressive or diffusion) whose chat template matched a
+        parser in ``_inject_tool_calling``.
+        """
+        return bool(getattr(self._tokenizer, "has_tool_calling", False))
+
+    @property
     def grammar_compiler(self):
         """Lazily create and return a GrammarCompiler for this VLM model."""
+        if self.is_diffusion_model:
+            # The diffusion lane denoises canvas positions in parallel —
+            # there is no sequential logit stream to mask, so compiled
+            # grammars cannot be enforced. Returning None routes
+            # response_format through the existing prompt-injection
+            # fallback (with the #1241 Warning header) instead of
+            # compiling a grammar that the lane would have to reject.
+            return None
         if self._grammar_compiler is not None:
             return self._grammar_compiler
         if self._grammar_compiler_init_attempted:
@@ -958,6 +1122,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_torch_free_image_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
                 custom_loaded = maybe_load_custom_quantization(
@@ -1100,6 +1265,7 @@ class VLMBatchedEngine(BaseEngine):
                     from mlx_lm import load as mlx_lm_load
 
                     from ..utils.model_loading import maybe_load_custom_quantization
+                    from ..utils.tokenizer import get_tokenizer_config
 
                     def _load_draft():
                         from ..patches.mlx_lm_mtp import set_mtp_active
@@ -1121,7 +1287,15 @@ class VLMBatchedEngine(BaseEngine):
                             if custom_loaded is not None:
                                 draft_model, _ = custom_loaded
                             else:
-                                draft_model, _ = mlx_lm_load(specprefill_draft)
+                                draft_tokenizer_config = get_tokenizer_config(
+                                    specprefill_draft,
+                                    trust_remote_code=self._trust_remote_code,
+                                )
+                                draft_model, _ = mlx_lm_load(
+                                    specprefill_draft,
+                                    tokenizer_config=draft_tokenizer_config,
+                                    trust_remote_code=self._trust_remote_code,
+                                )
                             # Materialize frozen buffers (RoPE freqs, etc.)
                             # on the loader thread. mlx_lm.load only does
                             # mx.eval(model.parameters()) and leaves siblings
@@ -1432,8 +1606,9 @@ class VLMBatchedEngine(BaseEngine):
 
         # Strategy 1: upstream encode_image (gemma4 and future models)
         if hasattr(model, "encode_image"):
+            image_grid_thw = extra_model_inputs.get("image_grid_thw")
             image_position_ids = extra_model_inputs.get("image_position_ids")
-            if image_position_ids is not None:
+            if image_grid_thw is not None or image_position_ids is not None:
                 try:
                     signature = inspect.signature(model.encode_image)
                 except (TypeError, ValueError):
@@ -1441,12 +1616,16 @@ class VLMBatchedEngine(BaseEngine):
 
                 if signature is None:
                     try:
+                        if image_grid_thw is not None:
+                            return model.encode_image(
+                                pixel_values, image_grid_thw=image_grid_thw
+                            )
                         return model.encode_image(
                             pixel_values, image_position_ids=image_position_ids
                         )
                     except TypeError:
                         logger.debug(
-                            "encode_image rejected image_position_ids; "
+                            "encode_image rejected image metadata; "
                             "retrying without it",
                             exc_info=True,
                         )
@@ -1456,7 +1635,16 @@ class VLMBatchedEngine(BaseEngine):
                         p.kind == inspect.Parameter.VAR_KEYWORD
                         for p in parameters.values()
                     )
-                    if "image_position_ids" in parameters or accepts_kwargs:
+                    if image_grid_thw is not None and (
+                        "image_grid_thw" in parameters or accepts_kwargs
+                    ):
+                        return model.encode_image(
+                            pixel_values, image_grid_thw=image_grid_thw
+                        )
+
+                    if image_position_ids is not None and (
+                        "image_position_ids" in parameters or accepts_kwargs
+                    ):
                         return model.encode_image(
                             pixel_values, image_position_ids=image_position_ids
                         )
@@ -1470,7 +1658,7 @@ class VLMBatchedEngine(BaseEngine):
                             inspect.Parameter.POSITIONAL_OR_KEYWORD,
                         )
                     ]
-                    if len(positional_parameters) >= 2:
+                    if image_position_ids is not None and len(positional_parameters) >= 2:
                         return model.encode_image(pixel_values, image_position_ids)
 
             return model.encode_image(pixel_values)
@@ -1816,6 +2004,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
         # Use processor or its tokenizer for chat template application
         template_target = self._processor
@@ -1881,6 +2070,7 @@ class VLMBatchedEngine(BaseEngine):
                     prefix_template_kwargs["tools"] = tools
                 if chat_template_kwargs:
                     prefix_template_kwargs.update(chat_template_kwargs)
+                _apply_minimax_m3_thinking_mode(model_type, prefix_template_kwargs)
 
                 images_consumed = 0
                 for msg_idx, msg_num_images in image_message_ranges:
@@ -2138,6 +2328,7 @@ class VLMBatchedEngine(BaseEngine):
                 template_kwargs["enable_thinking"] = self._enable_thinking
             if chat_template_kwargs:
                 template_kwargs.update(chat_template_kwargs)
+            _apply_minimax_m3_thinking_mode(self.model_type, template_kwargs)
 
             try:
                 return self._tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -2824,9 +3015,10 @@ class VLMBatchedEngine(BaseEngine):
         if not self.is_diffusion_model:
             return
         kwargs = kwargs or {}
-        if tools:
+        if tools and not self.supports_tool_calling:
             raise InvalidRequestError(
-                "Tool calling is not supported with diffusion models.",
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
                 field="tools",
             )
         if audio:
@@ -2897,6 +3089,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs["tools"] = tools
         if chat_template_kwargs:
             template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
         template_target = self._processor
         if not hasattr(template_target, "apply_chat_template"):
@@ -3021,6 +3214,60 @@ class VLMBatchedEngine(BaseEngine):
         block_text: list[str] = []
         emitted_tokens = 0
         last_stream_segment = ""
+
+        # Special tokens are stripped from the stream, EXCEPT protocol
+        # markers the model's output parser needs to see in the text:
+        # tool-call markers (e.g. Gemma's <|tool_call> / <tool_call|>)
+        # for the tool parser, and channel/turn markers for the output
+        # parser session (thought-channel → <think> conversion). They
+        # are removed downstream (parser session / parse_tool_calls /
+        # ToolCallStreamFilter) so they never leak to clients.
+        skip_special_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+        preserved_marker_texts: list[str] = []
+        if getattr(tokenizer, "has_tool_calling", False):
+            preserved_marker_texts.extend(
+                m
+                for m in (
+                    getattr(tokenizer, "tool_call_start", None),
+                    getattr(tokenizer, "tool_call_end", None),
+                )
+                if m
+            )
+
+        # Detect a protocol output parser (e.g. gemma4 channel markers).
+        # The diffusion lane emits detokenized text segments, so only
+        # sessions exposing ``process_text`` can be used here.
+        parser_session = None
+        try:
+            from ..adapter.output_parser import detect_output_parser
+
+            model_config = {"model_type": self.model_type} if self.model_type else None
+            factory = detect_output_parser(self._model_name, tokenizer, model_config)
+            if factory is not None:
+                session = factory.create_session(tokenizer)
+                if hasattr(session, "process_text"):
+                    parser_session = session
+                    preserved_marker_texts.extend(factory.protocol_marker_texts)
+        except Exception as e:
+            logger.debug("Diffusion output parser unavailable: %s", e)
+            parser_session = None
+
+        for marker in preserved_marker_texts:
+            try:
+                marker_id = tokenizer.convert_tokens_to_ids(marker)
+            except Exception:
+                marker_id = None
+            if marker_id is not None:
+                skip_special_ids.discard(marker_id)
+
+        def _parse_block(text: str, *, final: bool = False) -> str:
+            if parser_session is None:
+                return text
+            parsed = parser_session.process_text(text).visible_text
+            if final:
+                parsed += parser_session.finalize().visible_text
+            return parsed
+
         try:
             with limit_ctx:
                 results = stream_diffusion_generate(
@@ -3032,9 +3279,7 @@ class VLMBatchedEngine(BaseEngine):
                     diffusion_inputs.get("attention_mask"),
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    skip_special_token_ids=set(
-                        getattr(tokenizer, "all_special_ids", None) or []
-                    ),
+                    skip_special_token_ids=skip_special_ids,
                     mm_token_type_ids=diffusion_inputs.get("mm_token_type_ids"),
                     prefill_step_size=DIFFUSION_PREFILL_STEP_SIZE,
                 )
@@ -3064,7 +3309,10 @@ class VLMBatchedEngine(BaseEngine):
                         continue
 
                     new_text = remove_special_tokens_preserve_whitespace(
-                        "".join(block_text)
+                        _parse_block(
+                            "".join(block_text),
+                            final=finish_reason is not None,
+                        )
                     )
                     full_text += new_text
                     completion_tokens = int(result_tokens or emitted_tokens)

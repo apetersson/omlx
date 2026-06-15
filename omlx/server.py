@@ -154,7 +154,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
-from .api.thinking import ThinkingParser, extract_thinking
+from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
@@ -172,6 +172,7 @@ from .api.utils import (
     extract_text_content,
     has_nonleading_system_message,
     prepare_system_messages_for_template,
+    uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
@@ -983,23 +984,23 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     # Import audio engine classes lazily so that oMLX without the [audio]
     # extra still imports this module.
     try:
-        from omlx.engine.stt import STTEngine
+        from omlx.engine.stt import STTEngine as stt_engine_cls
     except Exception:  # pragma: no cover - defensive
-        STTEngine = None  # type: ignore[assignment]
+        stt_engine_cls = None
     try:
-        from omlx.engine.tts import TTSEngine
+        from omlx.engine.tts import TTSEngine as tts_engine_cls
     except Exception:  # pragma: no cover - defensive
-        TTSEngine = None  # type: ignore[assignment]
+        tts_engine_cls = None
     try:
-        from omlx.engine.sts import STSEngine
+        from omlx.engine.sts import STSEngine as sts_engine_cls
     except Exception:  # pragma: no cover - defensive
-        STSEngine = None  # type: ignore[assignment]
+        sts_engine_cls = None
 
-    if STTEngine is not None and isinstance(engine, STTEngine):
+    if stt_engine_cls is not None and isinstance(engine, stt_engine_cls):
         return "Use /v1/audio/transcriptions for speech-to-text models."
-    if TTSEngine is not None and isinstance(engine, TTSEngine):
+    if tts_engine_cls is not None and isinstance(engine, tts_engine_cls):
         return "Use /v1/audio/speech for text-to-speech models."
-    if STSEngine is not None and isinstance(engine, STSEngine):
+    if sts_engine_cls is not None and isinstance(engine, sts_engine_cls):
         return "Use /v1/audio/process for speech-to-speech / audio processing models."
     if isinstance(engine, EmbeddingEngine):
         return "Use /v1/embeddings for embedding models."
@@ -1117,8 +1118,11 @@ def get_sampling_params(
     Get effective sampling parameters with per-model settings support.
 
     Priority:
-    - If force_sampling is True (global or model level): use forced values
-    - Otherwise: request > model settings > ocr_defaults > global defaults
+    - If force_sampling is True (global or model level): force sampling knobs
+      that affect token selection.
+    - max_tokens is an output length cap, so it always uses
+      request > model settings > ocr_defaults > global defaults.
+    - Otherwise: request > model settings > ocr_defaults > global defaults.
 
     Returns:
         tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
@@ -1226,23 +1230,16 @@ def get_sampling_params(
     else:
         frequency_penalty = 0.0
 
-    # Max tokens: same hierarchy as other params
-    if force:
-        if model_settings and model_settings.max_tokens is not None:
-            max_tokens = model_settings.max_tokens
-        elif ocr_defaults and "max_tokens" in ocr_defaults:
-            max_tokens = ocr_defaults["max_tokens"]
-        else:
-            max_tokens = global_sampling.max_tokens
+    # Max tokens is an output length cap, not a sampling knob. Honor request
+    # bounds even when force_sampling pins token-selection parameters.
+    if req_max_tokens is not None:
+        max_tokens = req_max_tokens
+    elif model_settings and model_settings.max_tokens is not None:
+        max_tokens = model_settings.max_tokens
+    elif ocr_defaults and "max_tokens" in ocr_defaults:
+        max_tokens = ocr_defaults["max_tokens"]
     else:
-        if req_max_tokens is not None:
-            max_tokens = req_max_tokens
-        elif model_settings and model_settings.max_tokens is not None:
-            max_tokens = model_settings.max_tokens
-        elif ocr_defaults and "max_tokens" in ocr_defaults:
-            max_tokens = ocr_defaults["max_tokens"]
-        else:
-            max_tokens = global_sampling.max_tokens
+        max_tokens = global_sampling.max_tokens
 
     # XTC probability: request > default (0.0 = disabled)
     xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
@@ -1270,6 +1267,20 @@ def get_sampling_params(
         xtc_probability,
         xtc_threshold,
     )
+
+
+def _strip_synthetic_think_prefix(chunk_text: str, think_tag: str) -> str:
+    """Drop the scheduler's synthetic think opener from a raw completions chunk.
+
+    Raw completions are a pure continuation of the prompt. When the prompt
+    itself ends with an open think tag, the scheduler still prepends a
+    synthetic ``"<think>\\n"`` to the first streamed chunk (chat streams rely
+    on it to rebuild the reasoning block), but the opener belongs to the
+    prompt and the non-streaming completions path never returns it. Stripping
+    it keeps both completion paths returning the same continuation.
+    """
+    prefix = f"{think_tag}\n"
+    return chunk_text[len(prefix) :] if chunk_text.startswith(prefix) else chunk_text
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -2770,9 +2781,11 @@ async def create_completion(
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
     # Validate context window for each prompt
+    prompt_token_ids_by_prompt = []
     for prompt in prompts:
-        num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        prompt_token_ids = list(engine.tokenizer.encode(prompt))
+        prompt_token_ids_by_prompt.append(prompt_token_ids)
+        validate_context_window(len(prompt_token_ids), request.model)
 
     # Pre-flight prefill memory guard — see create_chat_completion for
     # the reason this must precede any StreamingResponse return.
@@ -2787,7 +2800,11 @@ async def create_completion(
         return StreamingResponse(
             _with_sse_keepalive(
                 stream_completion(
-                    engine, prompts[0], request, model_load_duration=model_load_duration
+                    engine,
+                    prompts[0],
+                    request,
+                    model_load_duration=model_load_duration,
+                    prompt_token_ids=prompt_token_ids_by_prompt[0],
                 ),
                 http_request=http_request,
                 keepalive_chunk=_resolve_keepalive("openai_completion"),
@@ -2829,6 +2846,11 @@ async def create_completion(
             req_xtc_threshold=getattr(request, "xtc_threshold", None),
         )
 
+        gen_kwargs = {}
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None:
+            gen_kwargs["thinking_budget"] = thinking_budget
+
         for i, prompt in enumerate(prompts):
             output = await engine.generate(
                 prompt=prompt,
@@ -2844,6 +2866,7 @@ async def create_completion(
                 xtc_threshold=xtc_threshold,
                 stop=request.stop,
                 seed=request.seed,
+                **gen_kwargs,
             )
 
             choices.append(
@@ -3715,7 +3738,18 @@ async def create_chat_completion(
     # get reasoning as a separate field; others fall back to <think> inlined
     # in content.
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
     is_vlm = isinstance(engine, VLMBatchedEngine)
     is_dflash_vlm = not is_vlm and getattr(
         engine, "supports_multimodal_fallback", False
@@ -3802,10 +3836,13 @@ async def create_chat_completion(
     # Merge MCP tools with user-provided tools unless the request explicitly
     # disables tool use.
     tools_disabled = request.tool_choice == "none"
-    if getattr(engine, "is_diffusion_model", False):
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
         if request.tools and not tools_disabled:
             raise InvalidRequestError(
-                "Tool calling is not supported with diffusion models.",
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
                 field="tools",
             )
         tools_disabled = True
@@ -4175,16 +4212,18 @@ def _reject_diffusion_structured_outputs(
 ) -> None:
     if not getattr(engine, "is_diffusion_model", False):
         return
-    response_format_needs_grammar = _response_format_requests_grammar(response_format)
-    if (
-        structured_outputs is None
-        and not guided_grammar
-        and not response_format_needs_grammar
-    ):
+    # ``response_format`` (json_object / json_schema) is NOT rejected here:
+    # it degrades to prompt-injected JSON with a Warning header, the same
+    # fallback used when xgrammar is unavailable (#1241).  Only explicit
+    # grammar requests — ``structured_outputs`` and ``guided_grammar`` —
+    # are rejected, because logit-mask enforcement has no equivalent in
+    # the parallel denoising loop.
+    if structured_outputs is None and not guided_grammar:
         return
     raise InvalidRequestError(
-        "Structured response_format and guided grammar are not supported "
-        "with diffusion models.",
+        "structured_outputs and guided grammar are not supported "
+        "with diffusion models (response_format degrades to "
+        "prompt-injected JSON).",
         field="response_format",
     )
 
@@ -4528,11 +4567,18 @@ async def stream_completion(
     prompt: str,
     request: CompletionRequest,
     model_load_duration: float = 0.0,
+    prompt_token_ids: list[int] | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
+    # Parity with the non-streaming path: when the prompt opens a thinking
+    # block, the first chunk carries the scheduler's synthetic think opener;
+    # strip it once so the stream is a pure continuation of the prompt.
+    pending_think_prefix_strip, think_tag = prompt_opens_thinking(
+        getattr(engine, "tokenizer", None), prompt, prompt_token_ids=prompt_token_ids
+    )
 
     (
         temperature,
@@ -4558,6 +4604,10 @@ async def stream_completion(
         req_xtc_probability=getattr(request, "xtc_probability", None),
         req_xtc_threshold=getattr(request, "xtc_threshold", None),
     )
+    gen_kwargs = {}
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if thinking_budget is not None:
+        gen_kwargs["thinking_budget"] = thinking_budget
     try:
         async for output in engine.stream_generate(
             prompt=prompt,
@@ -4573,10 +4623,16 @@ async def stream_completion(
             xtc_threshold=xtc_threshold,
             stop=request.stop,
             seed=request.seed,
+            **gen_kwargs,
         ):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
+
+            chunk_text = output.new_text
+            if pending_think_prefix_strip and chunk_text:
+                chunk_text = _strip_synthetic_think_prefix(chunk_text, think_tag)
+                pending_think_prefix_strip = False
 
             data = {
                 "id": f"cmpl-{uuid.uuid4().hex[:8]}",
@@ -4586,7 +4642,7 @@ async def stream_completion(
                 "choices": [
                     {
                         "index": 0,
-                        "text": output.new_text,
+                        "text": chunk_text,
                         "finish_reason": (
                             output.finish_reason if output.finished else None
                         ),
@@ -5494,7 +5550,18 @@ async def create_anthropic_message(
         engine, "supports_multimodal_fallback", False
     )
     _entry = get_engine_pool().get_entry(resolved_model)
-    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
     if engine.model_type == "gpt_oss":
         messages = convert_anthropic_to_internal_harmony(
             request,
@@ -5593,10 +5660,13 @@ async def create_anthropic_message(
 
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
-    if getattr(engine, "is_diffusion_model", False):
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
         if user_internal:
             raise InvalidRequestError(
-                "Tool calling is not supported with diffusion models.",
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
                 field="tools",
             )
         internal_tools = None
@@ -5928,9 +5998,14 @@ async def create_response(
 
     # Convert tools: flat → nested
     openai_tools = convert_responses_tools(request.tools)
-    if getattr(engine, "is_diffusion_model", False) and openai_tools:
+    if (
+        getattr(engine, "is_diffusion_model", False)
+        and not getattr(engine, "supports_tool_calling", False)
+        and openai_tools
+    ):
         raise InvalidRequestError(
-            "Tool calling is not supported with diffusion models.",
+            "Tool calling is not supported for this diffusion model "
+            "(no tool parser matched its chat template).",
             field="tools",
         )
 
@@ -5994,7 +6069,12 @@ async def create_response(
 
     # Merge MCP tools
     effective_tools = (
-        None if getattr(engine, "is_diffusion_model", False) else openai_tools
+        None
+        if (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
+        )
+        else openai_tools
     )
     if _server_state.mcp_manager and effective_tools:
         effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
