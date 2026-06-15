@@ -184,6 +184,29 @@ async def test_update_global_settings_saves_ds4_backend_controls(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_update_global_settings_keeps_default_ds4_support_dir_implicit(
+    monkeypatch,
+    tmp_path,
+):
+    """Saving the displayed default support dir keeps the oMLX-managed default."""
+    settings = GlobalSettings(base_path=tmp_path)
+    save = MagicMock()
+    monkeypatch.setattr(settings, "save", save)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    result = await admin_routes.update_global_settings(
+        admin_routes.GlobalSettingsRequest(
+            ds4_support_dir=str(tmp_path / "support" / "ds4")
+        ),
+        is_admin=True,
+    )
+
+    assert result["success"] is True
+    assert settings.ds4.support_dir is None
+    save.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_update_global_settings_clears_ds4_context_to_auto(
     monkeypatch,
     tmp_path,

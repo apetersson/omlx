@@ -1232,6 +1232,20 @@ def _clean_optional_setting_path(value: str | None) -> str | None:
     return value or None
 
 
+def _clean_optional_ds4_support_dir(
+    value: str | None,
+    base_path: Path,
+) -> str | None:
+    """Keep the default DS4 support dir implicit so oMLX can manage it."""
+    cleaned = _clean_optional_setting_path(value)
+    if cleaned is None:
+        return None
+    default_support_dir = (base_path / "support" / "ds4").expanduser().resolve()
+    if Path(cleaned).expanduser().resolve() == default_support_dir:
+        return None
+    return cleaned
+
+
 def _restore_settings_values(target: Any, values: dict[str, Any]) -> None:
     """Restore a settings dataclass/dict-like object from a value snapshot."""
     for key, value in values.items():
@@ -4042,8 +4056,9 @@ async def update_global_settings(
         global_settings.ds4.enabled = request.ds4_enabled
         ds4_changed = True
     if "ds4_support_dir" in request.model_fields_set:
-        global_settings.ds4.support_dir = _clean_optional_setting_path(
-            request.ds4_support_dir
+        global_settings.ds4.support_dir = _clean_optional_ds4_support_dir(
+            request.ds4_support_dir,
+            global_settings.base_path,
         )
         ds4_changed = True
     if "ds4_binary_path" in request.model_fields_set:

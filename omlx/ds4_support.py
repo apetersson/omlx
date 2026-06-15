@@ -54,7 +54,7 @@ DS4_METAL_FILES: tuple[str, ...] = (
     "bin.metal",
     "set_rows.metal",
 )
-_DS4_AUTO_BUILD_FAILURES: dict[str, str] = {}
+_DS4_AUTO_BUILD_FAILURES: dict[tuple[str, str, str], str] = {}
 
 
 class DS4SupportError(RuntimeError):
@@ -68,6 +68,18 @@ def clear_ds4_auto_build_failures() -> None:
     build environment before retrying in the same process.
     """
     _DS4_AUTO_BUILD_FAILURES.clear()
+
+
+def _ds4_auto_build_failure_key(
+    settings: DS4Settings,
+    base_path: Path,
+) -> tuple[str, str, str]:
+    """Key auto-build failures by destination and explicit source override."""
+    return (
+        str(settings.get_support_dir(base_path)),
+        settings.source_repo or "",
+        settings.source_commit or "",
+    )
 
 
 @dataclass(frozen=True)
@@ -522,9 +534,15 @@ def build_ds4_support_from_source(
 
     if source_is_local:
         source_dir = Path(source_value).expanduser().resolve()
+        current_head = _git_head(source_dir)
         if source_commit:
-            current_head = _git_head(source_dir)
-            if current_head and current_head != source_commit:
+            if not current_head:
+                raise DS4SupportError(
+                    f"Cannot verify local DS4 source {source_dir} against "
+                    f"requested commit {source_commit}; use a git checkout or "
+                    "clear the commit override"
+                )
+            if current_head != source_commit:
                 raise DS4SupportError(
                     f"Local DS4 source {source_dir} is at {current_head}, "
                     f"not requested commit {source_commit}"
@@ -534,7 +552,7 @@ def build_ds4_support_from_source(
             destination,
             manifest,
             source_repo=str(source_dir),
-            source_commit=source_commit or _git_head(source_dir),
+            source_commit=source_commit or current_head,
             skip_build=skip_build,
             overwrite=overwrite,
         )
@@ -679,7 +697,7 @@ def ensure_ds4_support(
         if status.ready:
             return status
         if settings.auto_build:
-            failure_key = str(settings.get_support_dir(base))
+            failure_key = _ds4_auto_build_failure_key(settings, base)
             if failure_key in _DS4_AUTO_BUILD_FAILURES:
                 raise DS4SupportError(
                     (status.error_message() or "DS4 support is unavailable")

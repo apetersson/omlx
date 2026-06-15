@@ -374,7 +374,9 @@ class TestDS4SourceBuild:
         assert loaded.binary_sha256 is None
         assert "--ssd-streaming" in loaded.required_cli_flags
 
-    def test_build_from_local_source_stages_validated_support_tree(self, tmp_path):
+    def test_build_from_local_source_stages_validated_support_tree(
+        self, tmp_path, monkeypatch
+    ):
         source = tmp_path / "ds4-source"
         destination = tmp_path / "support" / "ds4"
         manifest = tmp_path / "manifest.json"
@@ -382,6 +384,7 @@ class TestDS4SourceBuild:
         _write_manifest(
             manifest, source_repo=str(source), build_command="make ds4-server"
         )
+        monkeypatch.setattr(ds4_support, "_git_head", lambda _source_dir: "local-test")
 
         result = build_ds4_support_from_source(
             destination_dir=destination,
@@ -398,7 +401,9 @@ class TestDS4SourceBuild:
         assert staged_manifest["source_repo"] == str(source.resolve())
         assert staged_manifest["source_path"] == str(source.resolve())
 
-    def test_build_from_settings_source_override_stages_support_tree(self, tmp_path):
+    def test_build_from_settings_source_override_stages_support_tree(
+        self, tmp_path, monkeypatch
+    ):
         source = tmp_path / "ds4-source"
         destination = tmp_path / "support" / "ds4"
         manifest = tmp_path / "manifest.json"
@@ -409,6 +414,7 @@ class TestDS4SourceBuild:
             build_command="make ds4-server",
         )
         source_commit = "settings-pin"
+        monkeypatch.setattr(ds4_support, "_git_head", lambda _source_dir: source_commit)
 
         result = build_ds4_support_from_source(
             DS4Settings(source_repo=str(source), source_commit=source_commit),
@@ -423,6 +429,26 @@ class TestDS4SourceBuild:
         assert staged_manifest["source_repo"] == str(source.resolve())
         assert staged_manifest["source_commit"] == source_commit
         assert staged_manifest["source_path"] == str(source.resolve())
+
+    def test_build_from_local_source_rejects_unverified_commit(self, tmp_path):
+        source = tmp_path / "ds4-source"
+        destination = tmp_path / "support" / "ds4"
+        manifest = tmp_path / "manifest.json"
+        _write_buildable_ds4_source(source)
+        _write_manifest(
+            manifest, source_repo=str(source), build_command="make ds4-server"
+        )
+
+        with pytest.raises(DS4SupportError) as exc_info:
+            build_ds4_support_from_source(
+                destination_dir=destination,
+                source=source,
+                manifest_path=manifest,
+                validate_environment=False,
+            )
+
+        assert "Cannot verify local DS4 source" in str(exc_info.value)
+        assert not destination.exists()
 
     def test_ensure_ds4_support_builds_on_first_launch_when_enabled(
         self, tmp_path, monkeypatch
@@ -499,6 +525,44 @@ class TestDS4SourceBuild:
             assert expected in str(exc_info.value)
 
         assert calls == 1
+
+    def test_ensure_ds4_support_retries_failed_auto_build_for_new_source(
+        self, tmp_path, monkeypatch
+    ):
+        """Changing admin source overrides gets a fresh first-launch build attempt."""
+        base_path = tmp_path / "base"
+        calls: list[str | None] = []
+
+        def fake_build(settings, **kwargs):
+            calls.append(settings.source_repo)
+            if settings.source_repo == "bad":
+                raise DS4SupportError("bad source")
+            destination = settings.get_support_dir(kwargs["base_path"])
+            _write_complete_support_tree(destination)
+            return None
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+        settings = DS4Settings(auto_build=True, source_repo="bad")
+
+        with pytest.raises(DS4SupportError) as exc_info:
+            ensure_ds4_support(
+                settings,
+                base_path=base_path,
+                system="Darwin",
+                machine="arm64",
+            )
+        assert "bad source" in str(exc_info.value)
+
+        settings.source_repo = "good"
+        status = ensure_ds4_support(
+            settings,
+            base_path=base_path,
+            system="Darwin",
+            machine="arm64",
+        )
+
+        assert status.ready is True
+        assert calls == ["bad", "good"]
 
 
 class TestDS4SupportCopy:
