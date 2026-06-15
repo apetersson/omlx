@@ -378,6 +378,34 @@ class TestDS4BundledSupport:
         assert (status.support_dir / DS4_SERVER_BINARY).is_file()
         assert os.access(status.support_dir / DS4_SERVER_BINARY, os.X_OK)
 
+    def test_ensure_ds4_support_rejects_incomplete_bundled_tree_without_build(
+        self, tmp_path, monkeypatch
+    ):
+        """Broken app/Homebrew bundled support fails instead of runtime-building."""
+        source = tmp_path / "Resources" / BUNDLED_DS4_SUPPORT_DIR_NAME
+        source.mkdir(parents=True)
+        (source / "LICENSE").write_text("MIT\n")
+        calls = 0
+
+        def fake_build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("invalid bundled support should fail before build")
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+
+        with pytest.raises(DS4SupportError) as exc_info:
+            ensure_ds4_support(
+                DS4Settings(auto_build=True),
+                base_path=tmp_path / "base",
+                source_dir=source,
+                system="Darwin",
+                machine="arm64",
+            )
+
+        assert "Bundled DS4 support files are incomplete" in str(exc_info.value)
+        assert calls == 0
+
 
 class TestDS4SourceBuild:
     """Tests for build-from-source DS4 staging."""
@@ -503,6 +531,7 @@ class TestDS4SourceBuild:
         manifest = tmp_path / "manifest.json"
         metal_files = ("fork_attention.metal", "nested/custom_kernel.metal")
         _write_buildable_ds4_source(source, metal_files=metal_files)
+        _write_complete_support_tree(destination)
         _write_manifest(
             manifest, source_repo=str(source), build_command="make ds4-server"
         )
@@ -518,6 +547,7 @@ class TestDS4SourceBuild:
         staged_manifest = json.loads((destination / "manifest.json").read_text())
         assert (destination / "metal" / "fork_attention.metal").is_file()
         assert (destination / "metal" / "nested" / "custom_kernel.metal").is_file()
+        assert not (destination / "metal" / "flash_attn.metal").exists()
         assert staged_manifest["metal_files"] == [
             "metal/fork_attention.metal",
             "metal/nested/custom_kernel.metal",
@@ -710,7 +740,7 @@ class TestDS4SupportCopy:
         """Explicit overwrite refreshes already-copied support files."""
         source = tmp_path / "resources" / "ds4"
         destination = tmp_path / "support" / "ds4"
-        _write_complete_support_tree(source)
+        _write_complete_support_tree(source, metal_files=("fork_attention.metal",))
         _write_complete_support_tree(destination)
         (source / "README.md").write_text("new\n")
         (destination / "README.md").write_text("old\n")
@@ -719,6 +749,8 @@ class TestDS4SupportCopy:
 
         assert result.copied_files
         assert (destination / "README.md").read_text() == "new\n"
+        assert (destination / "metal" / "fork_attention.metal").is_file()
+        assert not (destination / "metal" / "flash_attn.metal").exists()
 
     def test_copy_rejects_incomplete_source_tree(self, tmp_path):
         """Missing bundled files fail clearly; no fetch/build is attempted."""

@@ -282,6 +282,16 @@ def _discover_ds4_metal_relative_paths(root: Path) -> tuple[str, ...]:
     )
 
 
+def _remove_stale_ds4_metal_files(
+    destination: Path,
+    keep_relative_paths: Iterable[str],
+) -> None:
+    keep = set(keep_relative_paths)
+    for rel in _discover_ds4_metal_relative_paths(destination):
+        if rel not in keep:
+            (destination / rel).unlink()
+
+
 def _manifest_ds4_metal_relative_paths(root: Path) -> tuple[str, ...]:
     manifest_path = root / DS4_SUPPORT_MANIFEST
     if not manifest_path.is_file():
@@ -776,18 +786,12 @@ def ensure_ds4_support(
     # support dir is oMLX-owned and can be repaired from bundled resources or
     # built from the pinned source commit.
     if settings.support_dir is None:
-        try:
-            install_bundled_ds4_support_files(
-                settings,
-                base_path=base,
-                source_dir=source_dir,
-                overwrite=True,
-            )
-        except DS4SupportError:
-            # A source checkout/wheel keeps only manifest/LICENSE/README in the
-            # package vendor dir. Treat that as "no bundled runtime tree" and
-            # fall through to the pinned-source build path below.
-            pass
+        install_bundled_ds4_support_files(
+            settings,
+            base_path=base,
+            source_dir=source_dir,
+            overwrite=True,
+        )
         status = inspect_ds4_support(
             settings,
             base_path=base,
@@ -934,6 +938,9 @@ def copy_ds4_support_files(
         raise DS4SupportError(
             f"Bundled DS4 binary is incompatible under {source}: {capability_error}"
         )
+
+    if overwrite:
+        _remove_stale_ds4_metal_files(destination, metal_files)
 
     copied: list[Path] = []
     for rel in required:
