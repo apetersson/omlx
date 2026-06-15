@@ -54,10 +54,20 @@ DS4_METAL_FILES: tuple[str, ...] = (
     "bin.metal",
     "set_rows.metal",
 )
+_DS4_AUTO_BUILD_FAILURES: dict[str, str] = {}
 
 
 class DS4SupportError(RuntimeError):
     """Raised when DS4 support files are unavailable or incomplete."""
+
+
+def clear_ds4_auto_build_failures() -> None:
+    """Clear remembered DS4 auto-build failures.
+
+    Intended for tests and long-running callers that deliberately change the
+    build environment before retrying in the same process.
+    """
+    _DS4_AUTO_BUILD_FAILURES.clear()
 
 
 @dataclass(frozen=True)
@@ -623,13 +633,15 @@ def ensure_ds4_support(
     This is the transparent provisioning path used by managed DS4 launches.  A
     ready configured directory is returned unchanged.  Otherwise, when the user
     has not configured a custom ``ds4.support_dir``, bundled/vendor support
-    files are copied into the default oMLX support directory and validation is
-    retried.  Explicit custom support directories remain user-managed.
+    files are copied into the default oMLX support directory, or the pinned
+    source is built on first DS4 launch when auto-build is enabled.  Explicit
+    custom support directories remain user-managed.
     """
     settings = settings or DS4Settings()
+    base = Path(base_path).expanduser().resolve() if base_path else DEFAULT_BASE_PATH
     status = inspect_ds4_support(
         settings,
-        base_path=base_path,
+        base_path=base,
         system=system,
         machine=machine,
     )
@@ -639,22 +651,67 @@ def ensure_ds4_support(
         raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
 
     # Keep explicit custom support directories fully user-managed.  The default
-    # support dir is oMLX-owned and can be repaired from bundled resources.
+    # support dir is oMLX-owned and can be repaired from bundled resources or
+    # built from the pinned source commit.
     if settings.support_dir is None:
-        install_bundled_ds4_support_files(
-            settings,
-            base_path=base_path,
-            source_dir=source_dir,
-            overwrite=True,
-        )
+        try:
+            install_bundled_ds4_support_files(
+                settings,
+                base_path=base,
+                source_dir=source_dir,
+                overwrite=True,
+            )
+        except DS4SupportError:
+            # A source checkout/wheel keeps only manifest/LICENSE/README in the
+            # package vendor dir. Treat that as "no bundled runtime tree" and
+            # fall through to the pinned-source build path below.
+            pass
         status = inspect_ds4_support(
             settings,
-            base_path=base_path,
+            base_path=base,
             system=system,
             machine=machine,
         )
         if status.ready:
             return status
+        if settings.auto_build:
+            failure_key = str(settings.get_support_dir(base))
+            if failure_key in _DS4_AUTO_BUILD_FAILURES:
+                raise DS4SupportError(
+                    (status.error_message() or "DS4 support is unavailable")
+                    + "; DS4 auto-build previously failed: "
+                    + _DS4_AUTO_BUILD_FAILURES[failure_key]
+                )
+            try:
+                build_ds4_support_from_source(
+                    settings,
+                    base_path=base,
+                    system=system,
+                    machine=machine,
+                )
+            except DS4SupportError as exc:
+                _DS4_AUTO_BUILD_FAILURES[failure_key] = str(exc)
+                raise
+            status = inspect_ds4_support(
+                settings,
+                base_path=base,
+                system=system,
+                machine=machine,
+            )
+            if status.ready:
+                _DS4_AUTO_BUILD_FAILURES.pop(failure_key, None)
+                return status
+            failure_message = (
+                status.error_message() or "built DS4 support is unavailable"
+            )
+            _DS4_AUTO_BUILD_FAILURES[failure_key] = failure_message
+            raise DS4SupportError(failure_message)
+        else:
+            raise DS4SupportError(
+                (status.error_message() or "DS4 support is unavailable")
+                + "; DS4 auto-build is disabled. Run `omlx ds4 install` or "
+                "configure ds4.support_dir / OMLX_DS4_SUPPORT_DIR."
+            )
 
     raise DS4SupportError(status.error_message() or "DS4 support is unavailable")
 
@@ -686,7 +743,7 @@ def find_bundled_ds4_support_dir(
             return candidate
 
     package_candidate = module_path.parent / VENDORED_DS4_SUPPORT_RELATIVE_DIR
-    if package_candidate.is_dir():
+    if (package_candidate / DS4_SERVER_BINARY).is_file():
         return package_candidate
     return None
 

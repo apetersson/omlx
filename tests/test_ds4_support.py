@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import omlx.ds4_support as ds4_support
 from omlx.ds4_support import (
     BUNDLED_DS4_SUPPORT_DIR_NAME,
     BUNDLED_DS4_SUPPORT_ENV,
@@ -15,6 +16,7 @@ from omlx.ds4_support import (
     DS4_SERVER_BINARY,
     DS4SupportError,
     build_ds4_support_from_source,
+    clear_ds4_auto_build_failures,
     copy_ds4_support_files,
     ensure_ds4_support,
     find_bundled_ds4_support_dir,
@@ -277,13 +279,27 @@ class TestDS4BundledSupport:
     def test_find_bundled_support_dir_from_package_vendor(self, tmp_path):
         package_dir = tmp_path / "site-packages" / "omlx"
         source = package_dir / "vendor" / "ds4" / "darwin-arm64"
-        source.mkdir(parents=True)
+        _write_complete_support_tree(source)
         module_file = package_dir / "ds4_support.py"
         module_file.write_text("# module\n")
 
         found = find_bundled_ds4_support_dir(env={}, module_file=module_file)
 
         assert found == source.resolve()
+
+    def test_find_bundled_support_dir_ignores_metadata_only_package_vendor(
+        self, tmp_path
+    ):
+        package_dir = tmp_path / "site-packages" / "omlx"
+        source = package_dir / "vendor" / "ds4" / "darwin-arm64"
+        source.mkdir(parents=True)
+        (source / "manifest.json").write_text("{}\n")
+        module_file = package_dir / "ds4_support.py"
+        module_file.write_text("# module\n")
+
+        found = find_bundled_ds4_support_dir(env={}, module_file=module_file)
+
+        assert found is None
 
     def test_install_bundled_support_files_to_default_dir(self, tmp_path):
         source = tmp_path / "Resources" / BUNDLED_DS4_SUPPORT_DIR_NAME
@@ -337,6 +353,12 @@ class TestDS4BundledSupport:
 class TestDS4SourceBuild:
     """Tests for build-from-source DS4 staging."""
 
+    def setup_method(self):
+        clear_ds4_auto_build_failures()
+
+    def teardown_method(self):
+        clear_ds4_auto_build_failures()
+
     def test_load_manifest_reads_source_pin_without_binary_hash(self, tmp_path):
         manifest = tmp_path / "manifest.json"
         _write_manifest(
@@ -375,6 +397,82 @@ class TestDS4SourceBuild:
         staged_manifest = json.loads((destination / "manifest.json").read_text())
         assert staged_manifest["source_repo"] == str(source.resolve())
         assert staged_manifest["source_path"] == str(source.resolve())
+
+    def test_ensure_ds4_support_builds_on_first_launch_when_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        """Managed DS4 launch can build missing default support files once."""
+        base_path = tmp_path / "base"
+        calls = 0
+
+        def fake_build(settings, **kwargs):
+            nonlocal calls
+            calls += 1
+            destination = settings.get_support_dir(kwargs["base_path"])
+            _write_complete_support_tree(destination)
+            return None
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+
+        status = ensure_ds4_support(
+            DS4Settings(auto_build=True),
+            base_path=base_path,
+            system="Darwin",
+            machine="arm64",
+        )
+
+        assert status.ready is True
+        assert calls == 1
+
+    def test_ensure_ds4_support_auto_build_disabled_fails_without_build(
+        self, tmp_path, monkeypatch
+    ):
+        """Operators can disable first-launch source builds."""
+        calls = 0
+
+        def fake_build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("auto-build should not run")
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+
+        with pytest.raises(DS4SupportError) as exc_info:
+            ensure_ds4_support(
+                DS4Settings(auto_build=False),
+                base_path=tmp_path,
+                system="Darwin",
+                machine="arm64",
+            )
+
+        assert calls == 0
+        assert "auto-build is disabled" in str(exc_info.value)
+
+    def test_ensure_ds4_support_failed_auto_build_is_not_retried(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed auto-build is remembered until support is externally fixed."""
+        calls = 0
+
+        def fake_build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise DS4SupportError("missing make")
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+        settings = DS4Settings(auto_build=True)
+
+        for expected in ("missing make", "previously failed"):
+            with pytest.raises(DS4SupportError) as exc_info:
+                ensure_ds4_support(
+                    settings,
+                    base_path=tmp_path,
+                    system="Darwin",
+                    machine="arm64",
+                )
+            assert expected in str(exc_info.value)
+
+        assert calls == 1
 
 
 class TestDS4SupportCopy:

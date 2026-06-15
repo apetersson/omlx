@@ -806,6 +806,29 @@ class TestServeCommandFunctions:
 
         assert callable(serve_command)
 
+    def test_seed_ds4_support_does_not_build_from_source_on_startup(
+        self, tmp_path, monkeypatch
+    ):
+        """Plain server startup may copy bundled DS4 files, but must not build."""
+        from omlx import cli
+        import omlx.ds4_support as ds4_support
+        from omlx.settings import DS4Settings
+
+        calls = 0
+
+        def fake_build(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("serve startup must not build DS4")
+
+        monkeypatch.setattr(ds4_support, "build_ds4_support_from_source", fake_build)
+
+        cli.seed_ds4_support(
+            SimpleNamespace(base_path=tmp_path, ds4=DS4Settings(auto_build=True))
+        )
+
+        assert calls == 0
+
     def test_serve_model_dir_optional_with_default(self):
         """Test that serve --model-dir is optional with default ~/.omlx/models."""
         result = subprocess.run(

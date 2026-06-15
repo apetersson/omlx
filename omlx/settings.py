@@ -345,6 +345,7 @@ class DS4Settings:
     enabled: bool = True
     support_dir: str | None = None  # None means ~/.omlx/support/ds4
     binary_path: str | None = None  # Hidden/advanced override for ds4-server
+    auto_build: bool = True  # Build pinned DS4 source on first DS4 launch if needed
     context_default_tokens: int | None = None  # None means adaptive by physical RAM
     ready_timeout_ms: int = 600_000
     kv_cache_enabled: bool = True
@@ -393,7 +394,7 @@ class DS4Settings:
         """Return the adaptive DS4 context default based on physical RAM."""
         if self.context_default_tokens is not None:
             return self.context_default_tokens
-        memory_gb = (memory_bytes if memory_bytes is not None else get_system_memory())
+        memory_gb = memory_bytes if memory_bytes is not None else get_system_memory()
         memory_gb = memory_gb / 1024**3
         if memory_gb <= 64:
             return 32_768
@@ -409,6 +410,7 @@ class DS4Settings:
             "enabled": self.enabled,
             "support_dir": self.support_dir,
             "binary_path": self.binary_path,
+            "auto_build": self.auto_build,
             "context_default_tokens": self.context_default_tokens,
             "ready_timeout_ms": self.ready_timeout_ms,
             "kv_cache_enabled": self.kv_cache_enabled,
@@ -433,6 +435,7 @@ class DS4Settings:
             enabled=data.get("enabled", True),
             support_dir=data.get("support_dir"),
             binary_path=data.get("binary_path"),
+            auto_build=data.get("auto_build", True),
             context_default_tokens=data.get("context_default_tokens"),
             ready_timeout_ms=data.get("ready_timeout_ms", 600_000),
             kv_cache_enabled=data.get("kv_cache_enabled", True),
@@ -1069,6 +1072,13 @@ class GlobalSettings:
             self.ds4.support_dir = ds4_support_dir
         if ds4_binary_path := os.getenv("OMLX_DS4_BINARY_PATH"):
             self.ds4.binary_path = ds4_binary_path
+        if ds4_auto_build := os.getenv("OMLX_DS4_AUTO_BUILD"):
+            self.ds4.auto_build = ds4_auto_build.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         if ds4_kv_root := os.getenv("OMLX_DS4_KV_ROOT"):
             self.ds4.kv_root = ds4_kv_root
         if ds4_kv_cache_enabled := os.getenv("OMLX_DS4_KV_CACHE_ENABLED"):
@@ -1090,9 +1100,7 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_DS4_READY_TIMEOUT_MS: {ds4_ready_timeout}"
                 )
-        if ds4_kv_interval := os.getenv(
-            "OMLX_DS4_KV_CACHE_CONTINUED_INTERVAL_TOKENS"
-        ):
+        if ds4_kv_interval := os.getenv("OMLX_DS4_KV_CACHE_CONTINUED_INTERVAL_TOKENS"):
             try:
                 self.ds4.kv_cache_continued_interval_tokens = int(ds4_kv_interval)
             except ValueError:

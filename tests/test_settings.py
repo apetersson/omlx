@@ -444,14 +444,13 @@ class TestDS4Settings:
         base_path = Path("/tmp/omlx")
 
         assert settings.enabled is True
+        assert settings.auto_build is True
         assert settings.get_support_dir(base_path) == Path("/tmp/omlx/support/ds4")
         assert settings.get_binary_path(base_path) == Path(
             "/tmp/omlx/support/ds4/ds4-server"
         )
         assert settings.get_kv_root(base_path) == Path("/tmp/omlx/ds4-kv")
-        assert settings.get_trace_dir(base_path) == Path(
-            "/tmp/omlx/logs/ds4-traces"
-        )
+        assert settings.get_trace_dir(base_path) == Path("/tmp/omlx/logs/ds4-traces")
         assert settings.get_debug_dir(base_path) == Path("/tmp/omlx/logs/ds4-debug")
         assert settings.ready_timeout_ms == 600_000
         assert settings.kv_cache_enabled is True
@@ -488,8 +487,7 @@ class TestDS4Settings:
         assert settings.get_auto_context_tokens(96 * gib) == 100_000
         assert settings.get_auto_context_tokens(256 * gib) == 250_000
         assert (
-            settings.get_auto_context_tokens(512 * gib)
-            == DS4_THINK_MAX_CONTEXT_TOKENS
+            settings.get_auto_context_tokens(512 * gib) == DS4_THINK_MAX_CONTEXT_TOKENS
         )
 
     def test_explicit_context_overrides_auto(self):
@@ -956,6 +954,7 @@ class TestGlobalSettings:
                         },
                         "ds4": {
                             "binary_path": "/opt/ds4/ds4-server",
+                            "auto_build": False,
                             "kv_root": "/ds4-kv",
                             "kv_disk_space_mb": 1234,
                             "ssd_streaming": "on",
@@ -978,6 +977,7 @@ class TestGlobalSettings:
             assert settings.cache.enabled is False
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.ds4.binary_path == "/opt/ds4/ds4-server"
+            assert settings.ds4.auto_build is False
             assert settings.ds4.kv_root == "/ds4-kv"
             assert settings.ds4.kv_disk_space_mb == 1234
             assert settings.ds4.ssd_streaming == "on"
@@ -1449,6 +1449,7 @@ class TestGlobalSettings:
                     "OMLX_DS4_ENABLED": "false",
                     "OMLX_DS4_SUPPORT_DIR": "/env/ds4-support",
                     "OMLX_DS4_BINARY_PATH": "/env/ds4-server",
+                    "OMLX_DS4_AUTO_BUILD": "false",
                     "OMLX_DS4_KV_ROOT": "/env/ds4-kv",
                     "OMLX_DS4_KV_CACHE_ENABLED": "false",
                     "OMLX_DS4_KV_DISK_SPACE_MB": "1234",
@@ -1468,6 +1469,7 @@ class TestGlobalSettings:
                 assert settings.ds4.enabled is False
                 assert settings.ds4.support_dir == "/env/ds4-support"
                 assert settings.ds4.binary_path == "/env/ds4-server"
+                assert settings.ds4.auto_build is False
                 assert settings.ds4.kv_root == "/env/ds4-kv"
                 assert settings.ds4.kv_cache_enabled is False
                 assert settings.ds4.kv_disk_space_mb == 1234

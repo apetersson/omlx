@@ -208,15 +208,11 @@ def serve_command(args):
     # Bind the socket before importing/initializing the server. Uvicorn's
     # normal startup runs ASGI lifespan before binding host/port, which means
     # pinned models can be preloaded before a port conflict is detected.
-    bind_hosts = [
-        h.strip() for h in settings.server.host.split(",") if h.strip()
-    ]
+    bind_hosts = [h.strip() for h in settings.server.host.split(",") if h.strip()]
     if not bind_hosts:
         print("Error: no valid bind hosts configured", file=sys.stderr)
         sys.exit(1)
-    display_urls = ", ".join(
-        f"http://{h}:{settings.server.port}" for h in bind_hosts
-    )
+    display_urls = ", ".join(f"http://{h}:{settings.server.port}" for h in bind_hosts)
     print(f"Binding server at {display_urls}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
@@ -489,7 +485,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     # If the model was chosen interactively (no --model and no explicit tier flags),
     # use the picked model for all tiers instead of letting settings-based tier
     # models override the user's selection.
-    if args.model is None and not (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+    if args.model is None and not (
+        cli_opus_model or cli_sonnet_model or cli_haiku_model
+    ):
         opus_model = None
         sonnet_model = None
         haiku_model = None
@@ -763,12 +761,11 @@ def diagnose_command(args) -> int:
 
 
 def seed_ds4_support(settings) -> None:
-    """Seed default DS4 support files from bundle or pinned source."""
+    """Seed default DS4 support files from bundled app resources."""
     import logging
 
     from .ds4_support import (
         DS4SupportError,
-        build_ds4_support_from_source,
         inspect_ds4_support,
         install_bundled_ds4_support_files,
     )
@@ -776,6 +773,14 @@ def seed_ds4_support(settings) -> None:
     logger = logging.getLogger("omlx.ds4_support")
     ds4_settings = getattr(settings, "ds4", None)
     if ds4_settings is None:
+        return
+
+    status = inspect_ds4_support(ds4_settings, base_path=settings.base_path)
+    if (
+        status.ready
+        or status.unsupported_platform
+        or ds4_settings.support_dir is not None
+    ):
         return
 
     try:
@@ -791,27 +796,6 @@ def seed_ds4_support(settings) -> None:
             )
     except (DS4SupportError, OSError) as exc:
         logger.warning("Bundled DS4 support files are unavailable: %s", exc)
-
-    status = inspect_ds4_support(ds4_settings, base_path=settings.base_path)
-    if (
-        status.ready
-        or status.unsupported_platform
-        or ds4_settings.support_dir is not None
-    ):
-        return
-
-    try:
-        build = build_ds4_support_from_source(
-            ds4_settings,
-            base_path=settings.base_path,
-        )
-        logger.info(
-            "Built DS4 support files from %s to %s",
-            build.source_dir,
-            build.destination_dir,
-        )
-    except (DS4SupportError, OSError) as exc:
-        logger.warning("DS4 support auto-build is unavailable: %s", exc)
 
 
 def ds4_command(args) -> int:

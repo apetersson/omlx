@@ -68,10 +68,19 @@ OMLX_DS4_BUNDLE_SOURCE=/path/to/ds4-support apps/omlx-mac/Scripts/build.sh relea
 Homebrew builds DS4 from the formula's pinned `resource "ds4"` during
 `def install` and installs `ds4-server` plus `metal/` into the package support
 directory. Source-clone users can run `omlx ds4 install` to build the same
-support tree into `~/.omlx/support/ds4`; missing `make`/Apple Command Line
-Tools produce a hint to run `xcode-select --install`. Air-gapped or custom
-prebuilt deployments keep using `ds4.support_dir` / `OMLX_DS4_SUPPORT_DIR` and
-`ds4.binary_path` / `OMLX_DS4_BINARY_PATH`.
+support tree into `~/.omlx/support/ds4`; if they skip that step, the first DS4
+model launch attempts the same pinned-source build when `ds4.auto_build` is
+enabled. Missing `make`/Apple Command Line Tools produce a hint to run
+`xcode-select --install`, and failures are remembered for the process so every
+request does not retry the compile. Air-gapped or custom prebuilt deployments
+keep using `ds4.support_dir` / `OMLX_DS4_SUPPORT_DIR` and `ds4.binary_path` /
+`OMLX_DS4_BINARY_PATH`; set `ds4.auto_build=false` or
+`OMLX_DS4_AUTO_BUILD=false` to require explicit provisioning.
+
+AC #7 ([apetersson/omlx#22](https://github.com/apetersson/omlx/issues/22)):
+source artifacts must keep DS4 auditable by shipping only the source pin
+metadata, while app, Homebrew, and source-clone installs produce `ds4-server`
+from that pinned commit.
 
 ## Output
 
