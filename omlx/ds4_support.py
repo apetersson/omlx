@@ -504,9 +504,13 @@ def build_ds4_support_from_source(
         else settings.get_support_dir(base)
     )
     manifest = load_ds4_support_manifest(manifest_path)
-    source_value = str(source) if source is not None else manifest.source_repo
-    source_commit = commit or manifest.source_commit
-    source_is_local = source is not None and _source_is_local_dir(source)
+    source_value = (
+        str(source)
+        if source is not None
+        else (settings.source_repo or manifest.source_repo)
+    )
+    source_commit = commit or settings.source_commit or manifest.source_commit
+    source_is_local = _source_is_local_dir(source_value)
 
     if validate_environment:
         _raise_if_ds4_build_environment_unavailable(
@@ -517,20 +521,20 @@ def build_ds4_support_from_source(
         )
 
     if source_is_local:
-        source_dir = Path(source).expanduser().resolve()
-        if commit:
+        source_dir = Path(source_value).expanduser().resolve()
+        if source_commit:
             current_head = _git_head(source_dir)
-            if current_head and current_head != commit:
+            if current_head and current_head != source_commit:
                 raise DS4SupportError(
                     f"Local DS4 source {source_dir} is at {current_head}, "
-                    f"not requested commit {commit}"
+                    f"not requested commit {source_commit}"
                 )
         return _build_and_copy_ds4_support(
             source_dir,
             destination,
             manifest,
             source_repo=str(source_dir),
-            source_commit=commit or _git_head(source_dir) or source_commit,
+            source_commit=source_commit or _git_head(source_dir),
             skip_build=skip_build,
             overwrite=overwrite,
         )

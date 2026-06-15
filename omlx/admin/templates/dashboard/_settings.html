@@ -647,6 +647,60 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.ds4.binary_path') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-neutral-50 text-neutral-500 border border-neutral-200">
+                                                {{ t('settings.ds4.next_launch_badge') }}
+                                            </span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.ds4.binary_path_hint') }}</p>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.ds4.binary_path"
+                                           placeholder="{{ t('settings.ds4.binary_path_placeholder') }}"
+                                           class="w-full sm:w-72 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.ds4.auto_build') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.ds4.auto_build_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="globalSettings.ds4.auto_build = !globalSettings.ds4.auto_build"
+                                            :class="globalSettings.ds4.auto_build ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.ds4.auto_build ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.ds4.source_repo') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-neutral-50 text-neutral-500 border border-neutral-200">
+                                                {{ t('settings.ds4.next_launch_badge') }}
+                                            </span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.ds4.source_repo_hint') }}</p>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.ds4.source_repo"
+                                           placeholder="{{ t('settings.ds4.source_repo_placeholder') }}"
+                                           class="w-full sm:w-96 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <div class="flex items-center gap-2">
+                                            <label class="text-sm text-neutral-700">{{ t('settings.ds4.source_commit') }}</label>
+                                            <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-neutral-50 text-neutral-500 border border-neutral-200">
+                                                {{ t('settings.ds4.next_launch_badge') }}
+                                            </span>
+                                        </div>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.ds4.source_commit_hint') }}</p>
+                                    </div>
+                                    <input type="text" x-model="globalSettings.ds4.source_commit"
+                                           placeholder="{{ t('settings.ds4.source_commit_placeholder') }}"
+                                           class="w-full sm:w-72 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.ds4.context_default') }}</label>
                                             <span class="px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-neutral-50 text-neutral-500 border border-neutral-200">
                                                 {{ t('settings.ds4.next_launch_badge') }}

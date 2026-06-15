@@ -346,6 +346,8 @@ class DS4Settings:
     support_dir: str | None = None  # None means ~/.omlx/support/ds4
     binary_path: str | None = None  # Hidden/advanced override for ds4-server
     auto_build: bool = True  # Build pinned DS4 source on first DS4 launch if needed
+    source_repo: str | None = None  # None means manifest source_repo
+    source_commit: str | None = None  # None means manifest source_commit
     context_default_tokens: int | None = None  # None means adaptive by physical RAM
     ready_timeout_ms: int = 600_000
     kv_cache_enabled: bool = True
@@ -411,6 +413,8 @@ class DS4Settings:
             "support_dir": self.support_dir,
             "binary_path": self.binary_path,
             "auto_build": self.auto_build,
+            "source_repo": self.source_repo,
+            "source_commit": self.source_commit,
             "context_default_tokens": self.context_default_tokens,
             "ready_timeout_ms": self.ready_timeout_ms,
             "kv_cache_enabled": self.kv_cache_enabled,
@@ -436,6 +440,8 @@ class DS4Settings:
             support_dir=data.get("support_dir"),
             binary_path=data.get("binary_path"),
             auto_build=data.get("auto_build", True),
+            source_repo=data.get("source_repo"),
+            source_commit=data.get("source_commit"),
             context_default_tokens=data.get("context_default_tokens"),
             ready_timeout_ms=data.get("ready_timeout_ms", 600_000),
             kv_cache_enabled=data.get("kv_cache_enabled", True),
@@ -1079,6 +1085,10 @@ class GlobalSettings:
                 "yes",
                 "on",
             }
+        if ds4_source_repo := os.getenv("OMLX_DS4_SOURCE_REPO"):
+            self.ds4.source_repo = ds4_source_repo
+        if ds4_source_commit := os.getenv("OMLX_DS4_SOURCE_COMMIT"):
+            self.ds4.source_commit = ds4_source_commit
         if ds4_kv_root := os.getenv("OMLX_DS4_KV_ROOT"):
             self.ds4.kv_root = ds4_kv_root
         if ds4_kv_cache_enabled := os.getenv("OMLX_DS4_KV_CACHE_ENABLED"):

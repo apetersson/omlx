@@ -77,10 +77,10 @@ keep using `ds4.support_dir` / `OMLX_DS4_SUPPORT_DIR` and `ds4.binary_path` /
 `OMLX_DS4_BINARY_PATH`; set `ds4.auto_build=false` or
 `OMLX_DS4_AUTO_BUILD=false` to require explicit provisioning.
 
-AC #7 ([apetersson/omlx#22](https://github.com/apetersson/omlx/issues/22)):
-source artifacts must keep DS4 auditable by shipping only the source pin
-metadata, while app, Homebrew, and source-clone installs produce `ds4-server`
-from that pinned commit.
+AC #7 (#22): DS4 support provisioning remains configurable from admin
+settings. The support directory, prebuilt binary path, auto-build toggle,
+source repository, and source commit all persist through
+`/admin/api/global-settings`.
 
 ## Output
 

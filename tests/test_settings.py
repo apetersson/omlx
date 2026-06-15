@@ -445,6 +445,8 @@ class TestDS4Settings:
 
         assert settings.enabled is True
         assert settings.auto_build is True
+        assert settings.source_repo is None
+        assert settings.source_commit is None
         assert settings.get_support_dir(base_path) == Path("/tmp/omlx/support/ds4")
         assert settings.get_binary_path(base_path) == Path(
             "/tmp/omlx/support/ds4/ds4-server"
@@ -501,6 +503,9 @@ class TestDS4Settings:
             enabled=False,
             support_dir="/support",
             binary_path="/support/custom-ds4",
+            auto_build=False,
+            source_repo="https://example.com/ds4.git",
+            source_commit="abc123",
             context_default_tokens=100_000,
             ready_timeout_ms=123,
             kv_cache_enabled=False,
@@ -955,6 +960,8 @@ class TestGlobalSettings:
                         "ds4": {
                             "binary_path": "/opt/ds4/ds4-server",
                             "auto_build": False,
+                            "source_repo": "https://example.com/ds4.git",
+                            "source_commit": "abc123",
                             "kv_root": "/ds4-kv",
                             "kv_disk_space_mb": 1234,
                             "ssd_streaming": "on",
@@ -978,6 +985,8 @@ class TestGlobalSettings:
             assert settings.cache.ssd_cache_dir == "/cache"
             assert settings.ds4.binary_path == "/opt/ds4/ds4-server"
             assert settings.ds4.auto_build is False
+            assert settings.ds4.source_repo == "https://example.com/ds4.git"
+            assert settings.ds4.source_commit == "abc123"
             assert settings.ds4.kv_root == "/ds4-kv"
             assert settings.ds4.kv_disk_space_mb == 1234
             assert settings.ds4.ssd_streaming == "on"
@@ -1450,6 +1459,8 @@ class TestGlobalSettings:
                     "OMLX_DS4_SUPPORT_DIR": "/env/ds4-support",
                     "OMLX_DS4_BINARY_PATH": "/env/ds4-server",
                     "OMLX_DS4_AUTO_BUILD": "false",
+                    "OMLX_DS4_SOURCE_REPO": "https://example.com/env-ds4.git",
+                    "OMLX_DS4_SOURCE_COMMIT": "env123",
                     "OMLX_DS4_KV_ROOT": "/env/ds4-kv",
                     "OMLX_DS4_KV_CACHE_ENABLED": "false",
                     "OMLX_DS4_KV_DISK_SPACE_MB": "1234",
@@ -1470,6 +1481,8 @@ class TestGlobalSettings:
                 assert settings.ds4.support_dir == "/env/ds4-support"
                 assert settings.ds4.binary_path == "/env/ds4-server"
                 assert settings.ds4.auto_build is False
+                assert settings.ds4.source_repo == "https://example.com/env-ds4.git"
+                assert settings.ds4.source_commit == "env123"
                 assert settings.ds4.kv_root == "/env/ds4-kv"
                 assert settings.ds4.kv_cache_enabled is False
                 assert settings.ds4.kv_disk_space_mb == 1234

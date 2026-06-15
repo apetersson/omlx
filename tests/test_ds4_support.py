@@ -398,6 +398,32 @@ class TestDS4SourceBuild:
         assert staged_manifest["source_repo"] == str(source.resolve())
         assert staged_manifest["source_path"] == str(source.resolve())
 
+    def test_build_from_settings_source_override_stages_support_tree(self, tmp_path):
+        source = tmp_path / "ds4-source"
+        destination = tmp_path / "support" / "ds4"
+        manifest = tmp_path / "manifest.json"
+        _write_buildable_ds4_source(source)
+        _write_manifest(
+            manifest,
+            source_repo="https://example.invalid/manifest-default.git",
+            build_command="make ds4-server",
+        )
+        source_commit = "settings-pin"
+
+        result = build_ds4_support_from_source(
+            DS4Settings(source_repo=str(source), source_commit=source_commit),
+            destination_dir=destination,
+            manifest_path=manifest,
+            validate_environment=False,
+        )
+
+        assert result.destination_dir == destination.resolve()
+        assert (destination / DS4_SERVER_BINARY).is_file()
+        staged_manifest = json.loads((destination / "manifest.json").read_text())
+        assert staged_manifest["source_repo"] == str(source.resolve())
+        assert staged_manifest["source_commit"] == source_commit
+        assert staged_manifest["source_path"] == str(source.resolve())
+
     def test_ensure_ds4_support_builds_on_first_launch_when_enabled(
         self, tmp_path, monkeypatch
     ):

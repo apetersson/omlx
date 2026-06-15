@@ -382,8 +382,6 @@ elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-0}" = "1" ]; then
     "$REPO_ROOT/scripts/build-ds4-support.sh" --out "$PACKAGING_DIR/DS4Support" \
         || die "failed to build DS4 support tree"
     DS4_SUPPORT_SOURCE="$PACKAGING_DIR/DS4Support"
-elif [ -f "$REPO_ROOT/../ds4-apetersson/ds4-server" ]; then
-    DS4_SUPPORT_SOURCE="$REPO_ROOT/../ds4-apetersson"
 fi
 
 if [ -n "$DS4_SUPPORT_SOURCE" ]; then

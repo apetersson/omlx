@@ -32,7 +32,12 @@ from pydantic import BaseModel, Field
 
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..model_profiles import EXCLUDED_FROM_PROFILES
-from ..settings import BURST_DECODE_MODES, DS4_MAX_CONTEXT_TOKENS, SubKeyEntry, burst_decode_env
+from ..settings import (
+    BURST_DECODE_MODES,
+    DS4_MAX_CONTEXT_TOKENS,
+    SubKeyEntry,
+    burst_decode_env,
+)
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -242,6 +247,10 @@ class GlobalSettingsRequest(BaseModel):
     # DS4/GGUF backend settings
     ds4_enabled: bool | None = None
     ds4_support_dir: str | None = None
+    ds4_binary_path: str | None = None
+    ds4_auto_build: bool | None = None
+    ds4_source_repo: str | None = None
+    ds4_source_commit: str | None = None
     ds4_context_default_tokens: int | None = None
     ds4_ready_timeout_ms: int | None = None
     ds4_kv_cache_enabled: bool | None = None
@@ -2853,15 +2862,9 @@ async def apply_model_profile(
     engine_pool = _get_engine_pool()
     entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
     is_ds4_entry = (
-        getattr(engine_pool, "_is_ds4_entry", None)
-        if engine_pool is not None
-        else None
+        getattr(engine_pool, "_is_ds4_entry", None) if engine_pool is not None else None
     )
-    is_ds4 = bool(
-        entry is not None
-        and callable(is_ds4_entry)
-        and is_ds4_entry(entry)
-    )
+    is_ds4 = bool(entry is not None and callable(is_ds4_entry) and is_ds4_entry(entry))
     target_max_context = previous_settings.max_context_window
     if is_ds4 and "max_context_window" in profile_settings:
         target_max_context = profile_settings.get("max_context_window")
@@ -3330,6 +3333,10 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "support_dir": str(
                 global_settings.ds4.get_support_dir(global_settings.base_path)
             ),
+            "binary_path": global_settings.ds4.binary_path or "",
+            "auto_build": global_settings.ds4.auto_build,
+            "source_repo": global_settings.ds4.source_repo or "",
+            "source_commit": global_settings.ds4.source_commit or "",
             "context_default_tokens": global_settings.ds4.context_default_tokens,
             "auto_context_tokens": ds4_auto_context,
             "auto_context_tokens_formatted": f"{ds4_auto_context:,}",
@@ -4037,6 +4044,24 @@ async def update_global_settings(
     if "ds4_support_dir" in request.model_fields_set:
         global_settings.ds4.support_dir = _clean_optional_setting_path(
             request.ds4_support_dir
+        )
+        ds4_changed = True
+    if "ds4_binary_path" in request.model_fields_set:
+        global_settings.ds4.binary_path = _clean_optional_setting_path(
+            request.ds4_binary_path
+        )
+        ds4_changed = True
+    if request.ds4_auto_build is not None:
+        global_settings.ds4.auto_build = request.ds4_auto_build
+        ds4_changed = True
+    if "ds4_source_repo" in request.model_fields_set:
+        global_settings.ds4.source_repo = _clean_optional_setting_path(
+            request.ds4_source_repo
+        )
+        ds4_changed = True
+    if "ds4_source_commit" in request.model_fields_set:
+        global_settings.ds4.source_commit = _clean_optional_setting_path(
+            request.ds4_source_commit
         )
         ds4_changed = True
     if "ds4_context_default_tokens" in request.model_fields_set:
@@ -5645,9 +5670,13 @@ async def delete_hf_model(
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
-    settings_manager = _get_settings_manager() if callable(_get_settings_manager) else None
+    settings_manager = (
+        _get_settings_manager() if callable(_get_settings_manager) else None
+    )
     resolved_model_name = model_name
-    if engine_pool is not None and callable(getattr(engine_pool, "resolve_model_id", None)):
+    if engine_pool is not None and callable(
+        getattr(engine_pool, "resolve_model_id", None)
+    ):
         try:
             resolved = engine_pool.resolve_model_id(model_name, settings_manager)
             if isinstance(resolved, str):
@@ -5716,13 +5745,9 @@ async def delete_hf_model(
         if resolved_model_name in loaded_ids:
             try:
                 await engine_pool._unload_engine(resolved_model_name)
-                logger.info(
-                    f"Unloaded model '{resolved_model_name}' before deletion"
-                )
+                logger.info(f"Unloaded model '{resolved_model_name}' before deletion")
             except Exception as e:
-                logger.warning(
-                    f"Failed to unload model '{resolved_model_name}': {e}"
-                )
+                logger.warning(f"Failed to unload model '{resolved_model_name}': {e}")
 
     # Delete from disk
     # Handle macOS resource fork files (._*) that may disappear on non-native

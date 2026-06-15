@@ -89,6 +89,10 @@ async def test_get_global_settings_exposes_ds4_backend_controls(monkeypatch, tmp
     settings.ds4.ssd_streaming = "on"
     settings.ds4.power = 77
     settings.ds4.logs_to_disk = False
+    settings.ds4.binary_path = "/opt/ds4/ds4-server"
+    settings.ds4.auto_build = False
+    settings.ds4.source_repo = "https://example.com/ds4.git"
+    settings.ds4.source_commit = "abc123"
     pool = _ds4_pool()
     pool.get_entry("foo").engine = _FakeStatusDS4Engine()
     monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
@@ -109,6 +113,10 @@ async def test_get_global_settings_exposes_ds4_backend_controls(monkeypatch, tmp
     ds4 = result["ds4"]
     assert ds4["enabled"] is True
     assert ds4["support_dir"] == str(tmp_path / "support" / "ds4")
+    assert ds4["binary_path"] == "/opt/ds4/ds4-server"
+    assert ds4["auto_build"] is False
+    assert ds4["source_repo"] == "https://example.com/ds4.git"
+    assert ds4["source_commit"] == "abc123"
     assert ds4["context_default_tokens"] is None
     assert ds4["auto_context_tokens"] == 100_000
     assert ds4["auto_context_tokens_formatted"] == "100,000"
@@ -138,6 +146,10 @@ async def test_update_global_settings_saves_ds4_backend_controls(monkeypatch, tm
         admin_routes.GlobalSettingsRequest(
             ds4_enabled=False,
             ds4_support_dir="  /tmp/ds4-support  ",
+            ds4_binary_path="  /tmp/ds4-server  ",
+            ds4_auto_build=False,
+            ds4_source_repo="  https://example.com/ds4.git  ",
+            ds4_source_commit="  abc123  ",
             ds4_context_default_tokens=100_000,
             ds4_ready_timeout_ms=42,
             ds4_kv_cache_enabled=False,
@@ -155,6 +167,10 @@ async def test_update_global_settings_saves_ds4_backend_controls(monkeypatch, tm
     assert "ds4" in result["runtime_applied"]
     assert settings.ds4.enabled is False
     assert settings.ds4.support_dir == "/tmp/ds4-support"
+    assert settings.ds4.binary_path == "/tmp/ds4-server"
+    assert settings.ds4.auto_build is False
+    assert settings.ds4.source_repo == "https://example.com/ds4.git"
+    assert settings.ds4.source_commit == "abc123"
     assert settings.ds4.context_default_tokens == 100_000
     assert settings.ds4.ready_timeout_ms == 42
     assert settings.ds4.kv_cache_enabled is False
@@ -620,9 +636,9 @@ async def test_list_models_exposes_ds4_admin_status(monkeypatch, tmp_path):
 
 def test_models_manager_can_render_ds4_gguf_entries():
     """Models Manager local list can show discovered DS4 GGUF files."""
-    template = (_PROJECT_ROOT / "omlx/admin/templates/dashboard/_models.html").read_text(
-        encoding="utf-8"
-    )
+    template = (
+        _PROJECT_ROOT / "omlx/admin/templates/dashboard/_models.html"
+    ).read_text(encoding="utf-8")
 
     assert "model.display_name || model.name" in template
     assert "model.backend_label" in template
@@ -634,18 +650,23 @@ def test_models_manager_can_render_ds4_gguf_entries():
 def test_model_settings_modal_exposes_ds4_supported_controls_only():
     """Admin UI hides unsupported MLX-only controls for DS4-backed models."""
     template = (
-        _PROJECT_ROOT
-        / "omlx/admin/templates/dashboard/_modal_model_settings.html"
+        _PROJECT_ROOT / "omlx/admin/templates/dashboard/_modal_model_settings.html"
     ).read_text(encoding="utf-8")
 
     assert "selectedModel?.engine_type === 'ds4'" in template
     assert 'x-model.number="modelSettings.max_context_window"' in template
-    assert ':max="selectedModel?.engine_type === \'ds4\' ? 1000000 : null"' in template
+    assert ":max=\"selectedModel?.engine_type === 'ds4' ? 1000000 : null\"" in template
     assert "modal.model_settings.max_context_window" in template
     assert "modelSettings." + "ds4_" + "context_tokens" not in template
     assert "selectedModel?.engine_type !== 'ds4'" in template
-    assert "selectedModel?.engine_type !== 'ds4' && reasoningParsers.length > 0" in template
-    assert "selectedModel?.engine_type !== 'ds4' && (!selectedModel?.model_type" in template
+    assert (
+        "selectedModel?.engine_type !== 'ds4' && reasoningParsers.length > 0"
+        in template
+    )
+    assert (
+        "selectedModel?.engine_type !== 'ds4' && (!selectedModel?.model_type"
+        in template
+    )
 
 
 def test_dashboard_saves_ds4_supported_settings_only():
@@ -680,14 +701,18 @@ def test_dashboard_formats_ds4_activity_phase_tps_metadata():
 
 def test_global_settings_ui_exposes_ds4_backend_controls():
     """Admin global settings includes DS4 backend status and launch controls."""
-    template = (_PROJECT_ROOT / "omlx/admin/templates/dashboard/_settings.html").read_text(
-        encoding="utf-8"
-    )
+    template = (
+        _PROJECT_ROOT / "omlx/admin/templates/dashboard/_settings.html"
+    ).read_text(encoding="utf-8")
 
     assert "settings.ds4.section_label" in template
     assert "globalSettings.ds4.status" in template
     assert "globalSettings.ds4.enabled" in template
     assert "globalSettings.ds4.support_dir" in template
+    assert "globalSettings.ds4.binary_path" in template
+    assert "globalSettings.ds4.auto_build" in template
+    assert "globalSettings.ds4.source_repo" in template
+    assert "globalSettings.ds4.source_commit" in template
     assert "globalSettings.ds4.context_default_tokens" in template
     assert "globalSettings.ds4.kv_cache_enabled" in template
     assert "globalSettings.ds4.logs_to_disk" in template
@@ -706,7 +731,14 @@ def test_dashboard_saves_ds4_global_settings():
     assert "ds4: { ...this.globalSettings.ds4, ...data.ds4 }" in js
     assert "ds4_enabled: this.globalSettings.ds4.enabled" in js
     assert "ds4_support_dir: this.globalSettings.ds4.support_dir" in js
-    assert "ds4_context_default_tokens: this.globalSettings.ds4.context_default_tokens || null" in js
+    assert "ds4_binary_path: this.globalSettings.ds4.binary_path" in js
+    assert "ds4_auto_build: this.globalSettings.ds4.auto_build" in js
+    assert "ds4_source_repo: this.globalSettings.ds4.source_repo" in js
+    assert "ds4_source_commit: this.globalSettings.ds4.source_commit" in js
+    assert (
+        "ds4_context_default_tokens: this.globalSettings.ds4.context_default_tokens || null"
+        in js
+    )
     assert "ds4_kv_cache_enabled: this.globalSettings.ds4.kv_cache_enabled" in js
     assert "ds4_kv_root: this.globalSettings.ds4.kv_root" in js
     assert "ds4_kv_disk_space_mb: this.globalSettings.ds4.kv_disk_space_mb" in js
@@ -729,6 +761,17 @@ def test_ds4_context_ui_strings_are_localized():
         "settings.ds4.status_label",
         "settings.ds4.enabled",
         "settings.ds4.support_dir",
+        "settings.ds4.binary_path",
+        "settings.ds4.binary_path_hint",
+        "settings.ds4.binary_path_placeholder",
+        "settings.ds4.auto_build",
+        "settings.ds4.auto_build_hint",
+        "settings.ds4.source_repo",
+        "settings.ds4.source_repo_hint",
+        "settings.ds4.source_repo_placeholder",
+        "settings.ds4.source_commit",
+        "settings.ds4.source_commit_hint",
+        "settings.ds4.source_commit_placeholder",
         "settings.ds4.logs_to_disk",
         "settings.ds4.logs_to_disk_hint",
         "settings.ds4.context_default",
