@@ -15,7 +15,9 @@ permissions:
 
 jobs:
   ds4-support:
-    runs-on: macos-14
+    # The pinned DS4 source uses Metal residency/math APIs unavailable in the
+    # macOS 14/Xcode 15 SDK on GitHub-hosted runners.
+    runs-on: macos-26
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
