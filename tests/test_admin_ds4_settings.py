@@ -79,6 +79,50 @@ def _memory_info(total_bytes: int) -> dict[str, int | str]:
     }
 
 
+def test_engine_info_includes_ds4_commit_link(monkeypatch):
+    """Engine Versions includes the bundled DS4 source pin as a commit link."""
+    from omlx.ds4_support import load_ds4_support_manifest
+
+    manifest = load_ds4_support_manifest()
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: None)
+
+    ds4 = admin_routes._get_engine_info()["ds4"]
+
+    assert ds4["name"] == "ds4"
+    assert ds4["commit"] == manifest.source_commit
+    assert ds4["url"] == (
+        f"https://github.com/antirez/ds4/commit/{manifest.source_commit}"
+    )
+
+
+def test_engine_info_prefers_staged_ds4_manifest(monkeypatch, tmp_path):
+    """A built/custom DS4 support tree reports the recorded resolved commit."""
+    settings = GlobalSettings(base_path=tmp_path)
+    support_dir = settings.ds4.get_support_dir(settings.base_path)
+    support_dir.mkdir(parents=True)
+    source_commit = "abc123def456"
+    (support_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "ds4",
+                "source_repo": "https://github.com/example/ds4-fork.git",
+                "source_commit": source_commit,
+                "platform": "darwin-arm64",
+                "binary": "ds4-server",
+                "build_command": "make ds4-server",
+                "required_cli_flags": ["--ssd-streaming"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    ds4 = admin_routes._get_engine_info()["ds4"]
+
+    assert ds4["commit"] == source_commit
+    assert ds4["url"] == f"https://github.com/example/ds4-fork/commit/{source_commit}"
+
+
 @pytest.mark.asyncio
 async def test_get_global_settings_exposes_ds4_backend_controls(monkeypatch, tmp_path):
     """Global settings API includes DS4 defaults, paths, and lifecycle status."""

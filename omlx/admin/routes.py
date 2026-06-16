@@ -4330,7 +4330,53 @@ def _get_engine_info() -> dict:
             pass
         engines[pkg_name] = info
 
+    engines["ds4"] = _get_ds4_engine_info()
+
     return engines
+
+
+def _get_ds4_engine_info() -> dict:
+    """Get the DS4 support source commit shown in the engine versions panel."""
+    info = {"name": "ds4", "version": None, "commit": None, "url": None}
+    try:
+        from ..ds4_support import DS4_SUPPORT_MANIFEST, load_ds4_support_manifest
+
+        manifest_path = None
+        settings = _get_global_settings() if callable(_get_global_settings) else None
+        if settings is not None:
+            staged_manifest = (
+                settings.ds4.get_support_dir(settings.base_path) / DS4_SUPPORT_MANIFEST
+            )
+            if staged_manifest.is_file():
+                manifest_path = staged_manifest
+
+        manifest = load_ds4_support_manifest(manifest_path)
+        commit = manifest.source_commit.strip()
+        if commit:
+            info["commit"] = commit
+            info["url"] = _github_commit_url(manifest.source_repo, commit)
+    except Exception as exc:
+        logger.debug("Could not read DS4 support manifest for engine info: %s", exc)
+    return info
+
+
+def _github_commit_url(repo_url: str, commit: str) -> str | None:
+    """Build a GitHub commit URL for a repo URL when possible."""
+    repo = repo_url.strip().rstrip("/")
+    commit = commit.strip()
+    if not repo or not commit:
+        return None
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if repo.startswith("git@github.com:"):
+        repo = f"https://github.com/{repo.removeprefix('git@github.com:')}"
+    elif repo.startswith("ssh://git@github.com/"):
+        repo = f"https://github.com/{repo.removeprefix('ssh://git@github.com/')}"
+    elif repo.startswith("http://github.com/"):
+        repo = f"https://github.com/{repo.removeprefix('http://github.com/')}"
+    if not repo.startswith("https://github.com/"):
+        return None
+    return f"{repo}/commit/{commit}"
 
 
 def _get_commit_from_direct_url(dist, default_url: str) -> dict | None:
@@ -4344,10 +4390,11 @@ def _get_commit_from_direct_url(dist, default_url: str) -> dict | None:
             vcs_info = direct_url.get("vcs_info", {})
             commit = vcs_info.get("commit_id")
             if commit:
-                repo_url = direct_url.get("url", default_url).rstrip("/")
-                if repo_url.endswith(".git"):
-                    repo_url = repo_url[:-4]
-                return {"commit": commit, "url": f"{repo_url}/commit/{commit}"}
+                repo_url = direct_url.get("url", default_url)
+                return {
+                    "commit": commit,
+                    "url": _github_commit_url(repo_url, commit),
+                }
     except Exception:
         pass
     return None
