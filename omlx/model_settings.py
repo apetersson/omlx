@@ -92,6 +92,11 @@ class ModelSettings:
             "gemma4_assistant" model.
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
+        ds4_mtp_enabled: Enable DS4/GGUF MTP speculative decoding with an external
+            Flash MTP sidecar. Mutually exclusive with DS4 SSD streaming at launch.
+        ds4_mtp_path: Path to the DS4 MTP sidecar GGUF.
+        ds4_mtp_draft: Maximum DS4 MTP draft tokens (None = ds4-server default).
+        ds4_mtp_margin: DS4 verifier confidence margin (None = ds4-server default).
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -172,6 +177,14 @@ class ModelSettings:
     vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
     vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
 
+    # DS4/GGUF MTP speculative decoding. Uses an external Flash MTP GGUF sidecar
+    # via ds4-server --mtp. Launch code disables SSD streaming whenever this is
+    # active because ds4-server currently treats the two paths as incompatible.
+    ds4_mtp_enabled: bool = False
+    ds4_mtp_path: Optional[str] = None
+    ds4_mtp_draft: Optional[int] = None
+    ds4_mtp_margin: Optional[float] = None
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
@@ -217,6 +230,12 @@ class ModelSettings:
                         f"vlm_mtp_enabled and {name} cannot both be True; "
                         "choose one speculative path per model"
                     )
+        if self.ds4_mtp_enabled and not (self.ds4_mtp_path or "").strip():
+            raise ValueError("ds4_mtp_enabled requires ds4_mtp_path")
+        if self.ds4_mtp_draft is not None and self.ds4_mtp_draft <= 0:
+            raise ValueError("ds4_mtp_draft must be > 0")
+        if self.ds4_mtp_margin is not None and self.ds4_mtp_margin < 0:
+            raise ValueError("ds4_mtp_margin must be >= 0")
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

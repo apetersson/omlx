@@ -273,6 +273,38 @@ class TestDS4LaunchConfig:
         assert "--ssd-streaming" not in command
         assert "--trace" not in command
 
+    def test_build_command_adds_mtp_and_disables_ssd_streaming(self, tmp_path):
+        """MTP sidecars are passed to DS4 and force SSD streaming off."""
+        support = tmp_path / "support" / "ds4"
+        _write_support_tree(support, _ready_server_script())
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"gguf")
+        mtp = tmp_path / "mtp.gguf"
+        mtp.write_bytes(b"gguf")
+        settings = DS4Settings(
+            support_dir=str(support),
+            ssd_streaming="on",
+        )
+        config = DS4LaunchConfig(
+            model_id="model",
+            gguf_path=gguf,
+            settings=settings,
+            base_path=tmp_path,
+            port=12345,
+            mtp_path=mtp,
+            mtp_draft=2,
+            mtp_margin=3.0,
+            platform_system="Darwin",
+            platform_machine="arm64",
+        )
+
+        command = config.build_command(12345)
+
+        assert command[command.index("--mtp") + 1] == str(mtp)
+        assert command[command.index("--mtp-draft") + 1] == "2"
+        assert command[command.index("--mtp-margin") + 1] == "3.0"
+        assert "--ssd-streaming" not in command
+
 
 class TestDS4ManagedProcess:
     """Tests for managed DS4 subprocess lifecycle."""

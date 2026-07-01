@@ -2,6 +2,7 @@
 """Admin settings safeguards for DS4-discovered GGUF models."""
 
 import json
+import struct
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -15,6 +16,40 @@ from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.settings import DS4_MAX_CONTEXT_TOKENS, GlobalSettings
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+_GGUF_TYPE_UINT32 = 4
+_GGUF_TYPE_STRING = 8
+
+
+def _write_gguf_string(f, value: str) -> None:
+    data = value.encode("utf-8")
+    f.write(struct.pack("<Q", len(data)))
+    f.write(data)
+
+
+def _write_gguf_scalar_kv(f, key: str, value) -> None:
+    _write_gguf_string(f, key)
+    if isinstance(value, str):
+        f.write(struct.pack("<I", _GGUF_TYPE_STRING))
+        _write_gguf_string(f, value)
+    else:
+        f.write(struct.pack("<I", _GGUF_TYPE_UINT32))
+        f.write(struct.pack("<I", int(value)))
+
+
+def _write_ds4_mtp_sidecar_header(path: Path) -> None:
+    metadata = {
+        "general.architecture": "deepseek4_mtp_support",
+        "general.name": "DeepSeek V4 Flash MTP",
+        "deepseek4.mtp_layer_count": 1,
+    }
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 0))
+        f.write(struct.pack("<Q", len(metadata)))
+        for key, value in metadata.items():
+            _write_gguf_scalar_kv(f, key, value)
 
 
 class _FakeStatusDS4Engine:
@@ -38,6 +73,7 @@ class _FakeLoadedDS4Engine:
         self.active = active
         self.race_active = race_active
         self.restarted_context_tokens = None
+        self.restarted_model_settings = None
 
     def has_active_requests(self) -> bool:
         return self.active
@@ -49,6 +85,23 @@ class _FakeLoadedDS4Engine:
                 "is currently serving another request; retry when idle"
             )
         self.restarted_context_tokens = context_tokens
+        return True
+
+    async def restart_with_launch_settings(
+        self,
+        *,
+        context_tokens: int | None,
+        model_settings,
+        reason: str = "launch setting change",
+        force: bool = False,
+    ) -> bool:
+        if self.race_active:
+            raise DS4ProxyError(
+                "DS4 launch setting change requires a backend restart, but the backend "
+                "is currently serving another request; retry when idle"
+            )
+        self.restarted_context_tokens = context_tokens
+        self.restarted_model_settings = model_settings
         return True
 
 
@@ -496,6 +549,111 @@ async def test_update_model_settings_allows_noop_ds4_max_context_while_active(
 
 
 @pytest.mark.asyncio
+async def test_update_model_settings_sets_ds4_mtp_and_restarts_loaded(monkeypatch):
+    """DS4 MTP settings validate against the main GGUF and restart idle engines."""
+    pool = _ds4_pool("/models/DeepSeek-V4-Flash.gguf")
+    fake_engine = _FakeLoadedDS4Engine()
+    pool.get_entry("foo").engine = fake_engine
+    manager = MagicMock()
+    manager.get_settings.return_value = ModelSettings()
+    validator_calls = []
+
+    def fake_validate(main_path, mtp_path):
+        validator_calls.append((str(main_path), str(mtp_path)))
+
+    monkeypatch.setattr("omlx.ds4_gguf.validate_ds4_mtp_compatibility", fake_validate)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
+
+    result = await admin_routes.update_model_settings(
+        "foo",
+        admin_routes.ModelSettingsRequest(
+            ds4_mtp_enabled=True,
+            ds4_mtp_path="/models/DeepSeek-V4-Flash-MTP.gguf",
+            ds4_mtp_draft=2,
+            ds4_mtp_margin=3.0,
+        ),
+        is_admin=True,
+    )
+
+    saved = manager.set_settings.call_args.args[1]
+    assert saved.ds4_mtp_enabled is True
+    assert saved.ds4_mtp_path == "/models/DeepSeek-V4-Flash-MTP.gguf"
+    assert saved.ds4_mtp_draft == 2
+    assert saved.ds4_mtp_margin == 3.0
+    assert validator_calls == [
+        ("/models/DeepSeek-V4-Flash.gguf", "/models/DeepSeek-V4-Flash-MTP.gguf")
+    ]
+    assert fake_engine.restarted_model_settings is saved
+    assert result["requires_reload"] is True
+    assert result["auto_reloaded"] is True
+    assert result["ds4_launch_restarted"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_incompatible_ds4_mtp(monkeypatch):
+    """Invalid DS4 MTP sidecars are rejected before settings persist."""
+    pool = _ds4_pool("/models/DeepSeek-V4-Pro.gguf")
+    manager = MagicMock()
+    manager.get_settings.return_value = ModelSettings()
+
+    def fake_validate(main_path, mtp_path):
+        from omlx.ds4_gguf import DS4MTPCompatibilityError
+
+        raise DS4MTPCompatibilityError("not a Flash match")
+
+    monkeypatch.setattr("omlx.ds4_gguf.validate_ds4_mtp_compatibility", fake_validate)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_routes.update_model_settings(
+            "foo",
+            admin_routes.ModelSettingsRequest(
+                ds4_mtp_enabled=True,
+                ds4_mtp_path="/models/DeepSeek-V4-Flash-MTP.gguf",
+            ),
+            is_admin=True,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "not a Flash match" in exc_info.value.detail
+    manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_model_settings_rejects_ds4_mtp_restart_when_active(monkeypatch):
+    """DS4 MTP launch changes do not interrupt active proxy requests."""
+    pool = _ds4_pool("/models/DeepSeek-V4-Flash.gguf")
+    pool.get_entry("foo").engine = _FakeLoadedDS4Engine(active=True)
+    manager = MagicMock()
+    manager.get_settings.return_value = ModelSettings()
+    monkeypatch.setattr(
+        "omlx.ds4_gguf.validate_ds4_mtp_compatibility",
+        lambda main_path, mtp_path: None,
+    )
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_routes.update_model_settings(
+            "foo",
+            admin_routes.ModelSettingsRequest(
+                ds4_mtp_enabled=True,
+                ds4_mtp_path="/models/DeepSeek-V4-Flash-MTP.gguf",
+            ),
+            is_admin=True,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "retry when idle" in exc_info.value.detail
+    manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_update_model_settings_does_not_persist_if_restart_races_active(
     monkeypatch,
 ):
@@ -600,6 +758,40 @@ async def test_list_models_exposes_ds4_display_name(monkeypatch, tmp_path):
     assert result["models"][0]["id"] == "foo"
     assert result["models"][0]["engine_type"] == "ds4"
     assert result["models"][0]["display_name"] == "Foo"
+
+
+@pytest.mark.asyncio
+async def test_list_models_exposes_ds4_mtp_sidecar_candidates(monkeypatch, tmp_path):
+    """Admin model list includes selectable DS4 MTP sidecar GGUFs."""
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    main = model_dir / "DeepSeek-V4-Flash.gguf"
+    main.write_bytes(b"0" * 1000)
+    sidecar = model_dir / "DeepSeek-V4-Flash-MTP.gguf"
+    _write_ds4_mtp_sidecar_header(sidecar)
+
+    pool = _ds4_pool(str(main))
+    manager = MagicMock()
+    manager.get_all_settings.return_value = {}
+    settings = MagicMock()
+    settings.get_effective_model_dirs.return_value = [model_dir]
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: manager)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: None)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+
+    result = await admin_routes.list_models(is_admin=True)
+
+    assert result["ds4_mtp_sidecars"] == [
+        {
+            "display_name": "DeepSeek-V4-Flash-MTP",
+            "path": str(sidecar),
+            "size": sidecar.stat().st_size,
+            "size_formatted": admin_routes.format_size(sidecar.stat().st_size),
+            "source_type": "local",
+            "source_repo_id": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -724,6 +916,10 @@ def test_model_settings_modal_exposes_ds4_supported_controls_only():
     assert 'x-model.number="modelSettings.max_context_window"' in template
     assert ":max=\"selectedModel?.engine_type === 'ds4' ? 1000000 : null\"" in template
     assert "modal.model_settings.max_context_window" in template
+    assert "modal.model_settings.ds4_mtp" in template
+    assert "ds4MtpSidecarCandidates()" in template
+    assert "applyDs4MtpPreset($event.target.value)" in template
+    assert 'x-model="modelSettings.ds4_mtp_path"' in template
     assert "modelSettings." + "ds4_" + "context_tokens" not in template
     assert "selectedModel?.engine_type !== 'ds4'" in template
     assert (
@@ -747,6 +943,11 @@ def test_dashboard_saves_ds4_supported_settings_only():
     assert "const isDs4 = this.selectedModel?.engine_type === 'ds4'" in js
     assert "if (isDs4)" in js
     assert "max_context_window: this.modelSettings.max_context_window || null" in js
+    assert "this.ds4MtpSidecars = data.ds4_mtp_sidecars || []" in js
+    assert "ds4MtpSidecarCandidates()" in js
+    assert "applyDs4MtpPreset(preset)" in js
+    assert "ds4_mtp_enabled: !!this.modelSettings.ds4_mtp_enabled" in js
+    assert "ds4_mtp_path: this.modelSettings.ds4_mtp_enabled" in js
     assert "ds4_" + "context_tokens" not in js
     assert "repetition_penalty: null" in js
     assert "presence_penalty: null" in js
@@ -824,6 +1025,19 @@ def test_ds4_context_ui_strings_are_localized():
         "modal.model_settings.ds4_status_context",
         "modal.model_settings.ds4_status_rss",
         "modal.model_settings.ds4_status_log",
+        "modal.model_settings.ds4_mtp",
+        "modal.model_settings.ds4_mtp_hint",
+        "modal.model_settings.ds4_mtp_path",
+        "modal.model_settings.ds4_mtp_sidecar_select",
+        "modal.model_settings.ds4_mtp_select_placeholder",
+        "modal.model_settings.ds4_mtp_no_sidecars",
+        "modal.model_settings.ds4_mtp_tuning",
+        "modal.model_settings.ds4_mtp_tuning_custom",
+        "modal.model_settings.ds4_mtp_tuning_conservative",
+        "modal.model_settings.ds4_mtp_tuning_balanced",
+        "modal.model_settings.ds4_mtp_tuning_aggressive",
+        "modal.model_settings.ds4_mtp_draft",
+        "modal.model_settings.ds4_mtp_margin",
         "settings.ds4.section_label",
         "settings.ds4.status_label",
         "settings.ds4.enabled",

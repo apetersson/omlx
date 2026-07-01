@@ -197,6 +197,7 @@ class EnginePool:
         if (
             entry.engine_type != "ds4"
             or self._get_ds4_settings().ssd_streaming != "auto"
+            or self._ds4_entry_uses_mtp(entry)
         ):
             return entry.estimated_size
 
@@ -228,6 +229,19 @@ class EnginePool:
             format_size(admission_size),
         )
         return admission_size
+
+    def _ds4_entry_uses_mtp(self, entry: EngineEntry) -> bool:
+        """Return True when per-model settings enable DS4's MTP sidecar."""
+        if entry.engine_type != "ds4" or self._settings_manager is None:
+            return False
+        try:
+            model_settings = self._settings_manager.get_settings(entry.model_id)
+        except Exception:  # noqa: BLE001 - settings should not block admission
+            return False
+        return bool(
+            getattr(model_settings, "ds4_mtp_enabled", False)
+            and getattr(model_settings, "ds4_mtp_path", None)
+        )
 
     async def _settle_ds4_auto_admission_after_eviction(
         self,
@@ -1488,6 +1502,7 @@ class EnginePool:
                         model_settings, "max_context_window", None
                     ),
                     auto_enable_ssd_streaming=entry.ds4_auto_enable_ssd_streaming,
+                    model_settings=model_settings,
                 )
             elif model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)

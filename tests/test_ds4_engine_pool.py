@@ -583,6 +583,37 @@ async def test_engine_pool_loads_ds4_with_per_model_context(
 
 
 @pytest.mark.asyncio
+async def test_engine_pool_loads_ds4_with_per_model_mtp_args(monkeypatch, tmp_path):
+    _patch_fake_process(monkeypatch)
+    pool = _pool_with_ds4(tmp_path)
+    mtp = tmp_path / "MTP.gguf"
+    mtp.write_bytes(b"0" * 100)
+
+    class SettingsManager:
+        def get_settings(self, model_id):
+            from omlx.model_settings import ModelSettings
+
+            return ModelSettings(
+                ds4_mtp_enabled=True,
+                ds4_mtp_path=str(mtp),
+                ds4_mtp_draft=2,
+                ds4_mtp_margin=3.0,
+            )
+
+    pool._settings_manager = SettingsManager()
+
+    await pool.get_engine("foo")
+
+    launch = FakeManagedProcess.instances[0]
+    assert launch.config.mtp_path == mtp.resolve()
+    assert "--mtp" in launch.command
+    assert launch.command[launch.command.index("--mtp") + 1] == str(mtp.resolve())
+    assert launch.command[launch.command.index("--mtp-draft") + 1] == "2"
+    assert launch.command[launch.command.index("--mtp-margin") + 1] == "3.0"
+    assert "--ssd-streaming" not in launch.command
+
+
+@pytest.mark.asyncio
 async def test_engine_pool_auto_enables_ds4_ssd_streaming_when_budget_is_tight(
     monkeypatch, tmp_path
 ):
@@ -604,6 +635,39 @@ async def test_engine_pool_auto_enables_ds4_ssd_streaming_when_budget_is_tight(
     assert launch.config.auto_enable_ssd_streaming is True
     assert "--ssd-streaming" in launch.command
     assert "--ssd-streaming-cache-experts" not in launch.command
+
+
+@pytest.mark.asyncio
+async def test_engine_pool_ds4_mtp_disables_auto_ssd_streaming_admission(
+    monkeypatch, tmp_path
+):
+    """MTP must not load under an auto-streaming memory assumption."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 1_000)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    mtp = tmp_path / "MTP.gguf"
+    mtp.write_bytes(b"0" * 100)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    pool._get_final_ceiling = lambda: 1_500
+    pool.discover_models(str(tmp_path))
+
+    class SettingsManager:
+        def get_settings(self, model_id):
+            from omlx.model_settings import ModelSettings
+
+            return ModelSettings(ds4_mtp_enabled=True, ds4_mtp_path=str(mtp))
+
+    pool._settings_manager = SettingsManager()
+
+    with pytest.raises(InsufficientMemoryError):
+        await pool.get_engine("foo")
+
+    assert pool.get_entry("foo").ds4_auto_enable_ssd_streaming is False
+    assert FakeManagedProcess.instances == []
 
 
 @pytest.mark.asyncio

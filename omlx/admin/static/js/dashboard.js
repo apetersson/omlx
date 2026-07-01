@@ -50,6 +50,10 @@
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
+        'ds4_mtp_enabled',
+        'ds4_mtp_path',
+        'ds4_mtp_draft',
+        'ds4_mtp_margin',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -166,6 +170,7 @@
 
             // Models
             models: [],
+            ds4MtpSidecars: [],
             loadingModels: false,
             reloading: false,
             sortBy: 'id',
@@ -1026,6 +1031,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.models = data.models || [];
+                        this.ds4MtpSidecars = data.ds4_mtp_sidecars || [];
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -1420,6 +1426,38 @@
                 );
             },
 
+            ds4MtpSidecarCandidates() {
+                const sidecars = this.ds4MtpSidecars || [];
+                const currentPath = this.modelSettings?.ds4_mtp_path || '';
+                if (!currentPath || sidecars.some((item) => item.path === currentPath)) {
+                    return sidecars;
+                }
+                return [
+                    {
+                        display_name: currentPath.split('/').pop() || currentPath,
+                        path: currentPath,
+                        size_formatted: '',
+                    },
+                    ...sidecars,
+                ];
+            },
+
+            ds4MtpSidecarLabel(sidecar) {
+                const label = sidecar.display_name || sidecar.path || '';
+                return sidecar.size_formatted ? `${label} (${sidecar.size_formatted})` : label;
+            },
+
+            applyDs4MtpPreset(preset) {
+                const presets = {
+                    conservative: { draft: 1, margin: 3 },
+                    balanced: { draft: 2, margin: 3 },
+                    aggressive: { draft: 4, margin: 1.5 },
+                };
+                const values = presets[preset] || presets.balanced;
+                this.modelSettings.ds4_mtp_draft = values.draft;
+                this.modelSettings.ds4_mtp_margin = values.margin;
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -1521,6 +1559,10 @@
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    ds4_mtp_enabled: s.ds4_mtp_enabled || false,
+                    ds4_mtp_path: s.ds4_mtp_path || '',
+                    ds4_mtp_draft: s.ds4_mtp_draft ?? 2,
+                    ds4_mtp_margin: s.ds4_mtp_margin ?? 3,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     trust_remote_code: s.trust_remote_code || false,
@@ -1971,6 +2013,18 @@
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
+                                    ds4_mtp_enabled: !!this.modelSettings.ds4_mtp_enabled,
+                                    ds4_mtp_path: this.modelSettings.ds4_mtp_enabled
+                                        ? (this.modelSettings.ds4_mtp_path || null)
+                                        : null,
+                                    ds4_mtp_draft: this.modelSettings.ds4_mtp_enabled
+                                        ? (parseInt(this.modelSettings.ds4_mtp_draft) || 2)
+                                        : null,
+                                    ds4_mtp_margin: this.modelSettings.ds4_mtp_enabled
+                                        ? (Number.isFinite(parseFloat(this.modelSettings.ds4_mtp_margin))
+                                            ? parseFloat(this.modelSettings.ds4_mtp_margin)
+                                            : 3)
+                                        : null,
                                     trust_remote_code: false,
                                 };
                             }
@@ -2115,6 +2169,10 @@
                                     vlm_mtp_enabled: false,
                                     vlm_mtp_draft_model: null,
                                     vlm_mtp_draft_block_size: null,
+                                    ds4_mtp_enabled: false,
+                                    ds4_mtp_path: null,
+                                    ds4_mtp_draft: null,
+                                    ds4_mtp_margin: null,
                                 });
                             }
                             return payload;

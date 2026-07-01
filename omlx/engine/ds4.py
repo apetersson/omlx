@@ -254,6 +254,7 @@ class DS4ProcessEngine(BaseEngine):
         base_path: str | Path | None = None,
         context_tokens: int | None = None,
         auto_enable_ssd_streaming: bool = False,
+        model_settings: Any | None = None,
     ):
         self.model_id = model_id
         self._model_path = Path(model_path)
@@ -261,6 +262,7 @@ class DS4ProcessEngine(BaseEngine):
         self.base_path = Path(base_path) if base_path is not None else DEFAULT_BASE_PATH
         self.context_tokens = context_tokens
         self.auto_enable_ssd_streaming = auto_enable_ssd_streaming
+        self.model_settings = model_settings
         self.process: DS4ManagedProcess | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._crash_count = 0
@@ -329,6 +331,7 @@ class DS4ProcessEngine(BaseEngine):
         """Start DS4 and wait for readiness."""
         if self.is_running:
             return
+        mtp_path, mtp_draft, mtp_margin = self._mtp_launch_args(self.model_settings)
         config = DS4LaunchConfig(
             model_id=self.model_id,
             gguf_path=self._model_path,
@@ -336,6 +339,9 @@ class DS4ProcessEngine(BaseEngine):
             base_path=self.base_path,
             context_tokens=self.context_tokens,
             auto_enable_ssd_streaming=self.auto_enable_ssd_streaming,
+            mtp_path=mtp_path,
+            mtp_draft=mtp_draft,
+            mtp_margin=mtp_margin,
         )
         self.process = DS4ManagedProcess(config)
         try:
@@ -368,6 +374,21 @@ class DS4ProcessEngine(BaseEngine):
         """Return the context token count DS4 will launch with."""
         return self.context_tokens or self.settings.get_auto_context_tokens()
 
+    @staticmethod
+    def _mtp_launch_args(
+        model_settings: Any | None,
+    ) -> tuple[Path | None, int | None, float | None]:
+        if model_settings is None or not getattr(model_settings, "ds4_mtp_enabled", False):
+            return None, None, None
+        mtp_path = getattr(model_settings, "ds4_mtp_path", None)
+        if not mtp_path:
+            return None, None, None
+        return (
+            Path(str(mtp_path)).expanduser().resolve(),
+            getattr(model_settings, "ds4_mtp_draft", None),
+            getattr(model_settings, "ds4_mtp_margin", None),
+        )
+
     async def ensure_min_context(self, min_tokens: int) -> bool:
         """Raise DS4 context for this loaded engine if needed.
 
@@ -393,34 +414,58 @@ class DS4ProcessEngine(BaseEngine):
 
     async def restart_with_context(self, context_tokens: int | None) -> bool:
         """Restart this loaded DS4 engine with a new per-engine context override."""
+        return await self.restart_with_launch_settings(
+            context_tokens=context_tokens,
+            model_settings=self.model_settings,
+            reason="context change",
+        )
+
+    async def restart_with_launch_settings(
+        self,
+        *,
+        context_tokens: int | None,
+        model_settings: Any | None,
+        reason: str = "launch setting change",
+        force: bool = False,
+    ) -> bool:
+        """Restart this loaded DS4 engine with new launch-time settings."""
         async with self._lifecycle_lock:
-            if self.context_tokens == context_tokens and self.is_running:
+            if (
+                not force
+                and self.context_tokens == context_tokens
+                and self.model_settings is model_settings
+                and self.is_running
+            ):
                 return False
             if self.has_active_requests():
                 raise DS4ProxyError(
-                    "DS4 context change requires a backend restart, but the backend "
+                    f"DS4 {reason} requires a backend restart, but the backend "
                     "is currently serving another request; retry when idle"
                 )
             old_context_tokens = self.context_tokens
+            old_model_settings = self.model_settings
             was_loaded = self.process is not None
             if was_loaded:
                 await self._stop_locked()
                 if self.has_active_requests():
                     self.context_tokens = old_context_tokens
+                    self.model_settings = old_model_settings
                     await self.start()
                     raise DS4ProxyError(
-                        "DS4 context change requires a backend restart, but the "
+                        f"DS4 {reason} requires a backend restart, but the "
                         "backend is currently serving another request; retry when idle"
                     )
             self.context_tokens = context_tokens
+            self.model_settings = model_settings
             if was_loaded:
                 await self.start()
                 if self.has_active_requests():
                     await self._stop_locked()
                     self.context_tokens = old_context_tokens
+                    self.model_settings = old_model_settings
                     await self.start()
                     raise DS4ProxyError(
-                        "DS4 context change requires a backend restart, but the "
+                        f"DS4 {reason} requires a backend restart, but the "
                         "backend is currently serving another request; retry when idle"
                     )
             return was_loaded

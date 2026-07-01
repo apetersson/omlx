@@ -155,6 +155,11 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
+    # DS4/GGUF MTP sidecar passed to ds4-server --mtp
+    ds4_mtp_enabled: bool | None = None
+    ds4_mtp_path: str | None = None
+    ds4_mtp_draft: int | None = None
+    ds4_mtp_margin: float | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -504,6 +509,9 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
     )
     for key in unsupported_none_fields:
         settings[key] = None
@@ -523,6 +531,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
+    settings["ds4_mtp_enabled"] = False
 
     unsupported_ct_kwargs = {
         "enable_thinking",
@@ -612,6 +621,10 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
     settings.vlm_mtp_draft_block_size = None
+    settings.ds4_mtp_enabled = False
+    settings.ds4_mtp_path = None
+    settings.ds4_mtp_draft = None
+    settings.ds4_mtp_margin = None
 
 
 def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
@@ -1853,6 +1866,72 @@ def _admin_ds4_status(ds4_status: dict[str, Any] | None) -> dict[str, Any] | Non
     return status
 
 
+def _list_ds4_mtp_sidecars(global_settings: Any | None) -> list[dict[str, Any]]:
+    """Return selectable DS4 MTP sidecars from configured model directories."""
+    if global_settings is None:
+        return []
+    try:
+        model_dirs = global_settings.get_effective_model_dirs()
+    except Exception:
+        try:
+            model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+        except Exception:
+            return []
+
+    from ..ds4_gguf import collect_ds4_mtp_gguf_sidecar_candidates
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for model_dir in model_dirs:
+        root = Path(model_dir).expanduser().resolve()
+        if not root.is_dir():
+            continue
+        try:
+            first_level_dirs = [
+                path
+                for path in root.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            ]
+        except OSError as e:
+            logger.debug("Could not list DS4 MTP sidecars in %s: %s", root, e)
+            continue
+
+        containers = [root, *first_level_dirs]
+        for group in first_level_dirs:
+            try:
+                containers.extend(
+                    path
+                    for path in group.iterdir()
+                    if path.is_dir() and not path.name.startswith(".")
+                )
+            except OSError as e:
+                logger.debug("Could not list DS4 MTP sidecars in %s: %s", group, e)
+
+        for container in containers:
+            try:
+                paths = list(container.iterdir())
+            except OSError as e:
+                logger.debug("Could not list DS4 MTP sidecars in %s: %s", container, e)
+                continue
+            for candidate in collect_ds4_mtp_gguf_sidecar_candidates(container, paths):
+                path = str(candidate.path)
+                if path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(
+                    {
+                        "display_name": candidate.display_name,
+                        "path": path,
+                        "size": candidate.size,
+                        "size_formatted": format_size(candidate.size),
+                        "source_type": candidate.source_type,
+                        "source_repo_id": candidate.source_repo_id,
+                    }
+                )
+    candidates.sort(key=lambda item: item["display_name"].lower())
+    return candidates
+
+
 def _admin_ds4_global_status(engine_pool: Any, *, enabled: bool) -> dict[str, Any]:
     """Summarize DS4 model lifecycle state for global settings UI."""
     summary: dict[str, Any] = {
@@ -2041,7 +2120,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             }
         )
 
-    return {"models": models}
+    return {
+        "models": models,
+        "ds4_mtp_sidecars": _list_ds4_mtp_sidecars(global_settings),
+    }
 
 
 @router.post("/api/models/{model_id}/unload")
@@ -2189,6 +2271,12 @@ async def update_model_settings(
     # Get current settings
     current_settings = settings_manager.get_settings(model_id)
     previous_max_context_window = current_settings.max_context_window
+    previous_ds4_mtp_settings = (
+        current_settings.ds4_mtp_enabled,
+        current_settings.ds4_mtp_path,
+        current_settings.ds4_mtp_draft,
+        current_settings.ds4_mtp_margin,
+    )
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -2257,8 +2345,6 @@ async def update_model_settings(
                 entry.engine_type = type_to_engine.get(override_value, "batched")
             else:
                 # Reset to auto-detected type
-                from pathlib import Path
-
                 from ..model_discovery import detect_model_type
 
                 detected_type = detect_model_type(Path(entry.model_path))
@@ -2454,6 +2540,61 @@ async def update_model_settings(
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
 
+    # DS4/GGUF MTP sidecar passed through to ds4-server --mtp.
+    ds4_mtp_fields = {
+        "ds4_mtp_enabled",
+        "ds4_mtp_path",
+        "ds4_mtp_draft",
+        "ds4_mtp_margin",
+    }
+    if sent & ds4_mtp_fields:
+        if not engine_pool._is_ds4_entry(entry):
+            requested_enable = (
+                bool(request.ds4_mtp_enabled)
+                if "ds4_mtp_enabled" in sent
+                else current_settings.ds4_mtp_enabled
+            )
+            requested_path = (
+                request.ds4_mtp_path
+                if "ds4_mtp_path" in sent
+                else current_settings.ds4_mtp_path
+            )
+            if requested_enable or requested_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DS4 MTP settings are only supported for DS4 GGUF models.",
+                )
+
+        if "ds4_mtp_path" in sent:
+            raw_path = request.ds4_mtp_path.strip() if request.ds4_mtp_path else None
+            current_settings.ds4_mtp_path = raw_path or None
+        if "ds4_mtp_draft" in sent:
+            value = request.ds4_mtp_draft
+            current_settings.ds4_mtp_draft = int(value) if value and value > 0 else None
+        if "ds4_mtp_margin" in sent:
+            value = request.ds4_mtp_margin
+            current_settings.ds4_mtp_margin = (
+                float(value) if value is not None and value >= 0 else None
+            )
+        if "ds4_mtp_enabled" in sent:
+            current_settings.ds4_mtp_enabled = bool(request.ds4_mtp_enabled)
+
+        if current_settings.ds4_mtp_enabled:
+            if not current_settings.ds4_mtp_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DS4 MTP requires a path to a Flash MTP sidecar GGUF.",
+                )
+            try:
+                from ..ds4_gguf import validate_ds4_mtp_compatibility
+
+                validate_ds4_mtp_compatibility(
+                    Path(entry.model_path),
+                    Path(current_settings.ds4_mtp_path),
+                )
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
@@ -2464,7 +2605,6 @@ async def update_model_settings(
             # the one that catches mlx-community converted weights where the
             # default sanitize path stripped the MTP heads.
             import json
-            from pathlib import Path
 
             from ..utils.model_loading import _is_mtp_compatible
 
@@ -2641,32 +2781,67 @@ async def update_model_settings(
                         settings=profile_settings,
                     )
 
-    ds4_context_restarted = False
-    ds4_context_requires_restart = (
+    current_ds4_mtp_settings = (
+        current_settings.ds4_mtp_enabled,
+        current_settings.ds4_mtp_path,
+        current_settings.ds4_mtp_draft,
+        current_settings.ds4_mtp_margin,
+    )
+    ds4_context_changed = (
         "max_context_window" in sent
         and current_settings.max_context_window != previous_max_context_window
-        and entry.engine is not None
-        and engine_pool._is_ds4_entry(entry)
     )
-    if ds4_context_requires_restart and entry.engine.has_active_requests():
+    ds4_mtp_changed = bool(sent & ds4_mtp_fields) and (
+        current_ds4_mtp_settings != previous_ds4_mtp_settings
+    )
+    ds4_launch_requires_restart = (
+        entry.engine is not None
+        and engine_pool._is_ds4_entry(entry)
+        and (ds4_context_changed or ds4_mtp_changed)
+    )
+    if ds4_launch_requires_restart and entry.engine.has_active_requests():
         raise HTTPException(
             status_code=409,
             detail=(
-                "DS4 context change requires a backend restart, but the backend "
+                "DS4 launch setting change requires a backend restart, but the backend "
                 "is currently serving another request; retry when idle"
             ),
         )
 
-    if ds4_context_requires_restart:
+    ds4_launch_restarted = False
+    if ds4_launch_requires_restart:
+        restart_with_launch_settings = getattr(
+            entry.engine, "restart_with_launch_settings", None
+        )
         restart_with_context = getattr(entry.engine, "restart_with_context", None)
-        if callable(restart_with_context):
+        if callable(restart_with_launch_settings):
             from ..engine.ds4 import DS4ProxyError
 
             try:
-                ds4_context_restarted = bool(
+                ds4_launch_restarted = bool(
+                    await restart_with_launch_settings(
+                        context_tokens=current_settings.max_context_window,
+                        model_settings=current_settings,
+                        reason="launch setting change",
+                        force=True,
+                    )
+                )
+                if ds4_launch_restarted:
+                    get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
+                    if callable(get_rss):
+                        entry.actual_size = get_rss() or entry.actual_size
+            except DS4ProxyError as e:
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+        elif callable(restart_with_context) and ds4_context_changed:
+            from ..engine.ds4 import DS4ProxyError
+
+            try:
+                ds4_launch_restarted = bool(
                     await restart_with_context(current_settings.max_context_window)
                 )
-                if ds4_context_restarted:
+                if ds4_launch_restarted:
                     get_rss = getattr(entry.engine, "get_process_rss_bytes", None)
                     if callable(get_rss):
                         entry.actual_size = get_rss() or entry.actual_size
@@ -2726,10 +2901,11 @@ async def update_model_settings(
         "settings": current_settings.to_dict(),
         "model_type": entry.model_type,
         "engine_type": entry.engine_type,
-        "requires_reload": requires_reload or ds4_context_requires_restart,
+        "requires_reload": requires_reload or ds4_launch_requires_restart,
         "auto_unloaded": auto_unloaded,
-        "auto_reloaded": auto_reloaded or ds4_context_restarted,
-        "ds4_context_restarted": ds4_context_restarted,
+        "auto_reloaded": auto_reloaded or ds4_launch_restarted,
+        "ds4_context_restarted": ds4_launch_restarted and ds4_context_changed,
+        "ds4_launch_restarted": ds4_launch_restarted,
     }
 
 

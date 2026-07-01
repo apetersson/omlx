@@ -76,6 +76,9 @@ class DS4LaunchConfig:
     port: int | None = None
     host: str = DS4_HOST
     auto_enable_ssd_streaming: bool = False
+    mtp_path: Path | None = None
+    mtp_draft: int | None = None
+    mtp_margin: float | None = None
     trace_timestamp: str | None = None
     platform_system: str | None = None
     platform_machine: str | None = None
@@ -150,6 +153,12 @@ class DS4LaunchConfig:
         context_tokens = self.context_tokens or self.settings.get_auto_context_tokens()
         if context_tokens:
             args.extend(["--ctx", str(context_tokens)])
+        if self.mtp_path is not None:
+            args.extend(["--mtp", str(self.mtp_path)])
+            if self.mtp_draft is not None:
+                args.extend(["--mtp-draft", str(self.mtp_draft)])
+            if self.mtp_margin is not None:
+                args.extend(["--mtp-margin", str(self.mtp_margin)])
         if self.settings.kv_cache_enabled:
             args.extend(
                 [
@@ -171,6 +180,8 @@ class DS4LaunchConfig:
 
     def should_enable_ssd_streaming(self) -> bool:
         """Resolve SSD streaming mode for this launch."""
+        if self.mtp_path is not None:
+            return False
         if self.settings.ssd_streaming == "on":
             return True
         if self.settings.ssd_streaming == "off":
