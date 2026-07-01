@@ -1,18 +1,20 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.4rc1.tar.gz"
-  sha256 "0adaa65c1900f3bc1b3f9fb3ac7a288991495968477e4ebeea18e831b994f448"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.4.4.tar.gz"
+  sha256 "ff06063b215cd9f9ea6d311069f13f0523164cbb9eb2d05e29ef5b48d4dcbf48"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
 
+  option "with-custom-kernel",
+         "Build native custom kernels for GLM-5.2 and MiniMax M3 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
 
   depends_on "rust" => :build
-  depends_on "python@3.11"
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
+  depends_on "python@3.11"
 
   # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
   # mlx-lm. Fetch source separately so we can patch the pin before install.
@@ -24,6 +26,15 @@ class Omlx < Formula
   resource "ds4" do
     url "https://github.com/antirez/ds4.git",
       revision: "5b95fa1c4f2371013dc6be3745321bdc080d7c61"
+  end
+
+  # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
+  # language model so the first TTS request does not download into the
+  # Homebrew venv at runtime.
+  resource "en-core-web-sm" do
+    url "https://github.com/explosion/spacy-models/releases/download/" \
+        "en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+    sha256 "1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
   end
 
   service do
@@ -45,6 +56,17 @@ class Omlx < Formula
     # C/C++ extension builds use LDFLAGS.
     ENV.append "LDFLAGS", "-Wl,-headerpad_max_install_names"
     ENV.append "RUSTFLAGS", "-C link-arg=-Wl,-headerpad_max_install_names"
+    if build.with?("custom-kernel")
+      kernel_sources = [
+        buildpath/"omlx/custom_kernels/glm_moe_dsa/csrc",
+        buildpath/"omlx/custom_kernels/minimax_m3/csrc",
+      ]
+      unless kernel_sources.all?(&:directory?)
+        odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
+      end
+
+      ENV["OMLX_WITH_CUSTOM_KERNEL"] = "1"
+    end
 
     # Install omlx (with optional grammar extra for structured output)
     install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
@@ -52,11 +74,30 @@ class Omlx < Formula
            "--no-binary", "cohere_melody,pydantic-core,rpds-py,tiktoken",
            install_spec
 
+    if build.with?("custom-kernel")
+      system libexec/"bin/python", "-c", <<~PYTHON
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.minimax_m3 import fast as minimax_fast
+        assert glm_fast.is_native_available(), glm_fast.import_error()
+        assert minimax_fast.is_native_available(), minimax_fast.import_error()
+      PYTHON
+    end
+
     # Install mlx-audio with patched mlx-lm pin to avoid version conflict
     resource("mlx-audio").stage do
       inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system libexec/"bin/pip", "install", ".[all]"
     end
+
+    # Install the spaCy English model required by misaki for Kokoro TTS.
+    # Homebrew's cached resource path is hash-prefixed, which pip rejects
+    # as an invalid wheel filename. Copy it back to the canonical basename.
+    spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
+    cp resource("en-core-web-sm").cached_download, spacy_model_wheel
+    system libexec/"bin/pip", "install", "--no-deps",
+           spacy_model_wheel
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
     system libexec/"bin/pip", "install", "python-multipart>=0.0.5"
@@ -97,7 +138,7 @@ class Omlx < Formula
   # write to RECORD inside `def install` is wiped before the user
   # sees it.
   def post_install
-    return unless build.with?("grammar")
+    return if build.without?("grammar")
 
     ohai "Patching xgrammar macOS arm64 wheel"
     py = libexec/"bin/python"
@@ -146,5 +187,7 @@ class Omlx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
+    system libexec/"bin/python", "-c",
+           "import spacy; spacy.load('en_core_web_sm')"
   end
 end

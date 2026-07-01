@@ -300,6 +300,24 @@ class BatchedEngine(BaseEngine):
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
 
+        # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
+        # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
+        # below their context window. Installed after TurboQuant so it is the
+        # outer wrapper and only grabs non-quantized 256 prefill; all other
+        # cases (incl. TurboQuant caches, other head dims, decode, short
+        # prefill) fall through to the prior SDPA unchanged. Passthrough-safe to
+        # install unconditionally — the route is strictly gated. Disable via
+        # model_settings.sdpa256_prefill_enabled = False.
+        if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
+            try:
+                from ..patches.sdpa256_attention import (
+                    apply_sdpa256_attention_patch,
+                )
+
+                apply_sdpa256_attention_patch()
+            except Exception:
+                logger.debug("sdpa256 attention patch not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)
@@ -672,6 +690,8 @@ class BatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
+                    generated_at=getattr(output, "generated_at", None),
+                    generated_until=getattr(output, "generated_until", None),
                 )
         except GeneratorExit:
             # Client disconnected

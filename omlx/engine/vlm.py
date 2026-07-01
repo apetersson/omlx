@@ -571,6 +571,128 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
         _vu.load_config = original
 
 
+def _is_mlx_format_safetensors_dir(model_dir: Path) -> bool:
+    """Return True when the first safetensors shard declares ``format=mlx``."""
+    import safetensors
+
+    try:
+        weight_files = sorted(
+            sf
+            for sf in model_dir.glob("*.safetensors")
+            if not sf.name.endswith("consolidated.safetensors")
+        )
+    except Exception:
+        return False
+    if not weight_files:
+        return False
+
+    try:
+        with safetensors.safe_open(str(weight_files[0]), framework="np") as f:
+            metadata = f.metadata()
+    except Exception:
+        return False
+    return isinstance(metadata, dict) and metadata.get("format") == "mlx"
+
+
+@contextlib.contextmanager
+def _drop_gemma4_mlx_shared_kv_extras_on_load(model_dir: Path):
+    """Drop Gemma4 shared-KV extra weights for MLX-format VLM checkpoints.
+
+    mlx-vlm skips model sanitizers when safetensors metadata is ``format=mlx``.
+    Gemma4 E2B/E4B MLX checkpoints still ship K/V tensors for shared-KV layers,
+    but the mlx-vlm model tree intentionally omits those modules.  If the
+    extras reach strict ``load_weights``, VLM loading fails and oMLX falls back
+    to text-only LLM.  Scope the fix to Gemma4 MLX-format models whose config
+    declares shared-KV layers; 26B/31B Gemma4 models have zero shared-KV layers
+    and remain no-op.
+    """
+    config_path = model_dir / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        yield
+        return
+
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        yield
+        return
+
+    if config.get("model_type") != "gemma4":
+        yield
+        return
+    if text_config.get("model_type") != "gemma4_text":
+        yield
+        return
+    if not _is_mlx_format_safetensors_dir(model_dir):
+        yield
+        return
+
+    try:
+        num_layers = int(text_config.get("num_hidden_layers") or 0)
+        num_shared = int(text_config.get("num_kv_shared_layers") or 0)
+    except (TypeError, ValueError):
+        yield
+        return
+    if num_layers <= 0 or num_shared <= 0 or num_shared >= num_layers:
+        yield
+        return
+
+    first_shared = num_layers - num_shared
+    drop_modules = {"k_proj", "v_proj", "k_norm", "v_norm"}
+    layer_prefix = "language_model.model.layers."
+
+    def _is_shared_kv_extra(key: str) -> bool:
+        if not key.startswith(layer_prefix):
+            return False
+        parts = key[len(layer_prefix) :].split(".")
+        if len(parts) < 4 or parts[1] != "self_attn":
+            return False
+        try:
+            layer_idx = int(parts[0])
+        except ValueError:
+            return False
+        return first_shared <= layer_idx < num_layers and parts[2] in drop_modules
+
+    import mlx.nn as _nn
+
+    original_load_weights = _nn.Module.load_weights
+    dropped = 0
+
+    def _patched_load_weights(self, weights_items, *args, **kwargs):
+        nonlocal dropped
+        if isinstance(weights_items, str):
+            return original_load_weights(self, weights_items, *args, **kwargs)
+
+        filtered = []
+        local_dropped = 0
+        for item in weights_items:
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) >= 2
+                and isinstance(item[0], str)
+                and _is_shared_kv_extra(item[0])
+            ):
+                local_dropped += 1
+                continue
+            filtered.append(item)
+        dropped += local_dropped
+        return original_load_weights(self, filtered, *args, **kwargs)
+
+    _nn.Module.load_weights = _patched_load_weights
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original_load_weights
+        if dropped:
+            logger.info(
+                "Dropped %d Gemma4 shared-KV extra weights for MLX-format "
+                "checkpoint %s",
+                dropped,
+                model_dir.name,
+            )
+
+
 _NESTED_VIS_PREFIX = "language_model.model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
 
@@ -589,6 +711,12 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
     if _read_config_model_type(model_dir) != MINIMAX_M3_VL_MODEL_TYPE:
         yield
         return
+
+    from ..patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
 
     import safetensors
     from mlx_vlm.models.minimax_m3_vl import minimax_m3_vl as _minimax_m3_vl
@@ -868,6 +996,118 @@ def _count_image_tokens(
     return image_parts * per_image_upper_bound
 
 
+def _smart_resize_tokens(
+    h: int, w: int, patch_size: int, merge_size: int,
+    min_pixels: int, max_pixels: int,
+) -> int:
+    """Real merged-token count for one image of pixel size (h, w), mirroring
+    the Qwen image processor's ``smart_resize`` -> grid_thw ->
+    ``(t*h*w)//merge**2`` pipeline (t=1 for a still image). Pure arithmetic;
+    no pixel decode. This is the *exact* count the real chat path produces, so
+    it never under-counts the prefill-memory guard."""
+    import math
+
+    factor = patch_size * merge_size
+    if h <= 0 or w <= 0:
+        return 0
+    h_bar = round(h / factor) * factor
+    w_bar = round(w / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((h * w) / max_pixels)
+        h_bar = max(factor, math.floor(h / beta / factor) * factor)
+        w_bar = max(factor, math.floor(w / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (h * w))
+        h_bar = math.ceil(h * beta / factor) * factor
+        w_bar = math.ceil(w * beta / factor) * factor
+    return (h_bar // patch_size) * (w_bar // patch_size) // (merge_size ** 2)
+
+
+def _read_image_dims(part: dict) -> Optional[tuple]:
+    """Best-effort, decode-free ``(width, height)`` for an OpenAI image part.
+
+    Handles ``data:`` base64 URIs, raw base64, and local file paths via a lazy
+    ``PIL.Image.open`` (reads the header only, not pixels). Returns ``None`` for
+    anything that would need a network fetch or that fails to parse, so callers
+    fall back to the conservative per-image upper bound."""
+    import base64 as _b64
+    import binascii
+    import io as _io
+
+    from PIL import Image as _Image
+
+    obj = part.get("image_url")
+    if obj is None:
+        obj = part.get("input_image") or part.get("image")
+    url = obj if isinstance(obj, str) else (obj.get("url") if isinstance(obj, dict) else None)
+    if not isinstance(url, str) or not url:
+        return None
+
+    raw = None
+    s = url.strip()
+    if s.startswith("data:"):
+        _, sep, encoded = s.partition(",")
+        if sep == ",":
+            try:
+                raw = _b64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                return None
+    elif s.startswith(("http://", "https://")):
+        return None  # no network in preflight
+    else:
+        try:
+            raw = _b64.b64decode(s, validate=True)
+        except (binascii.Error, ValueError):
+            raw = None  # not base64 -> treat as path below
+
+    try:
+        if raw is not None:
+            with _Image.open(_io.BytesIO(raw)) as im:
+                return im.size  # (width, height)
+        with _Image.open(s) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _count_image_tokens_real(
+    messages: list[dict[str, Any]],
+    processor: Any,
+    *,
+    upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+) -> int:
+    """Sum the *real* per-image token contribution from actual image
+    dimensions, instead of charging every image the model's ``max_pixels``
+    ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
+    be read decode-free or the processor isn't a Qwen-style one, so the guard
+    still never under-counts."""
+    ip = getattr(processor, "image_processor", None) or processor
+    ps = getattr(ip, "patch_size", None)
+    ms = getattr(ip, "merge_size", None)
+    minp = getattr(ip, "min_pixels", None)
+    maxp = getattr(ip, "max_pixels", None)
+    qwen_ok = all(
+        isinstance(x, int) and x > 0 for x in (ps, ms, minp, maxp)
+    )
+
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("image_url", "image", "input_image"):
+                continue
+            wh = _read_image_dims(part) if qwen_ok else None
+            if wh is None:
+                total += upper_bound
+            else:
+                total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
+    return total
+
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -1122,6 +1362,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_torch_free_image_processor()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
+                _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
@@ -1196,6 +1437,12 @@ class VLMBatchedEngine(BaseEngine):
             self._tokenizer = copy.deepcopy(self._processor.tokenizer)
         else:
             self._tokenizer = copy.deepcopy(self._processor)
+        if self._tokenizer is None or not callable(
+            getattr(self._tokenizer, "encode", None)
+        ):
+            raise RuntimeError(
+                f"VLM processor for {self._model_name} did not provide a usable tokenizer"
+            )
 
         if self.is_diffusion_model:
             self._inject_tool_calling(self._tokenizer)
@@ -1250,6 +1497,18 @@ class VLMBatchedEngine(BaseEngine):
                 )
                 scheduler._set_model_info_for_monitor()
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+
+        # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
+        # batched.py for rationale. Passthrough-safe; strictly gated route.
+        if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
+            try:
+                from ..patches.sdpa256_attention import (
+                    apply_sdpa256_attention_patch,
+                )
+
+                apply_sdpa256_attention_patch()
+            except Exception:
+                logger.debug("sdpa256 attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -1357,19 +1616,25 @@ class VLMBatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        if self._engine:
-            await self._engine.stop()
-            if hasattr(self._engine, "engine") and self._engine.engine is not None:
-                try:
-                    self._engine.engine.close()
-                except Exception as e:
-                    logger.warning(f"Error closing engine: {e}")
-        if self._vision_cache is not None:
-            self._vision_cache.close()
-            self._vision_cache = None
+        engine = self._engine
+
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
             cancel_event.set()
-        self._diffusion_cancel_events = set()
+
+        if engine:
+            await engine.stop()
+
+        if self._vision_cache is not None:
+            try:
+                self._vision_cache.close()
+            except Exception:
+                logger.warning("Error closing vision feature cache", exc_info=True)
+            self._vision_cache = None
+
+        # Drop wrapper-side references before EngineCore.close() performs its
+        # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
+        # model weights or cached feature arrays alive until after the reclaim
+        # pass has already run.
         self._engine = None
         self._vlm_model = None
         self._processor = None
@@ -1377,6 +1642,14 @@ class VLMBatchedEngine(BaseEngine):
         self._tokenizer = None
         self._vlm_mtp_drafter = None
         self._diffusion_family = None
+
+        if engine:
+            if hasattr(engine, "engine") and engine.engine is not None:
+                try:
+                    engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
+        self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
         self._loaded = False
         logger.info("VLMBatchedEngine stopped")
@@ -2568,6 +2841,8 @@ class VLMBatchedEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
                     cached_tokens=output.cached_tokens,
+                    generated_at=getattr(output, "generated_at", None),
+                    generated_until=getattr(output, "generated_until", None),
                 )
         except GeneratorExit:
             logger.info(f"[vlm_stream_generate] GeneratorExit for request {request_id}")
@@ -2742,9 +3017,10 @@ class VLMBatchedEngine(BaseEngine):
             return
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
-        num_tokens += _count_image_tokens(
+        num_tokens += _count_image_tokens_real(
             messages,
-            per_image_upper_bound=_derive_image_token_upper_bound(
+            getattr(self, "_processor", None),
+            upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),
         )

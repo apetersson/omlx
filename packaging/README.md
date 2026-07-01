@@ -34,6 +34,7 @@ Then the Swift bundle:
 ```bash
 apps/omlx-mac/Scripts/build.sh release             # full bundle
 apps/omlx-mac/Scripts/build.sh release --no-rebuild-donor   # reuse _export/
+apps/omlx-mac/Scripts/build.sh release --with-custom-kernel  # bundle GLM-5.2 / MiniMax M3 native kernels
 ```
 
 DS4/GGUF backend releases are built from the pinned source commit recorded in

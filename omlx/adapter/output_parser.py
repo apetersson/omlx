@@ -370,6 +370,12 @@ class MiniMaxM3OutputParserSession:
         tool_calls: list[dict[str, str]] = []
         if _MINIMAX_TOOL_CALL_START in self._raw_text:
             try:
+                from ..patches.mlx_vlm_minimax_m3_compat import (
+                    apply_mlx_vlm_minimax_m3_compat_patch,
+                )
+
+                apply_mlx_vlm_minimax_m3_compat_patch()
+
                 from mlx_vlm.tool_parsers.minimax_m3 import parse_tool_call
 
                 parsed = parse_tool_call(self._raw_text)
@@ -402,6 +408,19 @@ def _create_cohere2_moe_filter():
         return None
 
     return PyFilter(PyFilterOptions().cmd4().stream_tool_actions())
+
+
+def _reserialize_cohere_tool_arguments(args: str) -> str:
+    if not args:
+        return "{}"
+    try:
+        return json.dumps(
+            json.loads(args, strict=False),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (json.JSONDecodeError, ValueError):
+        return args or "{}"
 
 
 class Cohere2MoeOutputParserSession:
@@ -506,7 +525,7 @@ class Cohere2MoeOutputParserSession:
             {
                 "id": value["id"],
                 "name": value["name"],
-                "arguments": value["arguments"] or "{}",
+                "arguments": _reserialize_cohere_tool_arguments(value["arguments"]),
             }
             for _, value in sorted(self._tool_calls.items())
             if value["name"]

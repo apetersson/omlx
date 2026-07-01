@@ -9,6 +9,7 @@ patching _step_prefill_chunk directly.
 """
 
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from omlx.exceptions import PrefillMemoryExceededError
@@ -88,6 +89,45 @@ def _make_prefill_state(
         per_row_lps=[],
     )
     return state
+
+
+class _RecordingModel:
+    def __init__(self, model_type: str):
+        self.model_type = model_type
+        self.layers = []
+        self.chunk_lengths: list[int] = []
+
+    def __call__(self, tokens, cache=None):
+        self.chunk_lengths.append(int(tokens.shape[1]))
+
+
+def _make_recording_scheduler(
+    model_type: str,
+    *,
+    uses_minimax_m3_positions: bool = False,
+    nested_vlm_model_type: str | None = None,
+    model_name: str = "",
+) -> tuple[Scheduler, _RecordingModel]:
+    model = _RecordingModel(model_type)
+    if uses_minimax_m3_positions:
+        model._uses_minimax_m3_positions = True
+    if nested_vlm_model_type is not None:
+        model._vlm_model = SimpleNamespace(
+            config=SimpleNamespace(model_type=nested_vlm_model_type)
+        )
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            prefill_step_size=2048,
+            chunked_prefill=True,
+            paged_cache_block_size=0,
+            model_name=model_name,
+        ),
+    )
+    return scheduler, model
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +249,157 @@ class TestGetStats:
         sched.prefilling.append(_make_request("r1"))
         sched.prefilling.append(_make_request("r2"))
         assert sched.get_stats()["num_prefilling"] == 2
+
+
+# ---------------------------------------------------------------------------
+# GLM adaptive chunked prefill
+# ---------------------------------------------------------------------------
+
+
+class TestGLMAdaptiveChunkedPrefill:
+    def test_glm_uses_adaptive_prefill_chunk_size(self, monkeypatch):
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", raising=False)
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP_SIZE", raising=False)
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_AFTER", raising=False)
+        monkeypatch.delenv(
+            "MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_MIN_REMAINING", raising=False
+        )
+
+        sched, model = _make_recording_scheduler("glm_moe_dsa")
+        req = _make_request("glm", n_tokens=8194)
+        state = _make_prefill_state(sched, req, n_remaining=8193)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [8192]
+        assert state.tokens_processed == 8192
+
+    def test_non_glm_keeps_configured_prefill_chunk_size(self, monkeypatch):
+        monkeypatch.delenv("MLX_LM_GLM_DSA_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler("deepseek_v32")
+        req = _make_request("deepseek", n_tokens=8193)
+        state = _make_prefill_state(sched, req, n_remaining=8192)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+
+
+# ---------------------------------------------------------------------------
+# MiniMax M3 adaptive chunked prefill
+# ---------------------------------------------------------------------------
+
+
+class TestMiniMaxM3AdaptiveChunkedPrefill:
+    def test_minimax_m3_uses_4096_for_long_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP_SIZE", raising=False)
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_AFTER", raising=False)
+        monkeypatch.delenv(
+            "MLX_MINIMAX_M3_ADAPTIVE_PREFILL_MIN_REMAINING", raising=False
+        )
+
+        sched, model = _make_recording_scheduler("minimax_m3")
+        req = _make_request("minimax", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_minimax_m3_keeps_2048_for_short_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler("minimax_m3_vl")
+        req = _make_request("minimax-short", n_tokens=4096)
+        state = _make_prefill_state(sched, req, n_remaining=4095)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+
+    def test_minimax_m3_env_can_disable_adaptive_prefill(self, monkeypatch):
+        monkeypatch.setenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", "0")
+
+        sched, model = _make_recording_scheduler("minimax_m3")
+        req = _make_request("minimax-disabled", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [2048]
+        assert state.tokens_processed == 2048
+
+    def test_minimax_m3_vlm_adapter_flag_enables_adaptive_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler(
+            "vlm",
+            uses_minimax_m3_positions=True,
+        )
+        req = _make_request("minimax-adapter", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_minimax_m3_nested_vlm_model_enables_adaptive_prefill(self, monkeypatch):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+
+        sched, model = _make_recording_scheduler(
+            "vlm",
+            nested_vlm_model_type="minimax_m3_vl",
+        )
+        req = _make_request("minimax-nested-vlm", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
+
+    def test_minimax_m3_model_path_enables_adaptive_prefill(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("MLX_MINIMAX_M3_ADAPTIVE_PREFILL_STEP", raising=False)
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "minimax_m3_vl"}',
+            encoding="utf-8",
+        )
+
+        sched, model = _make_recording_scheduler(
+            "vlm",
+            model_name=str(tmp_path),
+        )
+        req = _make_request("minimax-model-path", n_tokens=4098)
+        state = _make_prefill_state(sched, req, n_remaining=4097)
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            done = sched._step_prefill_chunk(state)
+
+        assert not done
+        assert model.chunk_lengths == [4096]
+        assert state.tokens_processed == 4096
 
 
 # ---------------------------------------------------------------------------

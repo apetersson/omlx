@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Setuptools hooks for platform-tagged wheels.
+"""Setuptools hooks for platform wheels and optional custom kernels."""
 
-Release builds may stage a macOS arm64 DS4 support tree into the wheel.  Keep
-the Python/ABI tags generic, but mark built wheels as platform-specific so
-installers never treat staged native files as portable ``py3-none-any`` data.
-"""
+import os
+import sys
 
 from setuptools import setup
 from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
+
+
+CUSTOM_KERNEL_FLAG = "--with-custom-kernel"
+TRUTHY = {"1", "true", "yes", "on"}
+DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET = "15.0"
 
 
 class bdist_wheel(_bdist_wheel):
@@ -22,4 +25,54 @@ class bdist_wheel(_bdist_wheel):
         return "py3", "none", plat
 
 
-setup(cmdclass={"bdist_wheel": bdist_wheel})
+def _with_custom_kernel() -> bool:
+    if CUSTOM_KERNEL_FLAG in sys.argv:
+        sys.argv.remove(CUSTOM_KERNEL_FLAG)
+        return True
+    return os.environ.get("OMLX_WITH_CUSTOM_KERNEL", "").strip().lower() in TRUTHY
+
+
+def _custom_kernel_build_kwargs() -> dict:
+    if not _with_custom_kernel():
+        return {}
+
+    target = (
+        os.environ.get("OMLX_CUSTOM_KERNEL_DEPLOYMENT_TARGET")
+        or os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+        or DEFAULT_CUSTOM_KERNEL_DEPLOYMENT_TARGET
+    )
+    os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", target)
+    cmake_args = os.environ.get("CMAKE_ARGS", "").strip()
+    if "CMAKE_OSX_DEPLOYMENT_TARGET" not in cmake_args:
+        target_arg = f"-DCMAKE_OSX_DEPLOYMENT_TARGET={target}"
+        os.environ["CMAKE_ARGS"] = (
+            f"{cmake_args} {target_arg}".strip() if cmake_args else target_arg
+        )
+
+    from mlx import extension
+
+    return {
+        "ext_modules": [
+            extension.CMakeExtension(
+                "omlx.custom_kernels.glm_moe_dsa._ext",
+                sourcedir="omlx/custom_kernels/glm_moe_dsa/csrc",
+            ),
+            extension.CMakeExtension(
+                "omlx.custom_kernels.minimax_m3._ext",
+                sourcedir="omlx/custom_kernels/minimax_m3/csrc",
+            ),
+        ],
+        "cmdclass": {"build_ext": extension.CMakeBuild},
+    }
+
+
+def _setup_kwargs() -> dict:
+    kwargs = _custom_kernel_build_kwargs()
+    cmdclass = dict(kwargs.get("cmdclass", {}))
+    cmdclass["bdist_wheel"] = bdist_wheel
+    kwargs["cmdclass"] = cmdclass
+    return kwargs
+
+
+if __name__ == "__main__":
+    setup(**_setup_kwargs())
