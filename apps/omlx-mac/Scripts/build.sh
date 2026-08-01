@@ -598,7 +598,7 @@ elif [ "${OMLX_REQUIRE_DS4_BUNDLE:-1}" = "1" ]; then
 fi
 
 if [ -n "$DS4_SUPPORT_SOURCE" ]; then
-    log "Copying DS4 support files from $DS4_SUPPORT_SOURCE…"
+    log "Copying DS4 support files from ${DS4_SUPPORT_SOURCE}…"
     rm -rf "$RESOURCES_DIR/DS4Support"
     if ! PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         "$PYTHON_BIN" - "$DS4_SUPPORT_SOURCE" "$RESOURCES_DIR/DS4Support" <<'PY'
