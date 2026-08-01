@@ -74,6 +74,7 @@ VLM_MODEL_TYPES = {
     "florence2",
     "deepseekocr",
     "deepseekocr_2",
+    "unlimited_ocr",
     "dots_ocr",
     "glm_ocr",
     "minimax_m3_vl",
@@ -81,6 +82,8 @@ VLM_MODEL_TYPES = {
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
+    "inkling",
+    "inkling_mm_model",  # config model_type of Inkling Small checkpoints
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -90,6 +93,69 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
     "minimax_m3",
 }
+
+# Multimodal checkpoints whose currently vendored mlx-lm implementation only
+# exposes the text backbone. Route them directly to BatchedEngine instead of
+# deliberately failing an mlx-vlm load and relying on the engine-pool fallback.
+# Remove a family once mlx-vlm provides its multimodal implementation.
+MLX_LM_TEXT_ONLY_MODEL_TYPES = {
+    "mimo_v2",
+}
+
+# Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
+# are never meant to be served as standalone chat models. Some declare a
+# distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
+# or ``*_mtp`` (e.g. qwen3_5_mtp) marker — but DFlash draft checkpoints declare
+# a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
+# architecture name (``DFlashDraftModel``) or a drafter-only config block
+# (``dflash_config``). Keep these in sync with the drafter resolution in
+# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
+# drafter families are added.
+HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
+_HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
+_HELPER_CONFIG_KEYS = ("dflash_config",)
+
+
+def is_helper_config_model_type(config_model_type: str | None) -> bool:
+    """True when ``config_model_type`` marks a speculative-decoding drafter.
+
+    These are the raw top-level ``model_type`` values from a checkpoint's
+    config.json (e.g. ``gemma4_assistant``, ``qwen3_5_mtp``). Note this misses
+    DFlash drafts, whose model_type is a plain ``qwen3`` — use
+    :func:`is_helper_model_config` when the full config dict is available.
+    """
+    if not isinstance(config_model_type, str) or not config_model_type:
+        return False
+    mt = config_model_type.lower()
+    return mt.endswith(HELPER_CONFIG_MODEL_TYPE_SUFFIXES)
+
+
+def is_helper_model_config(config: dict) -> bool:
+    """True when a parsed config.json marks a speculative-decoding drafter.
+
+    Catches three intrinsic signals, any of which is definitive:
+    an ``*_assistant`` / ``*_mtp`` model_type, a drafter architecture name
+    (e.g. ``DFlashDraftModel``), or a drafter-only config block
+    (e.g. ``dflash_config``). These are helper checkpoints backing
+    dFlash / MTP / assistant speculative decoding, not chat models.
+    """
+    if not isinstance(config, dict):
+        return False
+    if is_helper_config_model_type(config.get("model_type")):
+        return True
+    if any(key in config for key in _HELPER_CONFIG_KEYS):
+        return True
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    elif not isinstance(architectures, list | tuple | set):
+        return False
+    for arch in architectures:
+        arch_lower = str(arch).lower()
+        if any(token in arch_lower for token in _HELPER_ARCH_TOKENS):
+            return True
+    return False
+
 
 # Known VLM architectures
 VLM_ARCHITECTURES = {
@@ -109,6 +175,8 @@ VLM_ARCHITECTURES = {
     "Molmo2ForConditionalGeneration",
     "LlavaQwen2ForCausalLM",  # apple/FastVLM (all sizes)
     "Florence2ForConditionalGeneration",
+    "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
+    "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
 }
 
 # Known embedding model types from mlx-embeddings
@@ -307,6 +375,7 @@ class DiscoveredModel:
     model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
+    text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -315,6 +384,7 @@ class DiscoveredModel:
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     # Optional UI display label preserving source casing.
     display_name: str | None = None
+    is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
 
 
 @dataclass(frozen=True)
@@ -489,16 +559,19 @@ def _has_vision_subconfig(config: dict) -> bool:
     - ``vision_config`` — most VLMs (Qwen2-VL, Gemma3, LLaVA-Next, ...).
     - ``vit_config`` — Molmo / Molmo2 family.
     - ``mm_vision_tower`` — older LLaVA family including FastVLM's
-      ``llava_qwen2``. The check is non-empty-only: a config-stub text-only
-      quant could in principle declare a tower path it doesn't ship weights
-      for, but in practice bf16 FastVLM ships a real path string.
+      ``llava_qwen2``.
+
+    All three are non-empty checks: text-only quants of VLM families can
+    leave an empty ``vision_config: {}`` stub behind after stripping the
+    vision tower (#2385), and key presence alone would misclassify them
+    as VLM.
 
     Used by the VLM classifier in :func:`detect_model_type` and by other
     paths (``oq``, admin model info) that need to ask "is this a VLM?".
     """
     return (
-        "vision_config" in config
-        or "vit_config" in config
+        bool(config.get("vision_config"))
+        or bool(config.get("vit_config"))
         or bool(config.get("mm_vision_tower"))
     )
 
@@ -605,6 +678,15 @@ def detect_model_type(model_path: Path) -> ModelType:
             "— treating as LLM"
         )
 
+    if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        if _has_vision_subconfig(config):
+            logger.warning(
+                "%s carries multimodal configuration, but the available mlx-lm "
+                "implementation is text-only; using the LLM engine",
+                model_type,
+            )
+        return "llm"
+
     if normalized_type in VLM_NATIVE_TEXT_MODEL_TYPES:
         logger.info(
             f"{model_type} detected as mlx-vlm native text model"
@@ -698,13 +780,15 @@ def detect_model_type(model_path: Path) -> ModelType:
 
 
 def detect_thinking_default(model_path: Path) -> bool | None:
-    """Detect whether a model's chat template enables thinking by default.
+    """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
-    determines the default behaviour:
+    determines the default behaviour, including narrow model-family serving
+    recommendations when the raw template deliberately defaults to opt-in:
 
     * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
-      thinking when ``enable_thinking is false``).
+      thinking when ``enable_thinking is false``; Laguna: Poolside recommends
+      servers pass ``enable_thinking=true`` by default).
     * **False** — model suppresses thinking by default (e.g. Gemma 4: only
       enables thinking when ``enable_thinking`` is truthy,
       ``default(false)``).
@@ -731,12 +815,30 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     if not template_text or "enable_thinking" not in template_text:
         return None
 
+    # Laguna's Jinja initializes the flag to false for direct tokenizer calls,
+    # while Poolside's serving recipe explicitly sets the default to true. Keep
+    # discovery, the admin "Auto" toggle, and API request policy consistent.
+    try:
+        with (model_path / "config.json").open(encoding="utf-8") as config_file:
+            model_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        model_config = {}
+    if model_config.get("model_type") == "laguna":
+        return True
+
     # Heuristic: if the template only disables thinking when explicitly
     # ``enable_thinking is false``, then thinking is ON by default.
     # If the template requires ``enable_thinking`` to be truthy or uses
     # ``default(false)``, then thinking is OFF by default.
     if "enable_thinking is false" in template_text:
         return True  # ON by default (Qwen pattern)
+    # An explicit ``enable_thinking | default(true)`` filter states the ON
+    # default directly. It must be anchored and checked before the broad
+    # ``default(false)`` scan: a template may default *other* flags to false
+    # (e.g. ``preserve_thinking | default(false)``, Laguna S-2.1) without
+    # changing its thinking default.
+    if re.search(r"enable_thinking\s*\|\s*default\(true\)", template_text):
+        return True
     if "default(false)" in template_text or "enable_thinking)" in template_text:
         return False  # OFF by default (Gemma pattern)
 
@@ -892,6 +994,87 @@ def estimate_model_size(model_path: Path) -> int:
     overhead_factor = 1.05
 
     return int(total_size * overhead_factor)
+
+
+# Weight-name prefixes that the text-only (mlx-lm) loaders drop when serving a
+# VLM-shaped checkpoint: qwen3_5(_moe) sanitize strips ``vision_tower.*`` and
+# ``model.visual.*``; the projector/vision-model spellings cover the other
+# families that ship text-only loadable checkpoints.
+_VISION_WEIGHT_PREFIXES = (
+    "vision_tower.",
+    "model.vision_tower.",
+    "visual.",
+    "model.visual.",
+    "vision_model.",
+    "model.vision_model.",
+    "multi_modal_projector.",
+    "model.multi_modal_projector.",
+)
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "I64": 8, "U64": 8,
+    "F32": 4, "I32": 4, "U32": 4,
+    "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+}
+
+
+def _vision_weight_bytes(model_path: Path) -> int:
+    """Sum tensor bytes under known vision prefixes from safetensors headers.
+
+    Reads only each shard's JSON header (dtype x shape per tensor), never the
+    weight data. Returns 0 when no shard parses or nothing matches.
+    """
+    import struct
+
+    total = 0
+    for shard in model_path.glob("*.safetensors"):
+        try:
+            with open(shard, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > 512 * 1024 * 1024:  # corrupt / not safetensors
+                    continue
+                header = json.loads(f.read(header_len))
+        except (OSError, ValueError, struct.error):
+            continue
+        for name, meta in header.items():
+            if name == "__metadata__" or not name.startswith(
+                _VISION_WEIGHT_PREFIXES
+            ):
+                continue
+            try:
+                dtype_size = _SAFETENSORS_DTYPE_BYTES.get(meta["dtype"], 0)
+                numel = 1
+                for dim in meta["shape"]:
+                    numel *= dim
+                total += numel * dtype_size
+            except (KeyError, TypeError):
+                continue
+    return total
+
+
+def estimate_text_only_model_size(model_path: Path) -> int:
+    """
+    Estimate memory usage when only the language part of a VLM-shaped
+    checkpoint is loaded (force_lm / model_type_override): the text loaders
+    drop the vision tower, so admission by the full file size over-charges by
+    the vision weights (#2385).
+
+    Returns 0 when there are no vision weights to subtract (plain text
+    checkpoints, unreadable shards) — callers fall back to
+    :func:`estimate_model_size`.
+    """
+    try:
+        vision_bytes = _vision_weight_bytes(model_path)
+        if vision_bytes <= 0:
+            return 0
+        full = estimate_model_size(model_path)
+    except (OSError, ValueError):
+        return 0
+    text_only = full - int(vision_bytes * 1.05)
+    if 0 < text_only < full:
+        return text_only
+    return 0
 
 
 def _is_adapter_dir(path: Path) -> bool:
@@ -1063,6 +1246,31 @@ def _safetensors_has_mlx_metadata(path: Path) -> bool:
 
 _MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
 
+# Speculative-decoding helper checkpoints (e.g. z-lab/Qwen3.6-27B-DFlash) are
+# MLX-loadable drafts even though their safetensors are saved in PyTorch ("pt")
+# format and the repo name carries no "mlx" token, so the HF-cache MLX
+# heuristic must recognise them explicitly or they vanish from the draft-model
+# picker (#1643). Detection delegates to is_helper_model_config so the drafter
+# markers stay in sync with helper flagging and engine_pool's drafter
+# resolution.
+def _is_helper_checkpoint(model_path: Path) -> bool:
+    """True if ``model_path`` is a speculative-decoding helper checkpoint.
+
+    Must never raise on an unreadable entry: unlike the config reads inside
+    _register_model, this runs outside discover_models' per-model guard, so
+    an escaped exception would abort the whole scan. UnicodeDecodeError from
+    a non-UTF-8 config.json is a ValueError, not a JSONDecodeError.
+    """
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return False
+    return is_helper_model_config(config)
+
 
 def _unique_ds4_model_id(
     models: dict[str, DiscoveredModel], candidate: str, *, force_suffix: bool = False
@@ -1172,6 +1380,13 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
         )
         return True
 
+    if _is_helper_checkpoint(model_dir):
+        logger.info(
+            f"Treating HF cache model as MLX-compatible speculative-decoding "
+            f"helper: {source_repo_id}"
+        )
+        return True
+
     logger.debug(f"Skipping non-MLX HF cache model: {source_repo_id}")
     return False
 
@@ -1185,6 +1400,12 @@ def _register_model(
     source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
+    if model_id in models and models[model_id].engine_type != "ds4":
+        logger.warning(
+            f"Duplicate model_id '{model_id}' found in {model_dir}, "
+            f"keeping version from {models[model_id].model_path}"
+        )
+        return
     try:
         if _is_unsupported_model(model_dir):
             logger.info(f"Skipping unsupported model: {model_id}")
@@ -1206,13 +1427,20 @@ def _register_model(
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
+        text_only_size = (
+            estimate_text_only_model_size(model_dir) if model_type == "vlm" else 0
+        )
 
         # Read raw config model_type for sub-type detection (e.g., OCR models)
+        # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
         config_model_type = ""
+        is_helper = False
         try:
             import json
             with open(model_dir / "config.json") as f:
-                config_model_type = json.load(f).get("model_type", "")
+                _config = json.load(f)
+            config_model_type = _config.get("model_type", "")
+            is_helper = is_helper_model_config(_config)
         except Exception:
             pass
 
@@ -1227,18 +1455,26 @@ def _register_model(
             model_type=model_type,
             engine_type=engine_type,
             estimated_size=estimated_size,
+            text_only_size=text_only_size,
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
+            is_helper=is_helper,
         )
 
         size_gb = estimated_size / (1024**3)
+        text_only_note = (
+            f", text-only: {text_only_size / (1024 ** 3):.2f}GB"
+            if text_only_size
+            else ""
+        )
         logger.info(
             f"Discovered model: {model_id} "
-            f"(type: {model_type}, engine: {engine_type}, size: {size_gb:.2f}GB)"
+            f"(type: {model_type}, engine: {engine_type}, "
+            f"size: {size_gb:.2f}GB{text_only_note})"
         )
     except Exception as e:
         logger.error(f"Failed to discover model {model_id}: {e}")

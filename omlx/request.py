@@ -136,6 +136,11 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Skip the post-completion prefix/SSD cache store for this request.
+    # Set by internal probes (context benchmark) whose KV must never
+    # pollute the shared cache tiers or trigger the completion-time
+    # host memcpy + disk write.
+    skip_cache_store: bool = False
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
@@ -284,6 +289,9 @@ class RequestOutput:
     # Internal producer-side timestamp for the latest generated token included
     # in this output. This lets aggregated chunks preserve the decode interval.
     generated_until: Optional[float] = None
+    # Timestamp of the very first generated token for this request (perf_counter).
+    # Set by non-streaming generate() to allow TTFT / prefill-duration estimation.
+    first_token_at: Optional[float] = None
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None

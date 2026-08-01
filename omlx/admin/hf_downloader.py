@@ -8,7 +8,6 @@ with directory-size-based progress polling.
 import asyncio
 import enum
 import logging
-import os
 import shutil
 import time
 import uuid
@@ -17,20 +16,20 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 from urllib.parse import quote, unquote, urlparse
 
-import huggingface_hub.constants as _hf_constants
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+)
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
-from . import ds4_downloader_catalog as _ds4_catalog
+# Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
+# guarantees it exists. Re-verify the symbol when bumping the hub version.
+from huggingface_hub.utils._xet import abort_xet_session
 
-# Force the xet download path off. hf_xet's Rust ``download_files`` invokes
-# the Python progress callback from a Rust frame and silently swallows any
-# Python exception raised inside it, so our tqdm-based cooperative cancel is
-# a no-op on xet-enabled repos. Falling back to ``http_get`` keeps cancel
-# working at chunk granularity. See issue #1322.
-_hf_constants.HF_HUB_DISABLE_XET = True
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+from . import ds4_downloader_catalog as _ds4_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -222,9 +221,11 @@ def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
     from the progress callback: raising here unwinds the download thread
     cleanly within one chunk, releasing its buffers and connection.
 
-    Note: this relies on the Python http_get path. If HF_HUB_ENABLE_HF_TRANSFER
-    is on, the Rust path ignores tqdm_class and this won't interrupt; oMLX does
-    not enable hf_transfer.
+    Note: this only interrupts the Python http_get path, which xet-less repos
+    and mirror endpoints still use. On the xet path the Rust side defers a
+    callback exception until the whole transfer finishes (issue #1322), so
+    cancellation there is driven by ``abort_xet_session()`` instead; this
+    class is kept as the raise-on-next-chunk backstop for http_get.
     """
 
     class _CancellableTqdm(_hf_tqdm):
@@ -262,6 +263,27 @@ def _get_hf_api() -> tuple[HfApi, str | None]:
         resolved = _resolve_endpoint(endpoint)
         return HfApi(endpoint=resolved), resolved
     return HfApi(), None
+
+
+def _list_models_stale_token_fallback(api: HfApi, kwargs: dict) -> tuple[list, bool]:
+    """Drain list_models, retrying anonymously when the stored token is rejected.
+
+    huggingface_hub attaches the locally stored credential (HF_TOKEN env var or
+    the hf auth login token file) to every request, so a stale token 401s even
+    the public model listing (#2276, #2310). Listing needs no auth, so retry
+    once with token=False and report the rejected token to the caller.
+    """
+    try:
+        return list(api.list_models(**kwargs)), False
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 401:
+            raise
+        logger.warning(
+            "HF model listing rejected the stored token (401): %s. "
+            "Retrying anonymously.",
+            e,
+        )
+        return list(api.list_models(token=False, **kwargs)), True
 
 
 class DownloadStatus(str, enum.Enum):
@@ -427,7 +449,9 @@ class HFDownloader:
             show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
-            Dict with 'trending' and 'popular' lists.
+            Dict with 'trending' and 'popular' lists, plus 'hf_token_invalid'
+            set when the stored HF token was rejected and the listing was
+            fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
         legacy_filters = show_mlx is None and show_ds4_gguf is None
@@ -439,9 +463,9 @@ class HFDownloader:
         if not include_mlx and not include_ds4:
             return {"trending": [], "popular": []}
 
-        async def _fetch_mlx(sort: str) -> list[dict]:
+        async def _fetch_mlx(sort: str) -> tuple[list[dict], bool]:
             if not include_mlx:
-                return []
+                return [], False
             kwargs = {
                 "sort": sort,
                 "limit": limit,
@@ -452,8 +476,10 @@ class HFDownloader:
                     kwargs["author"] = "mlx-community"
             else:
                 kwargs["filter"] = "mlx"
-            models = await asyncio.wait_for(
-                asyncio.to_thread(api.list_models, **kwargs),
+            # list_models returns a lazy generator; drain it inside the worker
+            # thread so the paginated HTTP calls never block the event loop.
+            models, token_rejected = await asyncio.wait_for(
+                asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                 timeout=_HF_API_TIMEOUT,
             )
             results = []
@@ -469,12 +495,13 @@ class HFDownloader:
                 results.append(
                     _hf_catalog_item(m, backend="mlx", name=m.id.split("/")[-1])
                 )
-            return results
+            return results, token_rejected
 
-        async def _fetch_ds4(sort: str) -> list[dict]:
+        async def _fetch_ds4(sort: str) -> tuple[list[dict], bool]:
             if not include_ds4:
-                return []
+                return [], False
             results = []
+            token_rejected = False
             for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
                 kwargs = {
                     "sort": sort,
@@ -489,10 +516,11 @@ class HFDownloader:
                         "trendingScore",
                     ],
                 }
-                models = await asyncio.wait_for(
-                    asyncio.to_thread(api.list_models, **kwargs),
+                models, rejected = await asyncio.wait_for(
+                    asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                     timeout=_HF_API_TIMEOUT,
                 )
+                token_rejected = token_rejected or rejected
                 for m in models:
                     downloads = m.downloads or 0
                     if downloads < _MIN_DOWNLOADS or not _has_gguf_files(m):
@@ -509,32 +537,41 @@ class HFDownloader:
                         )
                     )
             key = "downloads" if sort == "downloads" else "trending_score"
-            return sorted(
-                _merge_catalog_results(results),
-                key=lambda item: item.get(key, 0),
-                reverse=True,
+            return (
+                sorted(
+                    _merge_catalog_results(results),
+                    key=lambda item: item.get(key, 0),
+                    reverse=True,
+                ),
+                token_rejected,
             )
 
-        async def _fetch(sort: str) -> list[dict]:
-            mlx_results, ds4_results = await asyncio.gather(
+        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+            (mlx_results, mlx_rejected), (ds4_results, ds4_rejected) = await asyncio.gather(
                 _fetch_mlx(sort),
                 _fetch_ds4(sort),
             )
             key = "downloads" if sort == "downloads" else "trending_score"
-            return sorted(
-                _merge_catalog_results(mlx_results + ds4_results),
-                key=lambda item: item.get(key, 0),
-                reverse=True,
+            return (
+                sorted(
+                    _merge_catalog_results(mlx_results + ds4_results),
+                    key=lambda item: item.get(key, 0),
+                    reverse=True,
+                ),
+                mlx_rejected or ds4_rejected,
             )
 
-        trending, popular = await asyncio.gather(
-            _fetch("trendingScore"),
-            _fetch("downloads"),
+        (trending, trending_rejected), (popular, popular_rejected) = (
+            await asyncio.gather(
+                _fetch("trendingScore"),
+                _fetch("downloads"),
+            )
         )
 
         return {
             "trending": trending[:result_limit],
             "popular": popular[:result_limit],
+            "hf_token_invalid": trending_rejected or popular_rejected,
         }
 
     @staticmethod
@@ -571,7 +608,9 @@ class HFDownloader:
             show_ds4_gguf: Include DeepSeek V4 DS4-GGUF candidates when set.
 
         Returns:
-            Dict with 'models' list and 'total' count.
+            Dict with 'models' list and 'total' count, plus 'hf_token_invalid'
+            set when the stored HF token was rejected and the listing was
+            fetched anonymously instead.
         """
         api, _endpoint = _get_hf_api()
         legacy_filters = show_mlx is None and show_ds4_gguf is None
@@ -620,9 +659,9 @@ class HFDownloader:
         else:
             base_sort = _SORT_MAP.get(sort, "trendingScore")
 
-        async def _fetch_mlx() -> list[dict]:
+        async def _fetch_mlx() -> tuple[list[dict], bool]:
             if not include_mlx:
-                return []
+                return [], False
             kwargs = {
                 "search": query,
                 "sort": base_sort,
@@ -638,16 +677,20 @@ class HFDownloader:
             }
             if (legacy_filters and mlx_only) or not legacy_filters:
                 kwargs["filter"] = "mlx"
-            models = await asyncio.wait_for(
-                asyncio.to_thread(api.list_models, **kwargs),
+            models, token_rejected = await asyncio.wait_for(
+                asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                 timeout=_HF_API_TIMEOUT,
             )
-            return [_hf_catalog_item(m, backend="mlx", name=m.id) for m in models]
+            return (
+                [_hf_catalog_item(m, backend="mlx", name=m.id) for m in models],
+                token_rejected,
+            )
 
-        async def _fetch_ds4() -> list[dict]:
+        async def _fetch_ds4() -> tuple[list[dict], bool]:
             if not include_ds4:
-                return []
+                return [], False
             results = []
+            token_rejected = False
             for base_filter in _DS4_GGUF_BASE_MODEL_FILTERS:
                 kwargs = {
                     "search": query,
@@ -665,10 +708,11 @@ class HFDownloader:
                         "lastModified",
                     ],
                 }
-                models = await asyncio.wait_for(
-                    asyncio.to_thread(api.list_models, **kwargs),
+                models, rejected = await asyncio.wait_for(
+                    asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                     timeout=_HF_API_TIMEOUT,
                 )
+                token_rejected = token_rejected or rejected
                 for m in models:
                     if _has_gguf_files(m):
                         results.append(
@@ -679,9 +723,12 @@ class HFDownloader:
                                 base_model_filter=base_filter,
                             )
                         )
-            return _merge_catalog_results(results)
+            return _merge_catalog_results(results), token_rejected
 
-        mlx_results, ds4_results = await asyncio.gather(_fetch_mlx(), _fetch_ds4())
+        (mlx_results, mlx_rejected), (ds4_results, ds4_rejected) = await asyncio.gather(
+            _fetch_mlx(), _fetch_ds4()
+        )
+        token_rejected = mlx_rejected or ds4_rejected
         results = []
         for item in _merge_catalog_results(mlx_results + ds4_results):
             params = item.get("params")
@@ -730,6 +777,7 @@ class HFDownloader:
         return {
             "models": results[:limit],
             "total": len(results),
+            "hf_token_invalid": token_rejected,
         }
 
     @staticmethod
@@ -963,9 +1011,19 @@ class HFDownloader:
         if task.status not in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING):
             return False
 
+        was_downloading = task.status == DownloadStatus.DOWNLOADING
+
         # Mark as cancelled
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
+
+        # A task in DOWNLOADING owns the download semaphore, so the in-flight
+        # xet transfer is necessarily this one; aborting the (global) session
+        # makes its snapshot_download thread unwind immediately. Pending tasks
+        # must not abort, that would kill another task's transfer. The next
+        # download lazily creates a fresh session.
+        if was_downloading:
+            abort_xet_session()
 
         # Stop progress polling
         progress_task = self._progress_tasks.pop(task_id, None)
@@ -1064,6 +1122,9 @@ class HFDownloader:
                     task.status = DownloadStatus.CANCELLED
         self._active_tasks.clear()
 
+        # Reap any in-flight xet transfer thread (no-op without a session).
+        abort_xet_session()
+
         logger.info("HF Downloader shut down")
 
     async def _run_download(self, task_id: str, hf_token: str) -> None:
@@ -1094,6 +1155,7 @@ class HFDownloader:
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
+                st_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -1116,6 +1178,12 @@ class HFDownloader:
                             "original/**",
                             "consolidated.*.pth",
                         ]
+                        # Computed inside this try so malformed metadata
+                        # (non-int counts) degrades to no estimate instead
+                        # of failing the download from the dry-run handler.
+                        st_estimate = _calc_safetensors_disk_size(
+                            model_info.safetensors
+                        )
                 except Exception as e:
                     logger.warning(f"Could not fetch repo info for {task.repo_id}: {e}")
 
@@ -1135,6 +1203,7 @@ class HFDownloader:
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
+                size_estimated = False
                 try:
                     dry_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -1146,9 +1215,14 @@ class HFDownloader:
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
+                    if st_estimate:
+                        task.total_size = st_estimate
+                        size_estimated = True
+                        detail = "Estimated total size from safetensors metadata."
+                    else:
+                        detail = "Progress estimation will be unavailable."
                     logger.warning(
-                        f"Dry run failed for {task.repo_id}: {e}. "
-                        "Progress estimation will be unavailable."
+                        f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
                 # Start progress polling
@@ -1156,10 +1230,11 @@ class HFDownloader:
                     self._poll_progress(task_id, target_dir)
                 )
 
-                # Run snapshot_download in a thread (blocking call). The
-                # cancellable tqdm aborts the download from its per-chunk
-                # progress callback so cancel actually stops it (the thread
-                # itself can't be force-killed).
+                # Run snapshot_download in a thread (blocking call). Cancel
+                # reaches the thread two ways: the cancellable tqdm raises on
+                # the next chunk of the http_get path, and abort_xet_session()
+                # (called by cancel/stall/shutdown) unwinds the xet path with
+                # a RuntimeError (the thread itself can't be force-killed).
                 await asyncio.to_thread(
                     snapshot_download,
                     **dl_kwargs,
@@ -1175,7 +1250,12 @@ class HFDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
-                task.downloaded_size = task.total_size or self._get_dir_size(target_dir)
+                if size_estimated or not task.total_size:
+                    # The estimate was only a progress denominator; report
+                    # the measured on-disk size once the download is done.
+                    task.downloaded_size = self._get_dir_size(target_dir)
+                else:
+                    task.downloaded_size = task.total_size
                 task.completed_at = time.time()
 
                 logger.info(
@@ -1217,7 +1297,13 @@ class HFDownloader:
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
         except Exception as e:
-            if task_id not in self._cancelled:
+            # Skip when already cancelled (the xet abort surfaces here as a
+            # RuntimeError) or already FAILED by the stall detector, whose
+            # error message would otherwise be clobbered by the abort error.
+            if (
+                task_id not in self._cancelled
+                and task.status != DownloadStatus.FAILED
+            ):
                 task.status = DownloadStatus.FAILED
                 task.error = str(e)
                 logger.error(f"Download failed for {task.repo_id}: {e}")
@@ -1282,10 +1368,13 @@ class HFDownloader:
                     logger.warning(
                         f"Download stalled for {task.repo_id} " f"(task_id={task_id})"
                     )
-                    # Cancel the snapshot_download thread
+                    # Cancel the snapshot_download thread. The task cancel
+                    # only unblocks the awaiting coroutine; aborting the xet
+                    # session is what actually reaps a wedged transfer thread.
                     active_task = self._active_tasks.get(task_id)
                     if active_task and not active_task.done():
                         active_task.cancel()
+                    abort_xet_session()
                     break
         except asyncio.CancelledError:
             pass

@@ -20,6 +20,12 @@ import pytest
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.scheduler import Scheduler
 
+_TINY_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
 # ---------------------------------------------------------------------------
 # Scheduler.preflight_or_raise / _preflight_memory_check_tokens
 # ---------------------------------------------------------------------------
@@ -275,7 +281,7 @@ async def test_vlm_preflight_chat_adds_image_token_budget(monkeypatch):
                 {"type": "text", "text": "hello"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,..."},
+                    "image_url": {"url": _TINY_PNG_DATA_URI},
                 },
                 {"type": "image", "source": {}},
                 {"type": "text", "text": "world"},
@@ -313,7 +319,7 @@ async def test_vlm_preflight_chat_strips_images_before_template(monkeypatch):
             "role": "user",
             "content": [
                 {"type": "text", "text": "compare these:"},
-                {"type": "image_url", "image_url": {"url": "data:..."}},
+                {"type": "image_url", "image_url": {"url": _TINY_PNG_DATA_URI}},
                 {"type": "image", "source": {}},
             ],
         }
@@ -712,9 +718,11 @@ class TestRejectionMessageNamesBindingCeiling:
         ``_preflight_memory_check`` so we can inspect the message it
         returns."""
         # Peak chosen larger than any ceiling tested below so the
-        # rejection branch fires deterministically.
+        # rejection branch fires deterministically. Admission charges the
+        # exact resident KV plus the floor-chunk transient bound; drive the
+        # rejection through the KV term.
         sched.memory_monitor = MagicMock()
-        sched.memory_monitor.estimate_prefill_peak_bytes.return_value = 512 * 1024**3
+        sched.memory_monitor.estimate_resident_kv_bytes.return_value = 512 * 1024**3
 
         import omlx.scheduler as scheduler_mod
 

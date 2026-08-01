@@ -2,6 +2,7 @@
 """Tests for the admin benchmark module."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +18,7 @@ from omlx.admin.benchmark import (
     _detect_experimental_features,
     _detect_quantization,
     _generate_prompt,
+    _run_batch_test,
     _run_single_test,
     cleanup_old_runs,
     create_run,
@@ -111,7 +113,7 @@ class TestBenchmarkRequest:
 
 class TestGeneratePrompt:
     def test_exact_token_count(self):
-        """Verify prompt generates exact number of tokens."""
+        """Prompt IDs are exact without a decode/re-encode round trip."""
         tokenizer = MagicMock()
 
         # Simulate tokenizer behavior
@@ -119,33 +121,104 @@ class TestGeneratePrompt:
             # Return roughly 1 token per 4 chars
             return list(range(len(text) // 4))
 
-        def mock_decode(tokens):
-            return "x" * len(tokens) * 4
-
         tokenizer.encode = mock_encode
-        tokenizer.decode = mock_decode
 
         prompt = _generate_prompt(tokenizer, 1024)
 
-        # Verify encode was called and result was truncated
-        encoded = tokenizer.encode(prompt)
-        assert len(encoded) == 1024
+        assert isinstance(prompt, list)
+        assert len(prompt) == 1024
+        tokenizer.decode.assert_not_called()
+
+    def test_rejects_non_positive_target(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            _generate_prompt(MagicMock(), 0)
 
     def test_uuid_prefix_uniqueness(self):
         """Verify each generated prompt has a unique UUID prefix."""
-        tokenizer = MagicMock()
-        tokenizer.encode = lambda text: list(range(2048))
-        tokenizer.decode = lambda tokens: f"decoded-{len(tokens)}"
+        tokenizer = _WordTokenizer()
 
         prompts = set()
         for _ in range(10):
-            # We can't easily verify uniqueness since decode is mocked,
-            # but we verify encode is called with text containing "BENCH-"
             prompt = _generate_prompt(tokenizer, 100)
-            prompts.add(prompt)
+            prompts.add(tuple(prompt))
 
-        # With mock decode they'll all be the same, but in real usage
-        # the UUID prefix ensures cache isolation
+        assert len(prompts) == 10
+
+
+class _WordTokenizer:
+    """Word-level round-trip tokenizer for content-sensitive prompt tests."""
+
+    def __init__(self):
+        self.vocab = {}
+        self.words = []
+
+    def encode(self, text):
+        ids = []
+        for word in text.split(" "):
+            if word not in self.vocab:
+                self.vocab[word] = len(self.words)
+                self.words.append(word)
+            ids.append(self.vocab[word])
+        return ids
+
+    def decode(self, ids):
+        return " ".join(self.words[i] for i in ids)
+
+
+class TestPromptRealism:
+    def test_corpus_file_ships_and_is_natural_text(self):
+        from omlx.admin.benchmark import _load_bench_corpus
+
+        corpus = _load_bench_corpus()
+        assert len(corpus) > 500_000
+        assert corpus.startswith("Call me Ishmael.")
+        assert "quick brown fox jumps" not in corpus
+
+    def test_prompt_is_not_repetitive(self):
+        """Speculative decoders (MTP/DFlash) hit ~99% draft acceptance on
+        repeated filler, inflating benchmark tg ~2x over real prompts; the
+        prompt must be natural, non-looping text."""
+        tokenizer = _WordTokenizer()
+        ids = _generate_prompt(tokenizer, 2048)
+        window = 16
+        windows = {tuple(ids[i : i + window]) for i in range(len(ids) - window)}
+        distinct_ratio = len(windows) / (len(ids) - window)
+        assert distinct_ratio > 0.5
+
+    def test_prompt_deterministic_apart_from_uuid_prefix(self):
+        tokenizer = _WordTokenizer()
+        first = _generate_prompt(tokenizer, 512)
+        second = _generate_prompt(tokenizer, 512)
+        assert first[0] != second[0]
+        assert first[1:] == second[1:]
+
+    def test_prefix_and_corpus_are_encoded_together(self):
+        tokenizer = _WordTokenizer()
+        encoded_texts = []
+        original_encode = tokenizer.encode
+
+        def recording_encode(text):
+            encoded_texts.append(text)
+            return original_encode(text)
+
+        tokenizer.encode = recording_encode
+        _generate_prompt(tokenizer, 256)
+        assert encoded_texts
+        assert all(text.startswith("BENCH-") for text in encoded_texts)
+        assert all("Call me Ishmael." in text for text in encoded_texts)
+
+    def test_external_prompt_is_not_repetitive(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        prompt = _generate_external_prompt(1024)
+        assert "Call me Ishmael." in prompt[:100]
+        words = prompt.split(" ")
+        window = 12
+        windows = {
+            tuple(words[i : i + window]) for i in range(len(words) - window)
+        }
+        distinct_ratio = len(windows) / (len(words) - window)
+        assert distinct_ratio > 0.5
 
 
 # =============================================================================
@@ -198,10 +271,12 @@ class TestComputeMetrics:
             peak_memory=0,
             cached_tokens=0,
         )
-        # Should not raise, values should be finite
+        # Should not raise, values should be finite. Decode rate is
+        # unmeasurable (not 0.0 tok/s, which would misleadingly read as
+        # a real stall) so it reports None.
         assert metrics["ttft_ms"] == 0.0
-        assert metrics["gen_tps"] == 0.0
-        assert metrics["tpot_ms"] == 0.0
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
 
     def test_native_duration_overrides(self):
         """Native engine timings can override streaming timing artifacts."""
@@ -233,12 +308,47 @@ class TestComputeMetrics:
             cached_tokens=0,
         )
 
-        assert metrics["gen_tps"] == 0.0
-        assert metrics["tpot_ms"] == 0.0
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
         assert metrics["total_throughput"] == pytest.approx(1898.7, abs=0.1)
 
 
 class TestRunSingleTest:
+    @pytest.mark.asyncio
+    async def test_rejects_prompt_length_before_submission(self):
+        engine = MagicMock()
+
+        with pytest.raises(RuntimeError, match="before pp1024"):
+            await _run_single_test(
+                engine,
+                prompt=[0] * 1023,
+                max_tokens=1,
+                pp_len=1024,
+            )
+
+        engine.stream_generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejects_engine_reported_prompt_length(self):
+        class MismatchedEngine:
+            async def stream_generate(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_tokens=1,
+                    prompt_tokens=1023,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        with pytest.raises(RuntimeError, match="engine reported 1023 tokens"):
+            await _run_single_test(
+                MismatchedEngine(),
+                prompt=[0] * 1024,
+                max_tokens=1,
+                pp_len=1024,
+            )
+
     @pytest.mark.asyncio
     async def test_uses_native_diffusion_metrics_for_chunked_stream(self):
         """Diffusion streams by canvas, so benchmark must not use chunk timing."""
@@ -258,7 +368,7 @@ class TestRunSingleTest:
 
         metrics = await _run_single_test(
             ChunkedDiffusionEngine(),
-            prompt="prompt",
+            prompt=[0] * 1024,
             max_tokens=128,
             pp_len=1024,
         )
@@ -288,7 +398,7 @@ class TestRunSingleTest:
 
         metrics = await _run_single_test(
             EarlyStopDiffusionEngine(),
-            prompt="prompt",
+            prompt=[0] * 1024,
             max_tokens=128,
             pp_len=1024,
         )
@@ -317,7 +427,7 @@ class TestRunSingleTest:
         with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.3]):
             metrics = await _run_single_test(
                 AggregatedEngine(),
-                prompt="prompt",
+                prompt=[0] * 1024,
                 max_tokens=128,
                 pp_len=1024,
             )
@@ -345,14 +455,66 @@ class TestRunSingleTest:
         with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.2]):
             metrics = await _run_single_test(
                 AggregatedEngine(),
-                prompt="prompt",
+                prompt=[0] * 1024,
                 max_tokens=128,
                 pp_len=1024,
             )
 
         assert metrics["ttft_ms"] == pytest.approx(200.0)
-        assert metrics["gen_tps"] == 0.0
-        assert metrics["tpot_ms"] == 0.0
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
+
+
+class TestRunBatchTest:
+    @pytest.mark.asyncio
+    async def test_submits_exact_token_ids(self):
+        class Core:
+            def __init__(self):
+                self.prompts = {}
+
+            async def add_request(self, prompt, sampling_params):
+                request_id = f"request-{len(self.prompts)}"
+                self.prompts[request_id] = prompt
+                return request_id
+
+            async def stream_outputs(self, request_id):
+                prompt = self.prompts[request_id]
+                yield SimpleNamespace(
+                    completion_tokens=2,
+                    prompt_tokens=len(prompt),
+                    finished=True,
+                )
+
+        core = Core()
+        engine = SimpleNamespace(_engine=core)
+        prompts = [[row] * 1024 for row in (1, 2)]
+
+        metrics = await _run_batch_test(
+            engine=engine,
+            prompts=prompts,
+            prompt_tokens=1024,
+            max_tokens=2,
+            batch_size=2,
+        )
+
+        assert list(core.prompts.values()) == prompts
+        assert metrics["batch_size"] == 2
+
+    @pytest.mark.asyncio
+    async def test_rejects_mismatched_prompt_before_submission(self):
+        core = MagicMock()
+        engine = SimpleNamespace(_engine=core)
+
+        with pytest.raises(RuntimeError, match="expected 1024"):
+            await _run_batch_test(
+                engine=engine,
+                prompts=[[0] * 1023, [1] * 1024],
+                prompt_tokens=1024,
+                max_tokens=1,
+                batch_size=2,
+            )
+
+        core.add_request.assert_not_called()
 
 
 # =============================================================================
@@ -506,6 +668,40 @@ class TestBenchmarkEngineSelection:
         assert pool.force_lm_values == [True]
         assert run.experimental_features == ["vlm_mtp"]
         assert run.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_benchmark_pins_speed_priority_and_restores(self):
+        """Throughput runs force prefill speed priority (no throttle
+        shrinking mid-measurement) and restore the previous mode after."""
+        pool = _FakeBenchEnginePool()
+        pool._scheduler_config = SimpleNamespace(prefill_speed_priority=False)
+        seen = []
+
+        class _Recorder(_FakeBenchEngine):
+            async def stream_generate(self, **kwargs):
+                seen.append(pool._scheduler_config.prefill_speed_priority)
+                yield SimpleNamespace(
+                    completion_tokens=1,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    new_text="x",
+                    finished=True,
+                    finish_reason="length",
+                )
+
+        pool._engine = _Recorder()
+        run = BenchmarkRun(
+            bench_id="bench-pin",
+            request=BenchmarkRequest(
+                model_id="m", prompt_lengths=[1024], generation_length=1
+            ),
+        )
+        with patch("omlx.admin.benchmark._upload_to_omlx_ai", AsyncMock()):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        assert seen and all(seen), "speed priority must be pinned during the run"
+        assert pool._scheduler_config.prefill_speed_priority is False
 
     @pytest.mark.asyncio
     async def test_batch_request_skips_engine_with_none_scheduler_core(self):
@@ -1065,3 +1261,406 @@ class TestSanitizeUploadError:
         from omlx.admin.benchmark import _sanitize_upload_error
         resp = self._resp(status=503, text="")
         assert _sanitize_upload_error(resp) == "HTTP 503"
+
+
+# =============================================================================
+# External endpoint benchmark tests
+# =============================================================================
+
+
+def _external_config():
+    from omlx.admin.external_api import ExternalEndpointConfig
+
+    return ExternalEndpointConfig(
+        base_url="http://localhost:8001/v1",
+        api_key="sk-test",
+        model="remote-model",
+    )
+
+
+def _stream_stats(prompt=1000, completion=128, cached=0):
+    from omlx.admin.external_api import StreamStats
+
+    return StreamStats(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        cached_tokens=cached,
+        start_time=0.0,
+        first_content_time=0.5,
+        last_content_time=1.5,
+        end_time=1.6,
+        text="x" * 16,
+    )
+
+
+class TestExternalBenchmarkRequest:
+    def test_external_accepted(self):
+        req = BenchmarkRequest(
+            model_id="remote-model",
+            prompt_lengths=[1024],
+            external=_external_config(),
+        )
+        assert req.external is not None
+        assert req.external.model == "remote-model"
+
+    def test_external_defaults_to_none(self):
+        req = BenchmarkRequest(model_id="m", prompt_lengths=[1024])
+        assert req.external is None
+
+    def test_external_invalid_base_url_rejected(self):
+        with pytest.raises(ValueError, match="http:// or https://"):
+            BenchmarkRequest(
+                model_id="m",
+                prompt_lengths=[1024],
+                external={"base_url": "localhost:8001", "model": "m"},
+            )
+
+
+class TestGenerateExternalPrompt:
+    def test_scales_with_target(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        short = _generate_external_prompt(1024)
+        long = _generate_external_prompt(4096)
+        assert len(short) == 1024 * 4
+        assert len(long) == 4096 * 4
+        assert len(long) > len(short) * 3
+
+    def test_unique_prefix(self):
+        from omlx.admin.benchmark import _generate_external_prompt
+
+        a = _generate_external_prompt(1024)
+        b = _generate_external_prompt(1024)
+        assert a.startswith("BENCH-")
+        assert a != b
+
+
+class TestRunExternalBenchmark:
+    def _make_run(self, prompt_lengths=None, batch_sizes=None):
+        return BenchmarkRun(
+            bench_id="bench-ext",
+            request=BenchmarkRequest(
+                model_id="remote-model",
+                prompt_lengths=prompt_lengths or [1024],
+                batch_sizes=batch_sizes or [],
+                external=_external_config(),
+            ),
+        )
+
+    def _mock_client(self, stats=None):
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(
+            return_value=stats or _stream_stats()
+        )
+        client.aclose = AsyncMock()
+        return client
+
+    async def test_never_touches_engine_pool(self):
+        run = self._make_run(batch_sizes=[2])
+        pool = MagicMock()
+        client = self._mock_client()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, pool)
+
+        assert run.status == "completed"
+        pool.get_engine.assert_not_called()
+        pool.get_loaded_model_ids.assert_not_called()
+        pool._unload_engine.assert_not_called()
+
+    async def test_event_sequence_and_upload_skipped(self):
+        run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
+        client = self._mock_client()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        event_types = [e["type"] for e in run.events]
+        assert event_types == [
+            "progress",  # warmup
+            "progress",  # single
+            "result",
+            "progress",  # batch
+            "result",
+            "done",
+            "upload_skipped",
+        ]
+        skipped = run.events[-1]
+        assert skipped["reason"] == "external_endpoint"
+        assert run.upload_state["phase"] == "skipped"
+        assert run.upload_state["skipped_reason"] == "external_endpoint"
+        client.aclose.assert_awaited()
+
+    async def test_single_result_uses_usage_token_counts(self):
+        run = self._make_run(prompt_lengths=[4096])
+        client = self._mock_client(_stream_stats(prompt=3900, completion=128))
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["test_type"] == "single"
+        assert result["requested_pp"] == 4096
+        assert result["pp"] == 3900
+        assert result["prompt_tokens"] == 3900
+        assert result["completion_tokens"] == 128
+        assert result["peak_memory_bytes"] is None
+        # gen duration 1.0s (first 0.5 → last 1.5) with 128 tokens
+        assert result["gen_tps"] == 128.0
+        assert result["ttft_ms"] == 500.0
+
+    async def test_batch_result_aggregates_usage_counts(self):
+        run = self._make_run(prompt_lengths=[1024], batch_sizes=[2])
+        client = self._mock_client(_stream_stats(prompt=1000, completion=100))
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        batch = [r for r in run.results if r["test_type"] == "batch"][0]
+        assert batch["batch_size"] == 2
+        assert batch["requested_pp"] == 1024
+        assert batch["pp"] == 1000
+        assert batch["prompt_tokens_min"] == 1000
+        assert batch["prompt_tokens_max"] == 1000
+        assert batch["total_prompt_tokens"] == 2000
+        assert batch["total_gen_tokens"] == 200
+
+    async def test_single_result_unmeasurable_span_reports_none(self):
+        """A true single-chunk dump (first_content_time == last_content_time
+        == end_time) must report tg TPS as unmeasured, not 0.0.
+
+        Content was still observed, so TTFT and the prefill rate derived from
+        it remain real measurements and must keep their values.
+        """
+        from omlx.admin.external_api import StreamStats
+
+        collapsed_stats = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=128,
+            cached_tokens=0,
+            start_time=0.0,
+            first_content_time=0.5,
+            last_content_time=0.5,
+            end_time=0.5,
+            text="x" * 16,
+            content_observed=True,
+        )
+        run = self._make_run(prompt_lengths=[1024])
+        client = self._mock_client(collapsed_stats)
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["gen_tps"] is None
+        assert result["tpot_ms"] is None
+        assert result["ttft_ms"] == pytest.approx(500.0)
+        assert result["processing_tps"] == pytest.approx(2000.0)
+
+    async def test_single_result_without_content_reports_ttft_none(self):
+        """When no content or reasoning delta was ever seen, the fallback
+        timestamps make TTFT and pp TPS describe the whole response, so both
+        have to report unmeasured alongside the decode metrics."""
+        from omlx.admin.external_api import StreamStats
+
+        unobserved_stats = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=128,
+            cached_tokens=0,
+            start_time=0.0,
+            # stream_chat_completion falls both timestamps back to end_time
+            first_content_time=1.2,
+            last_content_time=1.2,
+            end_time=1.2,
+            text="",
+            content_observed=False,
+        )
+        run = self._make_run(prompt_lengths=[1024])
+        client = self._mock_client(unobserved_stats)
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        result = run.results[0]
+        assert result["ttft_ms"] is None
+        assert result["processing_tps"] is None
+        assert result["gen_tps"] is None
+        assert result["tpot_ms"] is None
+        # e2e still spans a real interval and stays measured
+        assert result["e2e_latency_s"] == pytest.approx(1.2)
+
+    async def test_batch_without_content_reports_none_not_inflated(self):
+        """Models the real collapse on the real clock: no field matched, so
+        every timestamp fell back to end_time, which stream_chat_completion
+        samples inside the request coroutine and therefore always before the
+        wall_end sampled after asyncio.gather.
+
+        The aggregate window stays a small positive number in that state, so
+        a sign check on it cannot detect the collapse and the batch reports
+        millions of tok/s. Measurability has to come from the stats.
+        """
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        async def collapsed_stream(**kwargs):
+            await asyncio.sleep(0.01)
+            now = time.perf_counter()
+            return StreamStats(
+                prompt_tokens=1000,
+                completion_tokens=128,
+                cached_tokens=0,
+                start_time=now - 0.01,
+                first_content_time=now,
+                last_content_time=now,
+                end_time=now,
+                text="",
+                content_observed=False,
+            )
+
+        client = MagicMock()
+        client.stream_chat_completion = collapsed_stream
+
+        result = await _run_external_batch_test(
+            client=client,
+            prompts=["p1", "p2"],
+            max_tokens=128,
+            batch_size=2,
+        )
+
+        assert result["tg_tps"] is None
+        assert result["pp_tps"] is None
+        assert result["avg_ttft_ms"] is None
+        assert result["total_gen_tokens"] == 256
+
+    async def test_batch_single_chunk_dump_keeps_ttft_but_drops_tg(self):
+        """Content arrived, but all of it in one chunk: the decode span is
+        unmeasurable while TTFT and pp TPS are real measurements."""
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        async def single_chunk_stream(**kwargs):
+            await asyncio.sleep(0.01)
+            now = time.perf_counter()
+            return StreamStats(
+                prompt_tokens=1000,
+                completion_tokens=128,
+                cached_tokens=0,
+                start_time=now - 0.01,
+                first_content_time=now,
+                last_content_time=now,
+                end_time=now,
+                text="x" * 16,
+                content_observed=True,
+            )
+
+        client = MagicMock()
+        client.stream_chat_completion = single_chunk_stream
+
+        result = await _run_external_batch_test(
+            client=client,
+            prompts=["p1", "p2"],
+            max_tokens=128,
+            batch_size=2,
+        )
+
+        assert result["tg_tps"] is None
+        assert result["pp_tps"] is not None
+        assert result["avg_ttft_ms"] is not None
+
+    async def test_batch_measurable_window_computes_tg_tps(self):
+        """A real, observed decode span still computes a normal tg_tps, with
+        no regression from the None guard."""
+        from omlx.admin.benchmark import _run_external_batch_test
+        from omlx.admin.external_api import StreamStats
+
+        measured = StreamStats(
+            prompt_tokens=1000,
+            completion_tokens=128,
+            cached_tokens=0,
+            start_time=0.0,
+            first_content_time=0.5,
+            last_content_time=1.5,
+            end_time=1.6,
+            text="x" * 16,
+            content_observed=True,
+        )
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(return_value=measured)
+
+        # A plain two-element side_effect would raise StopIteration on any
+        # other perf_counter call in the process during this block, so fall
+        # back to the last value instead.
+        clock = iter([0.0, 1.6])  # wall_start, wall_end
+        with patch(
+            "omlx.admin.benchmark.time.perf_counter",
+            side_effect=lambda: next(clock, 1.6),
+        ):
+            result = await _run_external_batch_test(
+                client=client,
+                prompts=["p1", "p2"],
+                max_tokens=128,
+                batch_size=2,
+            )
+
+        # total_gen_tokens=256, gen window = wall_end(1.6) - max_first_token(0.5) = 1.1s
+        assert result["tg_tps"] == pytest.approx(256 / 1.1, abs=0.1)
+        assert result["pp_tps"] == pytest.approx(2000 / 0.5, abs=0.1)
+
+    async def test_missing_usage_fails_run(self):
+        from omlx.admin.external_api import ExternalEndpointError
+
+        run = self._make_run()
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(
+            side_effect=ExternalEndpointError(
+                "External endpoint does not support stream usage"
+            )
+        )
+        client.aclose = AsyncMock()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            await run_benchmark(run, MagicMock())
+
+        assert run.status == "error"
+        assert "stream usage" in run.error_message
+        error_events = [e for e in run.events if e["type"] == "error"]
+        assert error_events and "stream usage" in error_events[0]["message"]
+
+    async def test_cancellation_mid_run(self):
+        run = self._make_run()
+        started = asyncio.Event()
+
+        async def hang(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        client = MagicMock()
+        client.stream_chat_completion = AsyncMock(side_effect=hang)
+        client.aclose = AsyncMock()
+
+        with patch(
+            "omlx.admin.benchmark.ExternalAPIClient", return_value=client
+        ):
+            task = asyncio.create_task(run_benchmark(run, MagicMock()))
+            await started.wait()
+            task.cancel()
+            await task
+
+        assert run.status == "cancelled"
+        assert run.events[-1]["type"] == "error"
+        assert "cancelled" in run.events[-1]["message"].lower()
+        client.aclose.assert_awaited()

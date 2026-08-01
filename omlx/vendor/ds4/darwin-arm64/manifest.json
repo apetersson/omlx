@@ -1,7 +1,7 @@
 {
   "name": "ds4",
   "source_repo": "https://github.com/antirez/ds4",
-  "source_commit": "5b95fa1c4f2371013dc6be3745321bdc080d7c61",
+  "source_commit": "4893e0c40fba03dbc85555faeb035799aa04e0b6",
   "platform": "darwin-arm64",
   "binary": "ds4-server",
   "build_command": "make ds4-server",

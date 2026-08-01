@@ -509,6 +509,7 @@ class BoundarySnapshotSSDStore:
     def _writer_loop(self) -> None:
         """Background thread that writes safetensors files."""
         while not self._shutdown.is_set():
+            item = None
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
@@ -522,8 +523,15 @@ class BoundarySnapshotSSDStore:
             # rmtree the snapshot directory while we're mid-write and
             # we'd recreate ``req-X/`` underneath it, leaving an
             # orphaned file after the cleanup returns.
-            with self._writer_busy:
-                self._process_write_item(item)
+            try:
+                with self._writer_busy:
+                    self._process_write_item(item)
+            finally:
+                # ``item`` contains ``tensors_raw``. If the thread waits for
+                # the next queue entry without clearing this local, the frame
+                # can pin a whole boundary snapshot after pending_writes was
+                # cleaned up.
+                item = None
 
     def _process_write_item(self, item) -> None:
         """Process one (pw_key, tensors_raw, metadata, file_path) queue item.
@@ -663,7 +671,17 @@ class BoundarySnapshotSSDStore:
                 # tuples (one per sub-cache, e.g. RotatingKVCache +
                 # PoolingCache for DeepSeek V4). Flatten as
                 # ``layer_{i}_sub_{j}_state_{k}`` keys so reconstruction
-                # can rebuild the nested shape.
+                # can rebuild the nested shape. Mirror the flat branch's
+                # has_tensors gate: a CacheList whose subs hold no tensor
+                # at all (empty KV + untouched conv slots) carries no
+                # restorable state.
+                has_tensors = any(
+                    hasattr(elem, "shape") for sub in state for elem in sub
+                )
+                if not has_tensors:
+                    info["has_state"] = "false"
+                    layer_info.append(info)
+                    continue
                 info["has_state"] = "true"
                 info["sub_count"] = str(len(state))
                 for j, sub_state in enumerate(state):

@@ -68,6 +68,17 @@ class CohereTokenizer:
         return "".join(self._token_map[token_id] for token_id in token_ids)
 
 
+class DeepSeekV4Tokenizer(CohereTokenizer):
+    has_tool_calling = True
+    tool_call_start = "<｜DSML｜tool_calls>"
+    tool_call_end = "</｜DSML｜tool_calls>"
+
+    def tool_parser(self, text: str, tools=None):
+        from omlx.patches.deepseek_v4.tool_parser_v4 import parse_tool_call
+
+        return parse_tool_call(text, tools)
+
+
 class _FakeMelodyOptions:
     def cmd4(self):
         return self
@@ -253,13 +264,16 @@ class TestCohere2MoeOutputParserSession:
                         name="edit",
                         arguments=literal_newline_args,
                     )
-                    return SimpleNamespace(content=None, reasoning=None, tool_calls=[tc])
+                    return SimpleNamespace(
+                        content=None, reasoning=None, tool_calls=[tc]
+                    )
                 return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
 
             def flush_partials(self):
                 return SimpleNamespace(content=None, reasoning=None, tool_calls=[])
 
         import types, json as _json
+
         module = types.ModuleType("cohere_melody")
         module.PyFilter = _FakeMelodyFilterLiteralNewline
         module.PyFilterOptions = _FakeMelodyOptions
@@ -267,6 +281,7 @@ class TestCohere2MoeOutputParserSession:
 
         tokenizer = CohereTokenizer({"TC": "TC"})
         from omlx.adapter.output_parser import Cohere2MoeOutputParserSession
+
         session = Cohere2MoeOutputParserSession.__new__(Cohere2MoeOutputParserSession)
         session._tokenizer = tokenizer
         session._melody = _FakeMelodyFilterLiteralNewline(None)
@@ -477,6 +492,90 @@ class TestGemma4OutputParserSession:
 
 
 class TestOutputParserFactory:
+    def test_detects_deepseek_v4_by_config(self):
+        tokenizer = DeepSeekV4Tokenizer({1: "x"})
+        factory = detect_output_parser(
+            "DeepSeek-V4-Flash-oQ4e",
+            tokenizer,
+            {"model_type": "deepseek_v4"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "deepseek_v4"
+
+    def test_deepseek_v4_stops_at_first_dsml_tool_block(self):
+        tokenizer = DeepSeekV4Tokenizer(
+            {
+                1: "Before ",
+                2: "<｜DSML｜tool",
+                3: '_calls>\n<｜DSML｜invoke name="Bash">\n',
+                4: '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n'
+                "</｜DSML｜invoke>\n",
+                5: "</｜DSML｜tool_calls>",
+            }
+        )
+        factory = detect_output_parser(
+            "DeepSeek-V4-Flash-oQ4e",
+            tokenizer,
+            {"model_type": "deepseek_v4"},
+        )
+        session = factory.create_session(tokenizer)
+
+        stream = []
+        visible = []
+        stop_seen = False
+        for token_id in [1, 2, 3, 4, 5]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+            stop_seen = stop_seen or result.is_stop
+            assert result.record_token is True
+
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        assert stop_seen is True
+        assert "".join(stream) == "Before "
+        assert "".join(visible) == "Before "
+        assert final.finish_reason == "tool_calls"
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "Bash"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"command": "ls"}
+
+    def test_deepseek_v4_drops_text_after_tool_end_in_same_token(self):
+        tokenizer = DeepSeekV4Tokenizer(
+            {
+                1: '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n',
+                2: '<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n'
+                "</｜DSML｜invoke>\n",
+                3: "</｜DSML｜tool_calls>\n"
+                '<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>',
+            }
+        )
+        factory = detect_output_parser(
+            "DeepSeek-V4-Flash-oQ4e",
+            tokenizer,
+            {"model_type": "deepseek_v4"},
+        )
+        session = factory.create_session(tokenizer)
+
+        stream = []
+        stop_seen = False
+        for token_id in [1, 2, 3]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            stop_seen = stop_seen or result.is_stop
+
+        final = session.finalize()
+        stream.append(final.stream_text)
+
+        assert stop_seen is True
+        assert "".join(stream) == ""
+        assert final.finish_reason == "tool_calls"
+        assert len(final.tool_calls) == 1
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"command": "ls"}
+
     def test_detects_minimax_m3_by_config(self):
         tokenizer = CohereTokenizer({1: "x"})
         factory = detect_output_parser(
@@ -599,6 +698,59 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
 
+    def test_session_receives_model_path_when_provided(self, monkeypatch):
+        """Since #2178 the scheduler's model_name is a display id, so the
+        filesystem path must reach parser sessions via model_path."""
+        import omlx.adapter.output_parser as output_parser_module
+
+        seen = {}
+
+        class RecordingSession:
+            def __init__(self, tokenizer, model_path=None):
+                seen["model_path"] = model_path
+
+        monkeypatch.setattr(
+            output_parser_module, "MiniMaxM3OutputParserSession", RecordingSession
+        )
+        tokenizer = CohereTokenizer({})
+        tokenizer.convert_tokens_to_ids = lambda text: -1
+        tokenizer.unk_token_id = -1
+
+        factory = detect_output_parser(
+            "MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+            model_path="/models/minimax-m3",
+        )
+        factory.create_session(tokenizer)
+        assert seen["model_path"] == "/models/minimax-m3"
+
+    def test_session_falls_back_to_model_name_without_model_path(self, monkeypatch):
+        """dflash/vlm engines pass their filesystem path as model_name and no
+        model_path, so the session fallback must keep using model_name."""
+        import omlx.adapter.output_parser as output_parser_module
+
+        seen = {}
+
+        class RecordingSession:
+            def __init__(self, tokenizer, model_path=None):
+                seen["model_path"] = model_path
+
+        monkeypatch.setattr(
+            output_parser_module, "MiniMaxM3OutputParserSession", RecordingSession
+        )
+        tokenizer = CohereTokenizer({})
+        tokenizer.convert_tokens_to_ids = lambda text: -1
+        tokenizer.unk_token_id = -1
+
+        factory = detect_output_parser(
+            "/models/MiniMax-M3-4bit",
+            tokenizer,
+            {"model_type": "minimax_m3_vl"},
+        )
+        factory.create_session(tokenizer)
+        assert seen["model_path"] == "/models/MiniMax-M3-4bit"
+
     def test_detects_gemma4_unified_by_config(self):
         tokenizer = GemmaTokenizer({1: "x"})
         factory = detect_output_parser(
@@ -681,3 +833,132 @@ class TestOutputParserFactory:
         thinking, content = extract_thinking(output_text)
         assert thinking == "Let me think about this"
         assert content == "Four"
+
+
+class InklingTokenizer:
+    def __init__(self, token_map: dict[int, str]):
+        self._token_map = token_map
+        self._reverse = {v: k for k, v in token_map.items()}
+
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        return self._reverse.get(token)
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return [self._reverse[text]] if text in self._reverse else [0, 1]
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        return "".join(self._token_map[token_id] for token_id in token_ids)
+
+    @property
+    def detokenizer(self):
+        return FakeDetokenizer(lambda token_id: self._token_map[token_id])
+
+
+class TestInklingOutputParserSession:
+    def _factory(self, token_map):
+        tokenizer = InklingTokenizer(token_map)
+        factory = detect_output_parser(
+            "inkling-small",
+            tokenizer,
+            {"model_type": "inkling_mm_model"},
+        )
+        assert factory is not None
+        assert factory.kind == "inkling"
+        return tokenizer, factory
+
+    def _run(self, session, token_ids):
+        stream, visible, stopped = [], [], False
+        for token_id in token_ids:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+            if result.is_stop:
+                stopped = True
+                break
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+        return "".join(stream), "".join(visible), stopped, final
+
+    def test_thinking_then_text(self):
+        token_map = {
+            1: "<|content_thinking|>",
+            2: "let me ",
+            3: "reason",
+            4: "<|end_message|>",
+            5: "<|message_model|>",
+            6: "<|content_text|>",
+            7: "Answer",
+            8: "<|content_model_end_sampling|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2, 3, 4, 5, 6, 7, 8])
+
+        assert stream == "<think>let me reason</think>Answer"
+        assert visible == stream
+        assert stopped
+        assert final.tool_calls == []
+        assert 8 in factory.stop_token_ids
+
+    def test_tool_call_suppressed_and_parsed(self):
+        token_map = {
+            1: "<|content_thinking|>",
+            2: "need weather",
+            3: "<|end_message|>",
+            4: "<|message_model|>",
+            5: "get_weather",
+            6: "<|content_invoke_tool_json|>",
+            7: '{"name":"get_weather","args":{"city":"Seoul"}}',
+            8: "<|end_message|>",
+            9: "<|content_model_end_sampling|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(
+            session, [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        )
+
+        assert stream == "<think>need weather</think>"
+        assert visible == stream
+        assert stopped
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "get_weather"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"city": "Seoul"}
+        assert final.finish_reason == "tool_calls"
+
+    def test_partial_marker_across_tokens(self):
+        token_map = {
+            1: "<|content_",
+            2: "text|>an",
+            3: "swer<|end_",
+            4: "message|>",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2, 3, 4])
+
+        assert visible == "answer"
+        assert "<|content_text|>" not in stream
+        assert not stopped
+
+    def test_unterminated_thinking_closed_at_finalize(self):
+        token_map = {
+            1: "<|content_thinking|>",
+            2: "half a thought",
+        }
+        tokenizer, factory = self._factory(token_map)
+        session = factory.create_session(tokenizer)
+        stream, visible, stopped, final = self._run(session, [1, 2])
+
+        assert stream == "<think>half a thought</think>"
+        assert visible == stream
+
+    def test_non_inkling_models_unaffected(self):
+        tokenizer = InklingTokenizer({0: "a", 1: "b"})
+        factory = detect_output_parser(
+            "llama-3-8b",
+            tokenizer,
+            {"model_type": "llama"},
+        )
+        assert factory is None

@@ -36,10 +36,13 @@ before loading the model, satisfying the ordering for inference. The oQ path in
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ..mlx_lm_mtp import prompt_priming
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +65,47 @@ def apply() -> bool:
     _patch_text_config(q35_config)
     _register_mtp_classes_for_vlm(q35_lang)
     _patch_vlm_language_model(q35_lang)
+    _patch_inner_model_capture(q35_lang)
     # VLMModelAdapter pass-throughs are installed by the MoE runtime patch
     # too; the function is idempotent so calling it twice is safe.
     _patch_vlm_model_adapter()
+    _patch_vlm_outer_model_load_weights()
 
     _APPLIED = True
     logger.info("mlx-vlm Qwen3.5 (dense) runtime MTP patch applied")
     return True
+
+
+def _patch_vlm_outer_model_load_weights() -> None:
+    """Repair miscalibrated MTP-head norms in ``Model.load_weights`` payloads.
+
+    Older oQ conversions stored the head's q_norm/k_norm/mtp.norm one below
+    the correct MLX value; ``repair_legacy_head_norms`` re-applies the +1 at
+    load time. Idempotent-safe on correctly-converted models.
+    """
+    try:
+        from mlx_vlm.models import qwen3_5 as q35_outer
+    except Exception as e:
+        logger.debug(f"mlx_vlm outer qwen3_5 not importable: {e}")
+        return
+
+    cls = q35_outer.Model
+    if getattr(cls, "_omlx_mtp_norm_repair_patched", False):
+        return
+
+    original_load_weights = cls.load_weights
+
+    def load_weights(self, weights, strict=True):
+        from ..mlx_lm_mtp.norm_repair import repair_legacy_head_norms
+
+        try:
+            weights, _ = repair_legacy_head_norms(weights)
+        except Exception:
+            logger.warning("MTP head-norm repair failed", exc_info=True)
+        return original_load_weights(self, weights, strict=strict)
+
+    cls.load_weights = load_weights
+    cls._omlx_mtp_norm_repair_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +248,19 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
         )
         if n_mtp > 0 and attach_enabled:
             self.mtp = q35_lang.MTPModule(args)
+        if self._omlx_mtp_decode_enabled:
+            # Depth-k chained drafting works on this path: mtp_forward
+            # supports return_hidden below, and rollback uses mlx-vlm's
+            # stock rollback_speculative_cache (native partial accepts).
+            from ..mlx_lm_mtp import get_mtp_depth
+
+            self._omlx_mtp_chain = True
+            self._omlx_mtp_depth = get_mtp_depth()
+            # Prompt-priming capture runs inside the inner Qwen3_5Model
+            # forward, which has no reference back to this LanguageModel
+            # (the mtp module / make_mtp_cache live here). A weakref avoids
+            # a tracked module cycle in the nn.Module tree.
+            self.model._omlx_mtp_prime_host = weakref.ref(self)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with optional MTP-cycle return shape.
@@ -252,16 +302,33 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
             shared_kv_states={} if return_shared_kv else None,
         )
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        """MTP-head forward (see mlx_lm_mtp.qwen35_model for the depth-k
+        chain contract: return_hidden yields the head's post-norm hidden for
+        chaining; logits_keep limits the lm_head to the last N positions)."""
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
             self.model.embed_tokens,
             mtp_cache,
         )
+        logits_source = mtp_out
+        if logits_keep and logits_source.shape[1] > logits_keep:
+            logits_source = logits_source[:, -logits_keep:, :]
         if self.args.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(mtp_out)
-        return self.lm_head(mtp_out)
+            logits = self.model.embed_tokens.as_linear(logits_source)
+        else:
+            logits = self.lm_head(logits_source)
+        if return_hidden:
+            return logits, mtp_out
+        return logits
 
     def make_mtp_cache(self):
         if hasattr(self, "mtp"):
@@ -273,6 +340,60 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls._omlx_mtp_runtime_patched = True
+
+
+# ---------------------------------------------------------------------------
+# Inner Qwen3_5Model — prompt-priming capture on prefill/decode forwards.
+# ---------------------------------------------------------------------------
+
+def _patch_inner_model_capture(q35_lang: Any) -> None:
+    """Wrap ``Qwen3_5Model.__call__`` to fold prompt chunks into the MTP head.
+
+    The inner model's return value is the trunk-normed hidden for every
+    position of the forward — exactly what the head history fold needs — and
+    scheduler prefill reaches it via the outer ``LanguageModel.__call__``
+    delegate, so this single wrap covers external prefill, chunked prefill
+    and the seam decode steps.
+
+    Skips: image/recursive calls (``inputs_embeds``), MTP verify and other
+    capture forwards (any of ``capture_layer_ids`` / ``hidden_sink`` /
+    ``gdn_sink``), unknown extra positional call shapes, and hosts without
+    an MTP head (weakref unset). All real gating lives in
+    ``prompt_priming.maybe_capture`` and fails safe to unprimed.
+    """
+    cls = q35_lang.Qwen3_5Model
+    if getattr(cls, "_omlx_mtp_prime_capture_patched", False):
+        return
+
+    original_call = cls.__call__
+
+    def __call__(
+        self, inputs, inputs_embeds=None, mask=None, cache=None, *args, **kwargs
+    ):
+        out = original_call(
+            self, inputs, inputs_embeds, mask, cache, *args, **kwargs
+        )
+        if (
+            inputs_embeds is None
+            and cache is not None
+            and not args
+            and kwargs.get("capture_layer_ids") is None
+            and kwargs.get("hidden_sink") is None
+            and kwargs.get("gdn_sink") is None
+        ):
+            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+            host = host_ref() if host_ref is not None else None
+            if host is not None:
+                try:
+                    prompt_priming.maybe_capture(host, inputs, out, cache)
+                except Exception:
+                    logger.debug(
+                        "MTP prompt-priming capture failed", exc_info=True
+                    )
+        return out
+
+    cls.__call__ = __call__
+    cls._omlx_mtp_prime_capture_patched = True
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +419,24 @@ def _patch_vlm_model_adapter() -> None:
     def mtp(self):
         return getattr(self._language_model, "mtp", None)
 
-    def mtp_forward(self, hidden_states, next_token_ids, mtp_cache):
+    def mtp_forward(
+        self,
+        hidden_states,
+        next_token_ids,
+        mtp_cache,
+        return_hidden: bool = False,
+        logits_keep: int = 0,
+    ):
+        # Forward the depth-k chain kwargs only when set so language models
+        # whose mtp_forward predates them (MoE runtime) keep working.
+        if return_hidden or logits_keep:
+            return self._language_model.mtp_forward(
+                hidden_states,
+                next_token_ids,
+                mtp_cache,
+                return_hidden=return_hidden,
+                logits_keep=logits_keep,
+            )
         return self._language_model.mtp_forward(
             hidden_states, next_token_ids, mtp_cache
         )
