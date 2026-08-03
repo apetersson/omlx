@@ -244,7 +244,12 @@ include = ["omlx*"]
     "vendor/ds4/darwin-arm64/README.md",
     "vendor/ds4/darwin-arm64/manifest.json",
 ]
-"omlx.admin" = ["templates/**/*.html", "static/**/*", "i18n/*.json", "bench_corpus.txt"]
+"omlx.admin" = [
+    "templates/**/*.html",
+    "static/**/*",
+    "i18n/*.json",
+    "bench_corpora/*",
+]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
 "omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
