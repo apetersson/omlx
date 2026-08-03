@@ -83,7 +83,7 @@ def _write_buildable_ds4_source(
             [
                 "ds4-server:",
                 "\tprintf '%s\\n' '#!/bin/sh' "
-                '\'if [ "$$1" = "--help" ]; then echo --ssd-streaming; fi\' '
+                '\'if [ "$$1" = "--help" ]; then echo --ssd-streaming --mtp --dspark; fi\' '
                 "> ds4-server",
                 "\tchmod +x ds4-server",
                 "",

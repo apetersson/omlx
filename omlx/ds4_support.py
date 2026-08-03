@@ -33,7 +33,11 @@ DS4_SUPPORT_FILES: tuple[str, ...] = (
     "LICENSE",
     "README.md",
 )
-DS4_REQUIRED_CLI_FLAGS: tuple[str, ...] = ("--ssd-streaming",)
+DS4_REQUIRED_CLI_FLAGS: tuple[str, ...] = (
+    "--ssd-streaming",
+    "--mtp",
+    "--dspark",
+)
 _DS4_AUTO_BUILD_FAILURES: dict[tuple[str, str, str], str] = {}
 _DS4_SUPPORT_LOCKS: dict[str, threading.Lock] = {}
 _DS4_SUPPORT_LOCKS_GUARD = threading.Lock()
@@ -407,7 +411,7 @@ def _inspect_ds4_binary_capabilities(binary_path: Path) -> str | None:
     """Return a compatibility error when the DS4 binary lacks required flags."""
     try:
         completed = subprocess.run(
-            [str(binary_path), "--help"],
+            [str(binary_path), "--help", "all"],
             capture_output=True,
             text=True,
             timeout=2,

@@ -396,7 +396,15 @@
                                                    placeholder="/path/to/DeepSeek-V4-Flash-MTP.gguf"
                                                    class="w-full px-3 py-2 border border-purple-200 rounded-xl text-sm focus:ring-2 focus:ring-purple-950 focus:border-transparent transition-all bg-white">
                                         </div>
-                                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                        <div x-show="modelSettings.ds4_mtp_path" x-cloak
+                                             class="text-xs font-semibold text-purple-900"
+                                             x-text="ds4MtpSidecarKind() === 'dspark' ? 'DSpark runtime (--dspark)' : 'Legacy MTP runtime'"></div>
+                                        <div x-show="ds4MtpSidecarKind() === 'dspark'" x-cloak
+                                             class="rounded-lg border border-purple-200 bg-purple-50 px-3 py-2 text-xs text-purple-800">
+                                            DSpark uses adaptive speculative decoding and can run with main-model SSD streaming. Legacy draft-token and margin tuning do not apply.
+                                        </div>
+                                        <div x-show="ds4MtpSidecarKind() !== 'dspark'"
+                                             class="grid grid-cols-1 sm:grid-cols-3 gap-3">
                                             <div>
                                                 <label class="block text-xs font-bold uppercase tracking-wider text-purple-800 mb-2">{{ t('modal.model_settings.ds4_mtp_tuning') }}</label>
                                                 <select @change="applyDs4MtpPreset($event.target.value); $event.target.value = ''"

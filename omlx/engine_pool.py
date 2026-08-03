@@ -238,7 +238,7 @@ class EnginePool:
         if (
             entry.engine_type != "ds4"
             or self._get_ds4_settings().ssd_streaming != "auto"
-            or self._ds4_entry_uses_mtp(entry)
+            or self._ds4_entry_uses_legacy_mtp(entry)
         ):
             return entry.estimated_size
 
@@ -271,18 +271,27 @@ class EnginePool:
         )
         return admission_size
 
-    def _ds4_entry_uses_mtp(self, entry: EngineEntry) -> bool:
-        """Return True when per-model settings enable DS4's MTP sidecar."""
+    def _ds4_entry_uses_legacy_mtp(self, entry: EngineEntry) -> bool:
+        """Return True when legacy MTP forbids DS4 SSD streaming.
+
+        DSpark also uses ``--mtp`` for its support GGUF, but the DS4 runtime
+        explicitly supports combining DSpark with main-model SSD streaming.
+        """
         if entry.engine_type != "ds4" or self._settings_manager is None:
             return False
         try:
             model_settings = self._settings_manager.get_settings(entry.model_id)
         except Exception:  # noqa: BLE001 - settings should not block admission
             return False
-        return bool(
-            getattr(model_settings, "ds4_mtp_enabled", False)
-            and getattr(model_settings, "ds4_mtp_path", None)
-        )
+        mtp_path = getattr(model_settings, "ds4_mtp_path", None)
+        if not getattr(model_settings, "ds4_mtp_enabled", False) or not mtp_path:
+            return False
+        try:
+            from .ds4_gguf import detect_ds4_mtp_sidecar_kind
+
+            return detect_ds4_mtp_sidecar_kind(Path(str(mtp_path))) != "dspark"
+        except Exception:  # noqa: BLE001 - unknown sidecars keep legacy safety
+            return True
 
     async def _settle_ds4_auto_admission_after_eviction(
         self,
@@ -805,9 +814,12 @@ class EnginePool:
     def _raise_if_model_path_missing_locked(
         self, model_id: str, entry: EngineEntry
     ) -> None:
-        """Drop stale unloaded entries whose backing model directory vanished."""
+        """Drop stale unloaded entries whose backing model files vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        if self._is_ds4_entry(entry):
+            if model_path.is_file():
+                return
+        elif model_path.exists() and (model_path / "config.json").exists():
             return
 
         if entry.engine is None:
@@ -993,7 +1005,10 @@ class EnginePool:
                     return profile_source
             all_settings = settings_manager.get_all_settings() or {}
             for mid, ms in all_settings.items():
-                if getattr(ms, "model_alias", None) == model_id_or_alias:
+                if (
+                    mid in self._entries
+                    and getattr(ms, "model_alias", None) == model_id_or_alias
+                ):
                     return mid
 
         ds4_alias_match = self._resolve_ds4_alias_id(model_id_or_alias, all_settings)
@@ -1014,7 +1029,10 @@ class EnginePool:
                 return ci_match
             if all_settings is not None:
                 for mid, ms in all_settings.items():
-                    if getattr(ms, "model_alias", None) == stripped:
+                    if (
+                        mid in self._entries
+                        and getattr(ms, "model_alias", None) == stripped
+                    ):
                         return mid
             ds4_alias_match = self._resolve_ds4_alias_id(stripped, all_settings)
             if ds4_alias_match is not None:
@@ -1315,7 +1333,11 @@ class EnginePool:
                             ceiling=ceiling,
                         )
                     projected = current + admission_size
-                    if projected <= evict_target:
+                    if projected <= evict_target and not (
+                        entry.engine_type == "ds4"
+                        and evicted_any
+                        and entry.ds4_auto_enable_ssd_streaming
+                    ):
                         break
                     victim = self._find_lru_victim()
                     if victim is not None:

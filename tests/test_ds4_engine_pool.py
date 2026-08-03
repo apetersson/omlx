@@ -671,6 +671,45 @@ async def test_engine_pool_ds4_mtp_disables_auto_ssd_streaming_admission(
 
 
 @pytest.mark.asyncio
+async def test_engine_pool_dspark_allows_auto_ssd_streaming_admission(
+    monkeypatch, tmp_path
+):
+    """DSpark can combine its support GGUF with main-model SSD streaming."""
+    _patch_fake_process(monkeypatch)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 1_000)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    monkeypatch.setattr(
+        "omlx.ds4_gguf.detect_ds4_mtp_sidecar_kind", lambda _path: "dspark"
+    )
+    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
+    dspark = tmp_path / "DSpark-support.gguf"
+    dspark.write_bytes(b"0" * 100)
+    pool = EnginePool(
+        base_path=tmp_path,
+        ds4_settings=DS4Settings(ssd_streaming="auto"),
+    )
+    pool._get_final_ceiling = lambda: 1_500
+    pool.discover_models(str(tmp_path))
+
+    class SettingsManager:
+        def get_settings(self, model_id):
+            from omlx.model_settings import ModelSettings
+
+            return ModelSettings(ds4_mtp_enabled=True, ds4_mtp_path=str(dspark))
+
+    pool._settings_manager = SettingsManager()
+
+    await pool.get_engine("foo")
+
+    launch = FakeManagedProcess.instances[0]
+    assert launch.config.mtp_kind == "dspark"
+    assert launch.config.auto_enable_ssd_streaming is True
+    assert "--mtp" in launch.command
+    assert "--dspark" in launch.command
+    assert "--ssd-streaming" in launch.command
+
+
+@pytest.mark.asyncio
 async def test_engine_pool_waits_for_ds4_ceiling_recovery_after_eviction(
     monkeypatch, tmp_path
 ):

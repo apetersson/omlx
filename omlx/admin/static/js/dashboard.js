@@ -1504,14 +1504,25 @@
                         display_name: currentPath.split('/').pop() || currentPath,
                         path: currentPath,
                         size_formatted: '',
+                        kind: /dspark/i.test(currentPath) ? 'dspark' : 'legacy_mtp',
                     },
                     ...sidecars,
                 ];
             },
 
+            ds4MtpSidecarKind() {
+                const currentPath = this.modelSettings?.ds4_mtp_path || '';
+                const candidate = (this.ds4MtpSidecars || []).find(
+                    (item) => item.path === currentPath,
+                );
+                return candidate?.kind || (/dspark/i.test(currentPath) ? 'dspark' : 'legacy_mtp');
+            },
+
             ds4MtpSidecarLabel(sidecar) {
                 const label = sidecar.display_name || sidecar.path || '';
-                return sidecar.size_formatted ? `${label} (${sidecar.size_formatted})` : label;
+                const kind = sidecar.kind === 'dspark' ? 'DSpark' : 'Legacy MTP';
+                const sized = sidecar.size_formatted ? `${label} (${sidecar.size_formatted})` : label;
+                return `[${kind}] ${sized}`;
             },
 
             applyDs4MtpPreset(preset) {
@@ -2103,6 +2114,7 @@
                                 ttl_seconds: this.modelSettings.ttl_seconds || null,
                             };
                             if (isDs4) {
+                                const ds4MtpKind = this.ds4MtpSidecarKind();
                                 return {
                                     ...commonPayload,
                                     max_context_window: this.modelSettings.max_context_window || null,
@@ -2154,9 +2166,11 @@
                                         ? (this.modelSettings.ds4_mtp_path || null)
                                         : null,
                                     ds4_mtp_draft: this.modelSettings.ds4_mtp_enabled
+                                        && ds4MtpKind !== 'dspark'
                                         ? (parseInt(this.modelSettings.ds4_mtp_draft) || 2)
                                         : null,
                                     ds4_mtp_margin: this.modelSettings.ds4_mtp_enabled
+                                        && ds4MtpKind !== 'dspark'
                                         ? (Number.isFinite(parseFloat(this.modelSettings.ds4_mtp_margin))
                                             ? parseFloat(this.modelSettings.ds4_mtp_margin)
                                             : 3)

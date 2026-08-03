@@ -9,8 +9,11 @@ from pathlib import Path
 import pytest
 
 from omlx.ds4_gguf import (
+    DS4_DSPARK_REQUIRED_TENSORS,
     DS4_MTP_REQUIRED_TENSORS,
     DS4MTPCompatibilityError,
+    detect_ds4_mtp_sidecar_kind,
+    is_ds4_mtp_gguf_sidecar,
     validate_ds4_mtp_compatibility,
 )
 
@@ -95,6 +98,17 @@ def _mtp_tensors(*, routed_shape=(4096, 2048, 256)) -> dict[str, tuple[int, ...]
     return tensors
 
 
+def _dspark_metadata() -> dict[str, object]:
+    return {
+        "general.architecture": "deepseek4-dspark",
+        "general.name": "DeepSeek V4 Flash DSpark support",
+    }
+
+
+def _dspark_tensors() -> dict[str, tuple[int, ...]]:
+    return {name: (1,) for name in DS4_DSPARK_REQUIRED_TENSORS}
+
+
 def test_validate_ds4_mtp_accepts_matching_flash_sidecar(tmp_path):
     main = tmp_path / "DeepSeek-V4-Flash.gguf"
     mtp = tmp_path / "DeepSeek-V4-Flash-MTP.gguf"
@@ -102,6 +116,31 @@ def test_validate_ds4_mtp_accepts_matching_flash_sidecar(tmp_path):
     _write_tiny_gguf(mtp, metadata=_mtp_metadata(), tensors=_mtp_tensors())
 
     validate_ds4_mtp_compatibility(main, mtp)
+
+
+def test_validate_ds4_mtp_accepts_dspark_support(tmp_path):
+    main = tmp_path / "DeepSeek-V4-Flash.gguf"
+    dspark = tmp_path / "DeepSeek-V4-Flash-DSpark-support.gguf"
+    _write_tiny_gguf(main, metadata=_main_metadata())
+    _write_tiny_gguf(dspark, metadata=_dspark_metadata(), tensors=_dspark_tensors())
+
+    assert detect_ds4_mtp_sidecar_kind(dspark) == "dspark"
+    assert is_ds4_mtp_gguf_sidecar(dspark) is True
+    validate_ds4_mtp_compatibility(main, dspark)
+
+
+def test_validate_ds4_mtp_rejects_incomplete_dspark_support(tmp_path):
+    main = tmp_path / "DeepSeek-V4-Flash.gguf"
+    dspark = tmp_path / "DeepSeek-V4-Flash-DSpark-support.gguf"
+    _write_tiny_gguf(main, metadata=_main_metadata())
+    _write_tiny_gguf(
+        dspark, metadata=_dspark_metadata(), tensors={"mtp.0.main_proj.weight": (1,)}
+    )
+
+    with pytest.raises(
+        DS4MTPCompatibilityError, match="DSpark support GGUF is missing"
+    ):
+        validate_ds4_mtp_compatibility(main, dspark)
 
 
 def test_validate_ds4_mtp_rejects_pro_main_model(tmp_path):

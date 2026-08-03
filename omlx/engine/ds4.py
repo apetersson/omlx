@@ -15,7 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
@@ -331,7 +331,9 @@ class DS4ProcessEngine(BaseEngine):
         """Start DS4 and wait for readiness."""
         if self.is_running:
             return
-        mtp_path, mtp_draft, mtp_margin = self._mtp_launch_args(self.model_settings)
+        mtp_path, mtp_kind, mtp_draft, mtp_margin = self._mtp_launch_args(
+            self.model_settings
+        )
         config = DS4LaunchConfig(
             model_id=self.model_id,
             gguf_path=self._model_path,
@@ -340,6 +342,7 @@ class DS4ProcessEngine(BaseEngine):
             context_tokens=self.context_tokens,
             auto_enable_ssd_streaming=self.auto_enable_ssd_streaming,
             mtp_path=mtp_path,
+            mtp_kind=mtp_kind,
             mtp_draft=mtp_draft,
             mtp_margin=mtp_margin,
         )
@@ -377,14 +380,24 @@ class DS4ProcessEngine(BaseEngine):
     @staticmethod
     def _mtp_launch_args(
         model_settings: Any | None,
-    ) -> tuple[Path | None, int | None, float | None]:
+    ) -> tuple[
+        Path | None,
+        Literal["legacy_mtp", "dspark"] | None,
+        int | None,
+        float | None,
+    ]:
         if model_settings is None or not getattr(model_settings, "ds4_mtp_enabled", False):
-            return None, None, None
+            return None, None, None, None
         mtp_path = getattr(model_settings, "ds4_mtp_path", None)
         if not mtp_path:
-            return None, None, None
+            return None, None, None, None
+        resolved_path = Path(str(mtp_path)).expanduser().resolve()
+        from ..ds4_gguf import detect_ds4_mtp_sidecar_kind
+
+        mtp_kind = detect_ds4_mtp_sidecar_kind(resolved_path) or "legacy_mtp"
         return (
-            Path(str(mtp_path)).expanduser().resolve(),
+            resolved_path,
+            mtp_kind,
             getattr(model_settings, "ds4_mtp_draft", None),
             getattr(model_settings, "ds4_mtp_margin", None),
         )

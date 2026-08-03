@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import platform
 import re
 import socket
 import time
@@ -77,6 +78,7 @@ class DS4LaunchConfig:
     host: str = DS4_HOST
     auto_enable_ssd_streaming: bool = False
     mtp_path: Path | None = None
+    mtp_kind: Literal["legacy_mtp", "dspark"] | None = None
     mtp_draft: int | None = None
     mtp_margin: float | None = None
     trace_timestamp: str | None = None
@@ -150,15 +152,24 @@ class DS4LaunchConfig:
             "--power",
             str(self.settings.power),
         ]
+        platform_system = self.platform_system or platform.system()
+        if platform_system == "Darwin":
+            # Require the accelerated backend explicitly. A CPU-only DS4 build
+            # otherwise defaults to the reference backend and can consume all
+            # host cores for minutes without surfacing a configuration error.
+            args.append("--metal")
         context_tokens = self.context_tokens or self.settings.get_auto_context_tokens()
         if context_tokens:
             args.extend(["--ctx", str(context_tokens)])
         if self.mtp_path is not None:
             args.extend(["--mtp", str(self.mtp_path)])
-            if self.mtp_draft is not None:
-                args.extend(["--mtp-draft", str(self.mtp_draft)])
-            if self.mtp_margin is not None:
-                args.extend(["--mtp-margin", str(self.mtp_margin)])
+            if self.mtp_kind == "dspark":
+                args.append("--dspark")
+            else:
+                if self.mtp_draft is not None:
+                    args.extend(["--mtp-draft", str(self.mtp_draft)])
+                if self.mtp_margin is not None:
+                    args.extend(["--mtp-margin", str(self.mtp_margin)])
         if self.settings.kv_cache_enabled:
             args.extend(
                 [
@@ -180,7 +191,7 @@ class DS4LaunchConfig:
 
     def should_enable_ssd_streaming(self) -> bool:
         """Resolve SSD streaming mode for this launch."""
-        if self.mtp_path is not None:
+        if self.mtp_path is not None and self.mtp_kind != "dspark":
             return False
         if self.settings.ssd_streaming == "on":
             return True

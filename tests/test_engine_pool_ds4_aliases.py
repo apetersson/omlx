@@ -35,6 +35,7 @@ def test_ds4_suffix_alias_uses_existing_model_alias(tmp_path):
     pool = _pool_with_gguf(tmp_path)
 
     settings_manager = MagicMock()
+    settings_manager.get_exposed_profile_source_model_id.return_value = None
     settings_manager.get_all_settings.return_value = {
         "foo": ModelSettings(model_alias="gpt-4o"),
     }
@@ -42,6 +43,29 @@ def test_ds4_suffix_alias_uses_existing_model_alias(tmp_path):
     assert pool.resolve_model_id("gpt-4o", settings_manager) == "foo"
     assert pool.resolve_model_id("gpt-4o-chat", settings_manager) == "foo"
     assert pool.resolve_model_id("omlx/gpt-4o-reasoner", settings_manager) == "foo"
+
+
+def test_model_alias_ignores_undiscovered_settings_entry(tmp_path):
+    """Stale per-model settings do not resolve aliases to missing models."""
+    pool = _pool_with_gguf(tmp_path)
+
+    settings_manager = MagicMock()
+    settings_manager.get_exposed_profile_source_model_id.return_value = None
+    settings_manager.get_all_settings.return_value = {
+        "missing": ModelSettings(model_alias="gpt-4o"),
+    }
+
+    assert pool.resolve_model_id("gpt-4o", settings_manager) == "gpt-4o"
+
+
+def test_ds4_gguf_file_path_is_not_dropped_as_missing(tmp_path):
+    """DS4 GGUF entries are files, not directories with config.json."""
+    pool = _pool_with_gguf(tmp_path)
+    entry = pool.get_entry("foo")
+
+    assert entry is not None
+    pool._raise_if_model_path_missing_locked("foo", entry)
+    assert pool.get_entry("foo") is entry
 
 
 def test_global_ds4_native_aliases_are_not_auto_created(tmp_path):

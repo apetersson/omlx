@@ -1958,6 +1958,7 @@ def _list_ds4_mtp_sidecars(global_settings: Any | None) -> list[dict[str, Any]]:
                         "path": path,
                         "size": candidate.size,
                         "size_formatted": format_size(candidate.size),
+                        "kind": candidate.kind,
                         "source_type": candidate.source_type,
                         "source_repo_id": candidate.source_repo_id,
                     }

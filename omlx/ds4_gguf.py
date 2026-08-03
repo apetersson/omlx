@@ -11,9 +11,10 @@ from __future__ import annotations
 import logging
 import re
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,12 @@ DS4_GENERIC_GGUF_STEMS = {
 }
 DS4_SUPPORTED_GGUF_ARCHITECTURES = {"deepseek4"}
 DS4_MTP_GGUF_ARCHITECTURE = "deepseek4_mtp_support"
+DS4_DSPARK_GGUF_ARCHITECTURE = "deepseek4-dspark"
+DS4SidecarKind = Literal["legacy_mtp", "dspark"]
+DS4_SPECULATOR_GGUF_ARCHITECTURES: dict[str, DS4SidecarKind] = {
+    DS4_MTP_GGUF_ARCHITECTURE: "legacy_mtp",
+    DS4_DSPARK_GGUF_ARCHITECTURE: "dspark",
+}
 DS4_MTP_REQUIRED_TENSORS = (
     "mtp.0.hc_head_base.weight",
     "mtp.0.hc_head_fn.weight",
@@ -58,6 +65,15 @@ DS4_MTP_REQUIRED_TENSORS = (
     "mtp.0.enorm.weight",
     "mtp.0.hnorm.weight",
     "mtp.0.norm.weight",
+)
+DS4_DSPARK_REQUIRED_TENSORS = (
+    "mtp.0.main_norm.weight",
+    "mtp.0.main_proj.weight",
+    "mtp.1.attn_norm.weight",
+    "mtp.2.confidence_head.proj.weight",
+    "mtp.2.markov_head.markov_w1.weight",
+    "mtp.2.markov_head.markov_w2.weight",
+    "mtp.2.norm.weight",
 )
 _DS4_SUMMARY_METADATA_KEYS = {
     "general.architecture",
@@ -126,7 +142,7 @@ class GGUFMetadataSummary:
     nextn_predict_layers: int | None = None
     mtp_layer_count: int | None = None
     vocab_size: int | None = None
-    tensor_infos: tuple["GGUFTensorInfo", ...] = ()
+    tensor_infos: tuple[GGUFTensorInfo, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -154,11 +170,12 @@ class DS4GGUFModelCandidate:
 
 @dataclass(frozen=True)
 class DS4MTPGGUFSidecarCandidate:
-    """A GGUF file that can be selected as a DS4 MTP sidecar."""
+    """A GGUF file that can be selected as a DS4 speculative sidecar."""
 
     display_name: str
     path: Path
     size: int
+    kind: DS4SidecarKind = "legacy_mtp"
     source_type: str = "local"
     source_repo_id: str | None = None
 
@@ -279,8 +296,7 @@ def _read_gguf_tensor_infos(f, tensor_count: int) -> tuple[GGUFTensorInfo, ...]:
         n_dimensions = _read_u32(f)
         if n_dimensions > 16:
             raise GGUFMetadataError(
-                f"GGUF tensor {name!r} has implausible dimension count "
-                f"{n_dimensions}"
+                f"GGUF tensor {name!r} has implausible dimension count {n_dimensions}"
             )
         dimensions = tuple(_read_u64(f) for _ in range(n_dimensions))
         ggml_type = _read_u32(f)
@@ -310,9 +326,7 @@ def read_ds4_gguf_metadata_summary(
                 f"file too short to be a GGUF file ({len(initial)} bytes)"
             )
         if initial != _GGUF_MAGIC:
-            raise GGUFMetadataError(
-                "not a GGUF file (missing magic bytes)"
-            )
+            raise GGUFMetadataError("not a GGUF file (missing magic bytes)")
         # Magic already consumed; file pointer is now at position 4
         # (start of version field).  Continue reading from here.
         _read_u32(f)  # version
@@ -401,8 +415,24 @@ def _ds4_is_flash(summary: GGUFMetadataSummary, path: Path) -> bool:
     return "deepseek" in haystack and "v4" in haystack and "flash" in haystack
 
 
+def detect_ds4_mtp_sidecar_kind(path: Path) -> DS4SidecarKind | None:
+    """Return ``legacy_mtp`` or ``dspark`` for a DS4 support GGUF."""
+    try:
+        metadata = read_ds4_gguf_metadata_summary(path)
+    except GGUFMetadataError as e:
+        logger.debug("Skipping non-DS4 support GGUF %s: %s", path, e)
+        return None
+    except Exception as e:
+        logger.info("Could not inspect GGUF metadata for %s: %s", path, e)
+        return None
+    if metadata.split_no is not None and metadata.split_no > 0:
+        return None
+    architecture = (metadata.architecture or "").strip().lower()
+    return DS4_SPECULATOR_GGUF_ARCHITECTURES.get(architecture)
+
+
 def validate_ds4_mtp_compatibility(main_path: Path, mtp_path: Path) -> None:
-    """Validate that *mtp_path* is the DS4 Flash MTP sidecar for *main_path*.
+    """Validate a legacy MTP or DSpark support GGUF against *main_path*.
 
     This is a cheap, upfront GGUF-header/tensor-directory check. DS4 still does
     the final runtime load validation, but this catches wrong paths, PRO/main
@@ -437,13 +467,36 @@ def validate_ds4_mtp_compatibility(main_path: Path, mtp_path: Path) -> None:
             "the current MTP sidecar is only supported for DeepSeek V4 Flash GGUFs"
         )
 
-    if (mtp.architecture or "").strip().lower() != DS4_MTP_GGUF_ARCHITECTURE:
+    mtp_architecture = (mtp.architecture or "").strip().lower()
+    sidecar_kind = DS4_SPECULATOR_GGUF_ARCHITECTURES.get(mtp_architecture)
+    if sidecar_kind is None:
         _raise_mtp_compat(
-            "MTP sidecar architecture must be "
-            f"{DS4_MTP_GGUF_ARCHITECTURE}, got {mtp.architecture!r}"
+            "support GGUF architecture must be one of "
+            f"{', '.join(sorted(DS4_SPECULATOR_GGUF_ARCHITECTURES))}, "
+            f"got {mtp.architecture!r}"
         )
     if mtp.split_no is not None and mtp.split_no > 0:
-        _raise_mtp_compat("MTP sidecar is a continuation split shard")
+        _raise_mtp_compat("support GGUF is a continuation split shard")
+
+    tensor_by_name = {info.name: info for info in mtp.tensor_infos}
+    if not tensor_by_name:
+        _raise_mtp_compat("support GGUF has no tensor directory")
+    non_mtp = [name for name in tensor_by_name if not name.startswith("mtp.")]
+    if non_mtp:
+        _raise_mtp_compat(
+            "support GGUF contains non-MTP tensor(s): " + ", ".join(non_mtp[:3])
+        )
+
+    if sidecar_kind == "dspark":
+        missing = [
+            name for name in DS4_DSPARK_REQUIRED_TENSORS if name not in tensor_by_name
+        ]
+        if missing:
+            _raise_mtp_compat(
+                "DSpark support GGUF is missing tensor(s): " + ", ".join(missing[:3])
+            )
+        return
+
     if mtp.mtp_layer_count not in (None, 1):
         _raise_mtp_compat(f"expected one MTP layer, got {mtp.mtp_layer_count}")
     if mtp.nextn_predict_layers not in (None, 1):
@@ -469,14 +522,6 @@ def validate_ds4_mtp_compatibility(main_path: Path, mtp_path: Path) -> None:
             f"expert_count mismatch ({main.expert_count} != {mtp.expert_count})"
         )
 
-    tensor_by_name = {info.name: info for info in mtp.tensor_infos}
-    if not tensor_by_name:
-        _raise_mtp_compat("MTP sidecar has no tensor directory")
-    non_mtp = [name for name in tensor_by_name if not name.startswith("mtp.")]
-    if non_mtp:
-        _raise_mtp_compat(
-            "MTP sidecar contains non-MTP tensor(s): " + ", ".join(non_mtp[:3])
-        )
     missing = [name for name in DS4_MTP_REQUIRED_TENSORS if name not in tensor_by_name]
     if missing:
         _raise_mtp_compat("MTP sidecar is missing tensor(s): " + ", ".join(missing[:3]))
@@ -528,8 +573,11 @@ def is_supported_ds4_gguf(path: Path) -> bool:
         # no-magic: not a real GGUF — keep extension-based compatibility
         # for hand-made test stubs.
         if "magic" in str(e).lower() or "missing" in str(e).lower():
-            logger.debug("Not a GGUF file (no magic), treating %s as supported "
-                         "by extension for stub compatibility", path)
+            logger.debug(
+                "Not a GGUF file (no magic), treating %s as supported "
+                "by extension for stub compatibility",
+                path,
+            )
             return True
         # bad-header: GGUF magic present but metadata is corrupt or
         # unsupported — reject explicitly.
@@ -561,20 +609,8 @@ def is_supported_ds4_gguf(path: Path) -> bool:
 
 
 def is_ds4_mtp_gguf_sidecar(path: Path) -> bool:
-    """Return True when a GGUF is a DS4 MTP support sidecar."""
-    try:
-        metadata = read_ds4_gguf_metadata_summary(path)
-    except GGUFMetadataError as e:
-        logger.debug("Skipping non-MTP GGUF sidecar candidate %s: %s", path, e)
-        return False
-    except Exception as e:
-        logger.info("Could not inspect GGUF metadata for %s: %s", path, e)
-        return False
-
-    if metadata.split_no is not None and metadata.split_no > 0:
-        return False
-    architecture = (metadata.architecture or "").strip().lower()
-    return architecture == DS4_MTP_GGUF_ARCHITECTURE
+    """Return True for legacy MTP and DSpark support GGUFs."""
+    return detect_ds4_mtp_sidecar_kind(path) is not None
 
 
 def normalize_ds4_gguf_model_id(name: str) -> str:
@@ -725,22 +761,27 @@ def collect_ds4_mtp_gguf_sidecar_candidates(
     source_type: str = "local",
     source_repo_id: str | None = None,
 ) -> list[DS4MTPGGUFSidecarCandidate]:
-    """Collect DS4 MTP sidecar GGUF files from a direct path listing."""
+    """Collect legacy MTP and DSpark support GGUFs from a path listing."""
     ggufs = [path for path in paths if is_ds4_gguf_file(path)]
-    mtp_ggufs = [path for path in ggufs if is_ds4_mtp_gguf_sidecar(path)]
+    support_ggufs = [
+        (path, kind)
+        for path in ggufs
+        if (kind := detect_ds4_mtp_sidecar_kind(path)) is not None
+    ]
     candidates: list[DS4MTPGGUFSidecarCandidate] = []
-    for gguf_path in mtp_ggufs:
+    for gguf_path, kind in support_ggufs:
         try:
             candidates.append(
                 DS4MTPGGUFSidecarCandidate(
                     display_name=compose_ds4_gguf_display_name(
                         root_dir,
                         gguf_path,
-                        len(mtp_ggufs),
+                        len(support_ggufs),
                         source_repo_id=source_repo_id,
                     ),
                     path=gguf_path,
                     size=gguf_path.stat().st_size,
+                    kind=kind,
                     source_type=source_type,
                     source_repo_id=source_repo_id,
                 )

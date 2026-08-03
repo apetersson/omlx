@@ -37,10 +37,16 @@ def _write_gguf_scalar_kv(f, key: str, value) -> None:
         f.write(struct.pack("<I", int(value)))
 
 
-def _write_ds4_mtp_sidecar_header(path: Path) -> None:
+def _write_ds4_mtp_sidecar_header(
+    path: Path, *, architecture: str = "deepseek4_mtp_support"
+) -> None:
     metadata = {
-        "general.architecture": "deepseek4_mtp_support",
-        "general.name": "DeepSeek V4 Flash MTP",
+        "general.architecture": architecture,
+        "general.name": (
+            "DeepSeek V4 Flash DSpark support"
+            if architecture == "deepseek4-dspark"
+            else "DeepSeek V4 Flash MTP"
+        ),
         "deepseek4.mtp_layer_count": 1,
     }
     with path.open("wb") as f:
@@ -762,13 +768,17 @@ async def test_list_models_exposes_ds4_display_name(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_list_models_exposes_ds4_mtp_sidecar_candidates(monkeypatch, tmp_path):
-    """Admin model list includes selectable DS4 MTP sidecar GGUFs."""
+    """Admin model list distinguishes legacy MTP and nested DSpark support."""
     model_dir = tmp_path / "models"
     model_dir.mkdir()
     main = model_dir / "DeepSeek-V4-Flash.gguf"
     main.write_bytes(b"0" * 1000)
     sidecar = model_dir / "DeepSeek-V4-Flash-MTP.gguf"
     _write_ds4_mtp_sidecar_header(sidecar)
+    dspark_dir = model_dir / "DeepSeek-V4-Flash-Quant"
+    dspark_dir.mkdir()
+    dspark = dspark_dir / "DeepSeek-V4-Flash-DSpark-support.gguf"
+    _write_ds4_mtp_sidecar_header(dspark, architecture="deepseek4-dspark")
 
     pool = _ds4_pool(str(main))
     manager = MagicMock()
@@ -784,13 +794,23 @@ async def test_list_models_exposes_ds4_mtp_sidecar_candidates(monkeypatch, tmp_p
 
     assert result["ds4_mtp_sidecars"] == [
         {
+            "display_name": "DeepSeek-V4-Flash-DSpark-support",
+            "path": str(dspark),
+            "size": dspark.stat().st_size,
+            "size_formatted": admin_routes.format_size(dspark.stat().st_size),
+            "kind": "dspark",
+            "source_type": "local",
+            "source_repo_id": None,
+        },
+        {
             "display_name": "DeepSeek-V4-Flash-MTP",
             "path": str(sidecar),
             "size": sidecar.stat().st_size,
             "size_formatted": admin_routes.format_size(sidecar.stat().st_size),
+            "kind": "legacy_mtp",
             "source_type": "local",
             "source_repo_id": None,
-        }
+        },
     ]
 
 

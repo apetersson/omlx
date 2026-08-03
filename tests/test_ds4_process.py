@@ -58,6 +58,10 @@ parser.add_argument('--kv-disk-dir')
 parser.add_argument('--kv-disk-space-mb')
 parser.add_argument('--kv-cache-continued-interval-tokens')
 parser.add_argument('--ssd-streaming', action='store_true')
+parser.add_argument('--mtp')
+parser.add_argument('--mtp-draft')
+parser.add_argument('--mtp-margin')
+parser.add_argument('--dspark', action='store_true')
 parser.add_argument('--trace')
 args, _ = parser.parse_known_args()
 print('fake ds4 argv model=' + str(args.model), flush=True)
@@ -86,7 +90,7 @@ def _never_ready_script() -> str:
 import sys
 import time
 if '--help' in sys.argv:
-    print('--ssd-streaming')
+    print('--ssd-streaming --mtp --dspark')
     raise SystemExit(0)
 print('fake ds4 never ready', flush=True)
 time.sleep(60)
@@ -207,6 +211,7 @@ class TestDS4LaunchConfig:
         assert command[command.index("--model") + 1] == str(gguf)
         assert command[command.index("--host") + 1] == DS4_HOST
         assert command[command.index("--port") + 1] == "12345"
+        assert "--metal" in command
         assert command[command.index("--ctx") + 1] == "100000"
         assert command[command.index("--kv-disk-space-mb") + 1] == "1234"
         assert (
@@ -230,6 +235,23 @@ class TestDS4LaunchConfig:
                 base_path=tmp_path,
                 host="0.0.0.0",
             )
+
+    def test_build_command_omits_metal_on_non_darwin(self, tmp_path):
+        """Non-Darwin launchers do not receive the macOS Metal backend flag."""
+        support = tmp_path / "support" / "ds4"
+        _write_support_tree(support, _ready_server_script())
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"gguf")
+        config = DS4LaunchConfig(
+            model_id="model",
+            gguf_path=gguf,
+            settings=DS4Settings(support_dir=str(support)),
+            base_path=tmp_path,
+            platform_system="Linux",
+            platform_machine="aarch64",
+        )
+
+        assert "--metal" not in config.build_command(12345)
 
     def test_launch_config_is_frozen_after_localhost_validation(self, tmp_path):
         """The localhost-only invariant cannot be bypassed by mutation."""
@@ -304,6 +326,35 @@ class TestDS4LaunchConfig:
         assert command[command.index("--mtp-draft") + 1] == "2"
         assert command[command.index("--mtp-margin") + 1] == "3.0"
         assert "--ssd-streaming" not in command
+
+    def test_build_command_adds_dspark_and_keeps_ssd_streaming(self, tmp_path):
+        """DSpark uses --mtp plus --dspark and permits main-model streaming."""
+        support = tmp_path / "support" / "ds4"
+        _write_support_tree(support, _ready_server_script())
+        gguf = tmp_path / "model.gguf"
+        gguf.write_bytes(b"gguf")
+        dspark = tmp_path / "dspark-support.gguf"
+        dspark.write_bytes(b"gguf")
+        config = DS4LaunchConfig(
+            model_id="model",
+            gguf_path=gguf,
+            settings=DS4Settings(support_dir=str(support), ssd_streaming="on"),
+            base_path=tmp_path,
+            mtp_path=dspark,
+            mtp_kind="dspark",
+            mtp_draft=4,
+            mtp_margin=1.5,
+            platform_system="Darwin",
+            platform_machine="arm64",
+        )
+
+        command = config.build_command(12345)
+
+        assert command[command.index("--mtp") + 1] == str(dspark)
+        assert "--dspark" in command
+        assert "--mtp-draft" not in command
+        assert "--mtp-margin" not in command
+        assert "--ssd-streaming" in command
 
 
 class TestDS4ManagedProcess:

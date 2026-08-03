@@ -5,5 +5,5 @@
   "platform": "darwin-arm64",
   "binary": "ds4-server",
   "build_command": "make ds4-server",
-  "required_cli_flags": ["--ssd-streaming"]
+  "required_cli_flags": ["--ssd-streaming", "--mtp", "--dspark"]
 }
