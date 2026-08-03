@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
-from .ds4_aliases import parse_ds4_alias_id
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -945,37 +944,6 @@ class EnginePool:
 
         return None
 
-    def _resolve_ds4_alias_id(
-        self, alias_id: str, all_settings: dict | None
-    ) -> str | None:
-        """Resolve OMLX-managed DS4 suffix aliases to the base DS4 model id."""
-        parsed = parse_ds4_alias_id(alias_id)
-        if parsed is None:
-            return None
-
-        base_id, _kind = parsed
-        entry = self._entries.get(base_id)
-        if entry is not None and self._is_ds4_entry(entry):
-            return base_id
-
-        ci_match = self._case_insensitive_entry_match(base_id)
-        if ci_match is not None and self._is_ds4_entry(self._entries[ci_match]):
-            return ci_match
-
-        if all_settings is not None:
-            for mid, ms in all_settings.items():
-                entry = self._entries.get(mid)
-                if entry is None or not self._is_ds4_entry(entry):
-                    continue
-                if getattr(ms, "model_alias", None) == base_id:
-                    return mid
-
-        source_match = self._resolve_ds4_source_name(base_id, require_gguf_hint=True)
-        if source_match is not None:
-            return source_match
-
-        return None
-
     def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
@@ -1011,35 +979,32 @@ class EnginePool:
                 ):
                     return mid
 
-        ds4_alias_match = self._resolve_ds4_alias_id(model_id_or_alias, all_settings)
-        if ds4_alias_match is not None:
-            return ds4_alias_match
-
         ds4_source_match = self._resolve_ds4_source_name(model_id_or_alias)
         if ds4_source_match is not None:
             return ds4_source_match
 
-        # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
+        # Strip provider prefixes for the general MLX compatibility path. DS4
+        # entries deliberately require their exact published identity: a
+        # namespace must not become another name for the same GGUF engine.
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
-            if stripped in self._entries:
+            if stripped in self._entries and not self._is_ds4_entry(
+                self._entries[stripped]
+            ):
                 return stripped
             ci_match = self._case_insensitive_entry_match(stripped)
-            if ci_match is not None:
+            if ci_match is not None and not self._is_ds4_entry(
+                self._entries[ci_match]
+            ):
                 return ci_match
             if all_settings is not None:
                 for mid, ms in all_settings.items():
                     if (
                         mid in self._entries
+                        and not self._is_ds4_entry(self._entries[mid])
                         and getattr(ms, "model_alias", None) == stripped
                     ):
                         return mid
-            ds4_alias_match = self._resolve_ds4_alias_id(stripped, all_settings)
-            if ds4_alias_match is not None:
-                return ds4_alias_match
-            ds4_source_match = self._resolve_ds4_source_name(stripped)
-            if ds4_source_match is not None:
-                return ds4_source_match
 
         return model_id_or_alias
 

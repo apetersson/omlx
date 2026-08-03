@@ -29,7 +29,6 @@ from omlx.server import (
 )
 from omlx.settings import (
     DS4Settings,
-    DS4_THINK_MAX_CONTEXT_TOKENS,
     GlobalSettings,
     ModelSettings as GlobalModelSettings,
 )
@@ -729,15 +728,7 @@ class TestGetMaxContextWindow:
 
     def _mount_pool(self, entries: dict, ds4_settings: DS4Settings | None = None):
         pool = MagicMock()
-        def resolve_model_id(mid, _sm):
-            if mid and mid.endswith(("-chat", "-reasoner", "-think-max")):
-                suffix = "-think-max" if mid.endswith("-think-max") else f"-{mid.rsplit('-', 1)[1]}"
-                base = mid[: -len(suffix)]
-                if base in entries:
-                    return base
-            return mid
-
-        pool.resolve_model_id.side_effect = resolve_model_id
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
         pool.get_entry.side_effect = lambda mid: entries.get(mid)
         pool._get_ds4_settings.return_value = ds4_settings or DS4Settings()
         self._state.engine_pool = pool
@@ -785,12 +776,6 @@ class TestGetMaxContextWindow:
         self._mount_settings({"foo": ModelSettings(max_context_window=100_000)})
         assert get_max_context_window("foo") == 100_000
 
-    def test_ds4_think_max_alias_exceeds_per_model_context_window(self):
-        """Think Max advertises its runtime raise above a lower base override."""
-        self._mount_pool({"foo": self._ds4_entry("foo")})
-        self._mount_settings({"foo": ModelSettings(max_context_window=100_000)})
-        assert get_max_context_window("foo-think-max") == DS4_THINK_MAX_CONTEXT_TOKENS
-
     def test_ds4_falls_back_to_ds4_auto_context(self):
         """DS4 without per-model context reports DS4 auto/global context."""
         self._mount_pool(
@@ -798,16 +783,6 @@ class TestGetMaxContextWindow:
             ds4_settings=DS4Settings(context_default_tokens=250_000),
         )
         assert get_max_context_window("foo") == 250_000
-
-    def test_ds4_think_max_alias_reports_forced_context(self):
-        """The think-max variant advertises the context it raises to at runtime."""
-        self._mount_pool(
-            {"foo": self._ds4_entry("foo")},
-            ds4_settings=DS4Settings(context_default_tokens=100_000),
-        )
-        assert get_max_context_window("foo-chat") == 100_000
-        assert get_max_context_window("foo-reasoner") == 100_000
-        assert get_max_context_window("foo-think-max") == DS4_THINK_MAX_CONTEXT_TOKENS
 
     def test_loaded_ds4_effective_context_wins_over_global_default(self):
         """Loaded DS4 reports its effective launch context."""

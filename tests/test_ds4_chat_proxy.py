@@ -21,6 +21,7 @@ from omlx.engine.ds4 import (
     DS4ProxyResponse,
     DS4StreamingProxyResponse,
 )
+from omlx.exceptions import ModelNotFoundError
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
 from omlx.server_metrics import get_server_metrics, reset_server_metrics
@@ -37,6 +38,9 @@ class _SettingsManager:
     def get_all_settings(self) -> dict[str, ModelSettings]:
         return {"foo": self.settings}
 
+    def get_exposed_profile_runtime_settings_for_request(self, model_id: str):
+        return None
+
 
 class _Pool:
     def __init__(self, engine: DS4ProcessEngine):
@@ -44,22 +48,18 @@ class _Pool:
         self.requested_model_ids: list[str] = []
 
     def resolve_model_id(self, model_id, settings_manager):
-        if model_id in {
-            "foo",
-            "foo-chat",
-            "foo-reasoner",
-            "foo-think-max",
-            "gpt-4o",
-            "gpt-4o-chat",
-            "gpt-4o-reasoner",
-            "gpt-4o-think-max",
-        }:
+        if model_id in {"foo", "gpt-4o"}:
             return "foo"
         return model_id
 
     async def get_engine(self, model_id, **kwargs):
         self.requested_model_ids.append(model_id)
+        if model_id != "foo":
+            raise ModelNotFoundError(model_id, ["foo"])
         return self.engine
+
+    async def release_engine(self, model_id):
+        return None
 
     def get_entry(self, model_id):
         return None
@@ -720,7 +720,7 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "foo-chat",
+                "model": "foo",
                 "messages": [{"role": "user", "content": "hello"}],
                 "temperature": 0.9,
                 "top_p": 0.8,
@@ -731,7 +731,7 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
     assert response.content == b'{"ds4":true,"choices":[]}'
     assert pool.requested_model_ids == ["foo"]
     body = engine.proxy_bodies[0]
-    assert body["model"] == "deepseek-chat"
+    assert body["model"] == "foo"
     assert body["messages"] == [{"role": "user", "content": "hello", "partial": False}]
     assert body["temperature"] == 0.9
     assert body["top_p"] == 0.8
@@ -744,15 +744,16 @@ def test_ds4_chat_non_streaming_proxies_raw_response_and_applies_defaults(tmp_pa
     assert "xtc_threshold" not in body
 
 
-def test_ds4_think_max_chat_request_raises_backend_context(tmp_path):
+def test_ds4_explicit_max_chat_request_raises_backend_context(tmp_path):
     engine = _FakeDS4Engine(tmp_path)
 
     with _client_with_engine(engine) as (client, _pool):
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "foo-think-max",
+                "model": "foo",
                 "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "max",
             },
         )
 
@@ -761,15 +762,16 @@ def test_ds4_think_max_chat_request_raises_backend_context(tmp_path):
     assert engine.proxy_bodies[0]["reasoning_effort"] == "max"
 
 
-def test_ds4_think_max_request_reserves_active_window_after_context_raise(tmp_path):
+def test_ds4_max_request_reserves_active_window_after_context_raise(tmp_path):
     engine = _FakeDS4Engine(tmp_path)
 
     with _client_with_engine(engine) as (client, _pool):
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "foo-think-max",
+                "model": "foo",
                 "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "max",
             },
         )
 
@@ -930,7 +932,7 @@ def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(
         response = client.post(
             "/v1/completions",
             json={
-                "model": "foo-chat",
+                "model": "foo",
                 "prompt": "complete this",
                 "temperature": 0.95,
                 "top_p": 0.85,
@@ -939,6 +941,7 @@ def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(
                 "suffix": " after",
                 "best_of": 3,
                 "logit_bias": {"42": -1},
+                "reasoning_effort": "max",
             },
         )
 
@@ -946,7 +949,7 @@ def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(
     assert response.content == b'{"ds4_completion":true,"choices":[]}'
     assert pool.requested_model_ids == ["foo"]
     body = engine.completion_bodies[0]
-    assert body["model"] == "deepseek-chat"
+    assert body["model"] == "foo"
     assert body["prompt"] == "complete this"
     assert body["echo"] is True
     assert body["logprobs"] == 2
@@ -957,6 +960,8 @@ def test_ds4_completion_non_streaming_proxies_raw_response_and_applies_defaults(
     assert body["top_p"] == 0.85
     assert body["top_k"] == 9
     assert body["max_tokens"] == 77
+    assert body["reasoning_effort"] == "max"
+    assert engine.min_context_requests == [DS4_THINK_MAX_CONTEXT_TOKENS]
     assert "repetition_penalty" not in body
     assert "presence_penalty" not in body
     assert "frequency_penalty" not in body
@@ -972,8 +977,9 @@ def test_ds4_completion_streaming_preserves_backend_sse_bytes(tmp_path):
             "POST",
             "/v1/completions",
             json={
-                "model": "foo-reasoner",
+                "model": "foo",
                 "prompt": "complete this",
+                "reasoning_effort": "high",
                 "stream": True,
             },
         ) as response:
@@ -981,7 +987,8 @@ def test_ds4_completion_streaming_preserves_backend_sse_bytes(tmp_path):
 
     assert response.status_code == 200
     assert body == b"data: completion\n\ndata: [DONE]\n\n"
-    assert engine.completion_stream_bodies[0]["model"] == "deepseek-reasoner"
+    assert engine.completion_stream_bodies[0]["model"] == "foo"
+    assert engine.completion_stream_bodies[0]["reasoning_effort"] == "high"
     assert engine.completion_stream_bodies[0]["stream"] is True
 
 
@@ -1000,10 +1007,10 @@ def test_ds4_responses_non_streaming_proxies_raw_response_and_applies_defaults(
         response = client.post(
             "/v1/responses",
             json={
-                "model": "foo-think-max",
+                "model": "foo",
                 "input": "answer this",
                 "temperature": 0.97,
-                "reasoning": {"summary": "auto", "effort": "low"},
+                "reasoning": {"summary": "auto", "effort": "max"},
                 "max_tokens": 42,
                 "parallel_tool_calls": True,
                 "ds4_extension": {"passthrough": True},
@@ -1034,8 +1041,9 @@ def test_ds4_responses_streaming_preserves_backend_sse_bytes(tmp_path):
             "POST",
             "/v1/responses",
             json={
-                "model": "foo-reasoner",
+                "model": "foo",
                 "input": "answer this",
+                "reasoning": {"effort": "high"},
                 "stream": True,
             },
         ) as response:
@@ -1043,7 +1051,8 @@ def test_ds4_responses_streaming_preserves_backend_sse_bytes(tmp_path):
 
     assert response.status_code == 200
     assert body == b"event: response.output_text.delta\ndata: {}\n\n"
-    assert engine.response_stream_bodies[0]["model"] == "deepseek-reasoner"
+    assert engine.response_stream_bodies[0]["model"] == "foo"
+    assert engine.response_stream_bodies[0]["reasoning"] == {"effort": "high"}
     assert engine.response_stream_bodies[0]["stream"] is True
 
 
@@ -1063,10 +1072,10 @@ def test_ds4_anthropic_non_streaming_proxies_raw_response_and_applies_defaults(
         response = client.post(
             "/v1/messages",
             json={
-                "model": "foo-think-max",
+                "model": "foo",
                 "messages": [{"role": "user", "content": "hello"}],
                 "temperature": 0.91,
-                "output_config": {"effort": "low"},
+                "output_config": {"effort": "max"},
                 "metadata": {"user_id": "u1"},
                 "ds4_extension": {"passthrough": True},
             },
@@ -1082,8 +1091,8 @@ def test_ds4_anthropic_non_streaming_proxies_raw_response_and_applies_defaults(
     assert body["temperature"] == 0.91
     assert body["top_p"] == 0.75
     assert body["top_k"] == 11
-    assert body["output_config"] == {"effort": "low"}
-    assert body["reasoning_effort"] == "max"
+    assert body["output_config"] == {"effort": "max"}
+    assert "reasoning_effort" not in body
     assert engine.min_context_requests == [DS4_THINK_MAX_CONTEXT_TOKENS]
     assert body["metadata"] == {"user_id": "u1"}
     assert body["ds4_extension"] == {"passthrough": True}
@@ -1097,9 +1106,10 @@ def test_ds4_anthropic_streaming_preserves_backend_sse_bytes(tmp_path):
             "POST",
             "/v1/messages",
             json={
-                "model": "foo-reasoner",
+                "model": "foo",
                 "max_tokens": 12,
                 "messages": [{"role": "user", "content": "hello"}],
+                "output_config": {"effort": "high"},
                 "stream": True,
             },
         ) as response:
@@ -1107,7 +1117,8 @@ def test_ds4_anthropic_streaming_preserves_backend_sse_bytes(tmp_path):
 
     assert response.status_code == 200
     assert body == b"event: content_block_delta\ndata: {}\n\n"
-    assert engine.anthropic_stream_bodies[0]["model"] == "deepseek-reasoner"
+    assert engine.anthropic_stream_bodies[0]["model"] == "foo"
+    assert engine.anthropic_stream_bodies[0]["output_config"] == {"effort": "high"}
     assert engine.anthropic_stream_bodies[0]["stream"] is True
 
 
@@ -1149,8 +1160,9 @@ def test_ds4_chat_streaming_preserves_backend_sse_bytes(tmp_path):
             "POST",
             "/v1/chat/completions",
             json={
-                "model": "foo-reasoner",
+                "model": "foo",
                 "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "high",
                 "stream": True,
             },
         ) as response:
@@ -1158,8 +1170,101 @@ def test_ds4_chat_streaming_preserves_backend_sse_bytes(tmp_path):
 
     assert response.status_code == 200
     assert body == b"data: one\n\ndata: [DONE]\n\n"
-    assert engine.stream_bodies[0]["model"] == "deepseek-reasoner"
+    assert engine.stream_bodies[0]["model"] == "foo"
+    assert engine.stream_bodies[0]["reasoning_effort"] == "high"
     assert engine.stream_bodies[0]["stream"] is True
+
+
+@pytest.mark.parametrize("removed_model_id", ["foo-" + "reasoner", "provider/foo"])
+def test_removed_ds4_model_id_is_rejected_by_all_proxy_apis(
+    tmp_path, removed_model_id
+):
+    engine = _FakeDS4Engine(tmp_path)
+    requests = [
+        (
+            "/v1/chat/completions",
+            {
+                "model": removed_model_id,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ),
+        (
+            "/v1/completions",
+            {"model": removed_model_id, "prompt": "hello"},
+        ),
+        (
+            "/v1/responses",
+            {"model": removed_model_id, "input": "hello"},
+        ),
+        (
+            "/v1/messages",
+            {
+                "model": removed_model_id,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ),
+    ]
+
+    with _client_with_engine(engine) as (client, _pool):
+        responses = [client.post(endpoint, json=payload) for endpoint, payload in requests]
+
+    assert [response.status_code for response in responses] == [404, 404, 404, 404]
+    for response in responses[:3]:
+        error = response.json()["error"]
+        assert error["type"] == "not_found_error"
+        assert error["param"] == "model"
+        assert error["code"] == "model_not_found"
+    assert responses[3].json() == {
+        "type": "error",
+        "error": {
+            "type": "not_found_error",
+            "message": (
+                f"Model '{removed_model_id}' not found. Available models: foo"
+            ),
+        },
+    }
+    assert engine.proxy_bodies == []
+    assert engine.completion_bodies == []
+    assert engine.response_bodies == []
+    assert engine.anthropic_bodies == []
+
+
+def test_ds4_non_thinking_controls_are_forwarded_explicitly(tmp_path):
+    engine = _FakeDS4Engine(tmp_path)
+
+    with _client_with_engine(engine) as (client, _pool):
+        client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "foo",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "none",
+            },
+        )
+        client.post(
+            "/v1/completions",
+            json={"model": "foo", "prompt": "hello", "reasoning_effort": "none"},
+        )
+        client.post(
+            "/v1/responses",
+            json={"model": "foo", "input": "hello", "reasoning": {"effort": "none"}},
+        )
+        client.post(
+            "/v1/messages",
+            json={
+                "model": "foo",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hello"}],
+                "thinking": {"type": "disabled"},
+            },
+        )
+
+    assert engine.proxy_bodies[0]["reasoning_effort"] == "none"
+    assert engine.completion_bodies[0]["reasoning_effort"] == "none"
+    assert engine.response_bodies[0]["reasoning"] == {"effort": "none"}
+    assert engine.anthropic_bodies[0]["thinking"] == {"type": "disabled"}
+    assert engine.min_context_requests == []
 
 
 def test_ds4_proxy_body_preserves_openai_schema_alias(tmp_path):
@@ -1188,34 +1293,7 @@ def test_ds4_proxy_body_preserves_openai_schema_alias(tmp_path):
     assert "schema_" not in body["response_format"]["json_schema"]
 
 
-def test_ds4_base_model_id_ending_with_alias_suffix_is_preserved(tmp_path):
-    from omlx.server import _build_ds4_chat_proxy_body
-
-    engine = _FakeDS4Engine(tmp_path)
-    state = ServerState()
-    state.engine_pool = _Pool(engine)
-    state.settings_manager = _SettingsManager()
-    request = ChatCompletionRequest(
-        model="foo-chat",
-        messages=[Message(role="user", content="hello")],
-    )
-
-    with patch("omlx.server._server_state", state):
-        body = _build_ds4_chat_proxy_body(request, "foo-chat")
-
-    assert body["model"] == "foo-chat"
-
-    request = ChatCompletionRequest(
-        model="FOO-CHAT",
-        messages=[Message(role="user", content="hello")],
-    )
-    with patch("omlx.server._server_state", state):
-        body = _build_ds4_chat_proxy_body(request, "foo-chat")
-
-    assert body["model"] == "FOO-CHAT"
-
-
-def test_ds4_think_max_alias_injects_reasoning_effort_with_user_alias(tmp_path):
+def test_ds4_chat_proxy_uses_resolved_engine_id_and_explicit_effort(tmp_path):
     from omlx.server import _build_ds4_chat_proxy_body
 
     engine = _FakeDS4Engine(tmp_path)
@@ -1223,29 +1301,19 @@ def test_ds4_think_max_alias_injects_reasoning_effort_with_user_alias(tmp_path):
     state.engine_pool = _Pool(engine)
     state.settings_manager = _SettingsManager(ModelSettings(model_alias="gpt-4o"))
     request = ChatCompletionRequest(
-        model="gpt-4o-think-max",
+        model="gpt-4o",
         messages=[Message(role="user", content="hello")],
-        reasoning_effort="low",
+        reasoning_effort="max",
     )
 
     with patch("omlx.server._server_state", state):
         body = _build_ds4_chat_proxy_body(request, "foo")
 
-    assert body["model"] == "gpt-4o"
-    assert body["reasoning_effort"] == "max"
-
-    request = ChatCompletionRequest(
-        model="omlx/gpt-4o-think-max",
-        messages=[Message(role="user", content="hello")],
-    )
-    with patch("omlx.server._server_state", state):
-        body = _build_ds4_chat_proxy_body(request, "foo")
-
-    assert body["model"] == "gpt-4o"
+    assert body["model"] == "foo"
     assert body["reasoning_effort"] == "max"
 
 
-def test_ds4_completion_proxy_body_preserves_reasoning_effort_and_aliases(tmp_path):
+def test_ds4_completion_proxy_uses_resolved_engine_id_and_explicit_effort(tmp_path):
     from omlx.server import _build_ds4_completion_proxy_body
 
     engine = _FakeDS4Engine(tmp_path)
@@ -1253,29 +1321,20 @@ def test_ds4_completion_proxy_body_preserves_reasoning_effort_and_aliases(tmp_pa
     state.engine_pool = _Pool(engine)
     state.settings_manager = _SettingsManager(ModelSettings(model_alias="gpt-4o"))
     request = CompletionRequest(
-        model="gpt-4o-think-max",
+        model="gpt-4o",
         prompt="complete this",
-        reasoning_effort="low",
+        reasoning_effort="max",
     )
 
     with patch("omlx.server._server_state", state):
         body = _build_ds4_completion_proxy_body(request, "foo")
 
-    assert body["model"] == "gpt-4o"
+    assert body["model"] == "foo"
     assert body["prompt"] == "complete this"
     assert body["reasoning_effort"] == "max"
 
-    request = CompletionRequest(
-        model="FOO-CHAT",
-        prompt="complete this",
-    )
-    with patch("omlx.server._server_state", state):
-        body = _build_ds4_completion_proxy_body(request, "foo-chat")
 
-    assert body["model"] == "FOO-CHAT"
-
-
-def test_ds4_responses_proxy_body_uses_responses_reasoning_effort(tmp_path):
+def test_ds4_responses_proxy_uses_resolved_engine_id_and_explicit_effort(tmp_path):
     from omlx.server import _build_ds4_responses_proxy_body
 
     engine = _FakeDS4Engine(tmp_path)
@@ -1283,29 +1342,20 @@ def test_ds4_responses_proxy_body_uses_responses_reasoning_effort(tmp_path):
     state.engine_pool = _Pool(engine)
     state.settings_manager = _SettingsManager(ModelSettings(model_alias="gpt-4o"))
     request = ResponsesRequest(
-        model="omlx/gpt-4o-think-max",
+        model="gpt-4o",
         input="answer this",
-        reasoning={"summary": "detailed", "effort": "low"},
+        reasoning={"summary": "detailed", "effort": "max"},
     )
 
     with patch("omlx.server._server_state", state):
         body = _build_ds4_responses_proxy_body(request, "foo")
 
-    assert body["model"] == "gpt-4o"
+    assert body["model"] == "foo"
     assert body["input"] == "answer this"
     assert body["reasoning"] == {"summary": "detailed", "effort": "max"}
 
-    request = ResponsesRequest(
-        model="FOO-CHAT",
-        input="answer this",
-    )
-    with patch("omlx.server._server_state", state):
-        body = _build_ds4_responses_proxy_body(request, "foo-chat")
 
-    assert body["model"] == "FOO-CHAT"
-
-
-def test_ds4_anthropic_proxy_body_preserves_extra_fields_and_aliases(tmp_path):
+def test_ds4_anthropic_proxy_uses_resolved_engine_id_and_explicit_effort(tmp_path):
     from omlx.server import _build_ds4_anthropic_proxy_body
 
     engine = _FakeDS4Engine(tmp_path)
@@ -1313,29 +1363,19 @@ def test_ds4_anthropic_proxy_body_preserves_extra_fields_and_aliases(tmp_path):
     state.engine_pool = _Pool(engine)
     state.settings_manager = _SettingsManager(ModelSettings(model_alias="gpt-4o"))
     request = AnthropicMessagesRequest(
-        model="omlx/gpt-4o-think-max",
+        model="gpt-4o",
         max_tokens=12,
         messages=[{"role": "user", "content": "hello"}],
-        output_config={"effort": "low"},
+        output_config={"effort": "max"},
         ds4_extension={"passthrough": True},
     )
 
     with patch("omlx.server._server_state", state):
         body = _build_ds4_anthropic_proxy_body(request, "foo")
 
-    assert body["model"] == "gpt-4o"
+    assert body["model"] == "foo"
     assert body["max_tokens"] == 12
     assert body["messages"] == [{"role": "user", "content": "hello"}]
-    assert body["output_config"] == {"effort": "low"}
-    assert body["reasoning_effort"] == "max"
+    assert body["output_config"] == {"effort": "max"}
+    assert "reasoning_effort" not in body
     assert body["ds4_extension"] == {"passthrough": True}
-
-    request = AnthropicMessagesRequest(
-        model="FOO-CHAT",
-        max_tokens=12,
-        messages=[{"role": "user", "content": "hello"}],
-    )
-    with patch("omlx.server._server_state", state):
-        body = _build_ds4_anthropic_proxy_body(request, "foo-chat")
-
-    assert body["model"] == "FOO-CHAT"

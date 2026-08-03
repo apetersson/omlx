@@ -604,6 +604,16 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
     }
 
 
+class _ModelNotFoundHTTPException(HTTPException):
+    """404 carrying stable API metadata for a failed model lookup."""
+
+    error_param = "model"
+    error_code = "model_not_found"
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=404, detail=detail)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
@@ -622,11 +632,28 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.status_code,
             exc.detail,
         )
-    if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+    if (
+        request.url.path == "/v1/messages"
+        and getattr(exc, "error_code", None) == "model_not_found"
+    ):
+        content = {
+            "type": "error",
+            "error": {"type": "not_found_error", "message": exc.detail},
+        }
+    elif _is_api_route(request):
+        content = _openai_error_body(
+            exc.detail,
+            exc.status_code,
+            param=getattr(exc, "error_param", None),
+            code=getattr(exc, "error_code", None),
+        )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -983,7 +1010,7 @@ async def get_engine(
             f"Model '{model_id}' not found. "
             f"Available models: {', '.join(available) if available else '(none)'}"
         )
-        raise HTTPException(status_code=404, detail=detail)
+        raise _ModelNotFoundHTTPException(detail)
     except ModelTooLargeError as e:
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
@@ -1454,7 +1481,10 @@ def resolve_model_id(model_id: str | None) -> str | None:
     pool = _server_state.engine_pool
     if pool is None:
         return model_id
-    return pool.resolve_model_id(model_id, _server_state.settings_manager)
+    resolver = getattr(pool, "resolve_model_id", None)
+    if not callable(resolver):
+        return model_id
+    return resolver(model_id, _server_state.settings_manager)
 
 
 async def _ensure_tokenizer_for_system_probe(
@@ -1574,14 +1604,6 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         (only possible when neither the model nor the global default
         provides a value, which shouldn't happen in practice).
     """
-    ds4_alias_kind = None
-    if model_id:
-        from .ds4_aliases import parse_ds4_alias_id
-
-        parsed_ds4_alias = parse_ds4_alias_id(model_id)
-        if parsed_ds4_alias is not None:
-            ds4_alias_kind = parsed_ds4_alias[1]
-
     # Resolve alias for physical model metadata, but keep requested alias settings.
     requested_model_id = model_id
     model_settings = get_model_settings_for_request(requested_model_id)
@@ -1590,36 +1612,24 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
 
     # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
-        if ds4_alias_kind == "think-max" and model_id and pool is not None:
-            entry = pool.get_entry(model_id)
-            if entry is not None and getattr(entry, "engine_type", None) == "ds4":
-                return max(
-                    model_settings.max_context_window,
-                    DS4_THINK_MAX_CONTEXT_TOKENS,
-                )
         return model_settings.max_context_window
 
     # Priority 2: model-native context, optionally clamped by policy
     if model_id and pool is not None:
-        entry = pool.get_entry(model_id)
+        get_entry = getattr(pool, "get_entry", None)
+        entry = get_entry(model_id) if callable(get_entry) else None
         if entry is not None and getattr(entry, "engine_type", None) == "ds4":
             engine = entry.engine
             effective_context = getattr(engine, "effective_context_tokens", None)
             if callable(effective_context):
-                ds4_context = effective_context()
-                if ds4_alias_kind == "think-max":
-                    return max(ds4_context, DS4_THINK_MAX_CONTEXT_TOKENS)
-                return ds4_context
+                return effective_context()
             get_ds4_settings = getattr(pool, "_get_ds4_settings", None)
             ds4_settings = get_ds4_settings() if callable(get_ds4_settings) else None
             if not isinstance(ds4_settings, DS4Settings):
                 global_settings = _server_state.global_settings
                 ds4_settings = getattr(global_settings, "ds4", None)
             if isinstance(ds4_settings, DS4Settings):
-                ds4_context = ds4_settings.get_auto_context_tokens()
-                if ds4_alias_kind == "think-max":
-                    return max(ds4_context, DS4_THINK_MAX_CONTEXT_TOKENS)
-                return ds4_context
+                return ds4_settings.get_auto_context_tokens()
         if entry is not None and entry.model_context_length is not None:
             native = entry.model_context_length
             policy = getattr(_server_state.sampling, "max_context_window_policy", None)
@@ -2583,8 +2593,6 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     favorite_ids: set[str] = set()
 
     if _server_state.engine_pool is not None:
-        from .ds4_aliases import ds4_aliases_for_model
-
         status = _server_state.engine_pool.get_status()
         settings_manager = _server_state.settings_manager
         display_ids_by_model: dict[str, str] = {}
@@ -2620,7 +2628,6 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     display_id = ms.model_alias
             display_ids_by_model[model_id] = display_id
 
-        reserved_display_ids = set(display_ids_by_model.values())
         for m in status["models"]:
             model_id = m["id"]
             display_id = display_ids_by_model[model_id]
@@ -2642,11 +2649,6 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
             if ms is not None and getattr(ms, "is_favorite", False):
                 favorite_ids.add(display_id)
             add_model_info(display_id, context_model_id=model_id)
-            if m.get("engine_type") == "ds4":
-                for alias in ds4_aliases_for_model(display_id):
-                    if alias.alias_id in reserved_display_ids:
-                        continue
-                    add_model_info(alias.alias_id, context_model_id=alias.alias_id)
 
         if settings_manager:
             physical_ids = {m["id"] for m in status["models"]}
@@ -2696,7 +2698,6 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
 
         # Resolve effective max_tokens: model setting > global default
         max_tokens = _server_state.sampling.max_tokens
-        display_id = model_id
         if _server_state.settings_manager:
             sm = _server_state.settings_manager
             if hasattr(sm, "get_settings_for_request"):
@@ -2709,17 +2710,20 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             base_ms = sm.get_settings(source_model_id)
             if base_ms and base_ms.model_alias and source_model_id == model_id:
                 m["model_alias"] = base_ms.model_alias
-                display_id = base_ms.model_alias
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
-        if m.get("engine_type") == "ds4":
-            from .ds4_aliases import ds4_aliases_for_model
-
-            m["ds4_aliases"] = [
-                alias.alias_id for alias in ds4_aliases_for_model(display_id)
-            ]
         m["max_tokens"] = max_tokens
     return status
+
+
+@app.get("/v1/models/{model_id}")
+async def retrieve_model(model_id: str, _: bool = Depends(verify_api_key)) -> ModelInfo:
+    """Return one API-visible model by its exact published identity."""
+    catalog = await list_models(True)
+    for model in catalog.data:
+        if model.id == model_id:
+            return model
+    raise _ModelNotFoundHTTPException(f"Model '{model_id}' not found")
 
 
 @app.post("/v1/models/{model_id}/unload")
@@ -3042,9 +3046,6 @@ async def create_completion(
         model_load_duration = time.perf_counter() - load_start
         resolved_model = _serving_model_id(lease, request.model)
 
-        # Resolve alias to real model ID for settings lookups
-        resolved_model = resolve_model_id(request.model) or request.model
-
         if _is_ds4_completion_proxy_engine(engine):
             response = await _create_ds4_text_completion(engine, request, resolved_model)
             await lease.release()
@@ -3263,29 +3264,6 @@ def _is_ds4_anthropic_proxy_engine(engine: object) -> bool:
     )
 
 
-def _ds4_request_uses_suffix_alias(
-    request_model: str,
-    resolved_model: str,
-) -> bool:
-    """Return True when the request selected an OMLX-managed DS4 suffix alias."""
-    from .ds4_aliases import parse_ds4_alias_id
-
-    stripped_model = (
-        request_model.split("/", 1)[1]
-        if "/" in request_model
-        else request_model
-    )
-    if stripped_model.lower() == resolved_model.lower():
-        return False
-    settings_manager = _server_state.settings_manager
-    if settings_manager is not None:
-        settings = settings_manager.get_settings(resolved_model)
-        model_alias = getattr(settings, "model_alias", None)
-        if model_alias in {request_model, stripped_model}:
-            return False
-    return parse_ds4_alias_id(stripped_model) is not None
-
-
 def _choose_sampling_value(
     request_value, setting_name: str, default, model_settings
 ):
@@ -3329,42 +3307,30 @@ def _ds4_sampling_params_without_force(
     }
 
 
-def _ds4_suffix_alias_for_request(
-    request_model: str,
-    resolved_model: str,
-):
-    """Return parsed DS4 suffix alias data when the request selected one."""
-    from .ds4_aliases import parse_ds4_alias_id
+def _ds4_explicit_reasoning_effort(request: object) -> str | None:
+    """Return the explicit reasoning effort from a supported API shape."""
+    direct = getattr(request, "reasoning_effort", None)
+    if isinstance(direct, str):
+        return direct
 
-    alias_source = (
-        request_model.split("/", 1)[1]
-        if "/" in request_model
-        else request_model
-    )
-    parsed_alias = parse_ds4_alias_id(alias_source)
-    if parsed_alias is not None and _ds4_request_uses_suffix_alias(
-        request_model, resolved_model
-    ):
-        return parsed_alias
+    for field_name in ("reasoning", "output_config"):
+        config = getattr(request, field_name, None)
+        if isinstance(config, dict):
+            effort = config.get("effort")
+        else:
+            effort = getattr(config, "effort", None)
+        if isinstance(effort, str):
+            return effort
     return None
 
 
-def _ds4_request_uses_think_max_alias(
-    request_model: str,
-    resolved_model: str,
-) -> bool:
-    parsed_alias = _ds4_suffix_alias_for_request(request_model, resolved_model)
-    return parsed_alias is not None and parsed_alias[1] == "think-max"
-
-
-async def _ensure_ds4_think_max_context(
+async def _ensure_ds4_max_reasoning_context(
     engine: object,
-    *,
-    request_model: str,
-    resolved_model: str,
+    request: object,
 ) -> None:
-    """Restart/raise DS4 context for Think Max aliases when needed."""
-    if not _ds4_request_uses_think_max_alias(request_model, resolved_model):
+    """Raise DS4 context only for an explicit maximum-effort request."""
+    effort = _ds4_explicit_reasoning_effort(request)
+    if effort is None or effort.strip().lower() != "max":
         return
     ensure_min_context = getattr(engine, "ensure_min_context", None)
     if callable(ensure_min_context):
@@ -3381,58 +3347,6 @@ async def _reserve_ds4_proxy_request_window(engine: object):
     return end
 
 
-def _apply_ds4_suffix_alias_to_body(
-    body: dict,
-    *,
-    request_model: str,
-    resolved_model: str,
-) -> dict:
-    """Apply DS4 per-model suffix alias request mutations in-place."""
-    from .ds4_aliases import (
-        ds4_model_for_alias_kind,
-        ds4_reasoning_effort_for_alias_kind,
-    )
-
-    parsed_alias = _ds4_suffix_alias_for_request(request_model, resolved_model)
-    if parsed_alias is not None:
-        alias_base, alias_kind = parsed_alias
-        ds4_model = ds4_model_for_alias_kind(alias_kind)
-        body["model"] = ds4_model or alias_base
-        reasoning_effort = ds4_reasoning_effort_for_alias_kind(alias_kind)
-        if reasoning_effort is not None:
-            body["reasoning_effort"] = reasoning_effort
-    return body
-
-
-def _apply_ds4_responses_suffix_alias_to_body(
-    body: dict,
-    *,
-    request_model: str,
-    resolved_model: str,
-) -> dict:
-    """Apply DS4 suffix aliases using Responses API request shapes."""
-    from .ds4_aliases import (
-        ds4_model_for_alias_kind,
-        ds4_reasoning_effort_for_alias_kind,
-    )
-
-    parsed_alias = _ds4_suffix_alias_for_request(request_model, resolved_model)
-    if parsed_alias is not None:
-        alias_base, alias_kind = parsed_alias
-        ds4_model = ds4_model_for_alias_kind(alias_kind)
-        body["model"] = ds4_model or alias_base
-        reasoning_effort = ds4_reasoning_effort_for_alias_kind(alias_kind)
-        if reasoning_effort is not None:
-            reasoning = body.get("reasoning")
-            if not isinstance(reasoning, dict):
-                reasoning = {}
-            else:
-                reasoning = dict(reasoning)
-            reasoning["effort"] = reasoning_effort
-            body["reasoning"] = reasoning
-    return body
-
-
 def _build_ds4_chat_proxy_body(
     request: ChatCompletionRequest,
     resolved_model: str,
@@ -3440,11 +3354,8 @@ def _build_ds4_chat_proxy_body(
     """Build the JSON body sent to DS4 for OpenAI chat completions."""
     body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
     body.update(_ds4_sampling_params_without_force(request))
-    return _apply_ds4_suffix_alias_to_body(
-        body,
-        request_model=request.model,
-        resolved_model=resolved_model,
-    )
+    body["model"] = resolved_model
+    return body
 
 
 def _build_ds4_completion_proxy_body(
@@ -3454,11 +3365,8 @@ def _build_ds4_completion_proxy_body(
     """Build the JSON body sent to DS4 for OpenAI text completions."""
     body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
     body.update(_ds4_sampling_params_without_force(request))
-    return _apply_ds4_suffix_alias_to_body(
-        body,
-        request_model=request.model,
-        resolved_model=resolved_model,
-    )
+    body["model"] = resolved_model
+    return body
 
 
 def _ds4_responses_sampling_params_without_force(
@@ -3497,11 +3405,8 @@ def _build_ds4_responses_proxy_body(
     """Build the JSON body sent to DS4 for OpenAI Responses API requests."""
     body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
     body.update(_ds4_responses_sampling_params_without_force(request, body))
-    return _apply_ds4_responses_suffix_alias_to_body(
-        body,
-        request_model=request.model,
-        resolved_model=resolved_model,
-    )
+    body["model"] = resolved_model
+    return body
 
 
 def _ds4_anthropic_sampling_params_without_force(
@@ -3538,11 +3443,8 @@ def _build_ds4_anthropic_proxy_body(
     """Build the JSON body sent to DS4 for Anthropic Messages requests."""
     body = request.model_dump(mode="json", exclude_none=True, by_alias=True)
     body.update(_ds4_anthropic_sampling_params_without_force(request))
-    return _apply_ds4_suffix_alias_to_body(
-        body,
-        request_model=request.model,
-        resolved_model=resolved_model,
-    )
+    body["model"] = resolved_model
+    return body
 
 
 def _proxy_response_media_type(headers: dict[str, str], fallback: str) -> str:
@@ -3759,11 +3661,7 @@ async def _create_ds4_text_completion(
 
     release_ds4_request = None
     try:
-        await _ensure_ds4_think_max_context(
-            engine,
-            request_model=request.model,
-            resolved_model=resolved_model,
-        )
+        await _ensure_ds4_max_reasoning_context(engine, request)
         release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_completion_proxy_body(request, resolved_model)
         if request.stream:
@@ -3811,11 +3709,7 @@ async def _create_ds4_response(
 
     release_ds4_request = None
     try:
-        await _ensure_ds4_think_max_context(
-            engine,
-            request_model=request.model,
-            resolved_model=resolved_model,
-        )
+        await _ensure_ds4_max_reasoning_context(engine, request)
         release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_responses_proxy_body(request, resolved_model)
         if request.stream:
@@ -3863,11 +3757,7 @@ async def _create_ds4_anthropic_message(
 
     release_ds4_request = None
     try:
-        await _ensure_ds4_think_max_context(
-            engine,
-            request_model=request.model,
-            resolved_model=resolved_model,
-        )
+        await _ensure_ds4_max_reasoning_context(engine, request)
         release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_anthropic_proxy_body(request, resolved_model)
         if request.stream:
@@ -3915,11 +3805,7 @@ async def _create_ds4_chat_completion(
 
     release_ds4_request = None
     try:
-        await _ensure_ds4_think_max_context(
-            engine,
-            request_model=request.model,
-            resolved_model=resolved_model,
-        )
+        await _ensure_ds4_max_reasoning_context(engine, request)
         release_ds4_request = await _reserve_ds4_proxy_request_window(engine)
         body = _build_ds4_chat_proxy_body(request, resolved_model)
         if request.stream:

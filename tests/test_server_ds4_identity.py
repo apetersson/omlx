@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for DS4 aliases exposed through server model listing."""
+"""Tests for canonical DS4 identities exposed by the server."""
 
-import json
 from contextlib import contextmanager
 from unittest.mock import patch
 from urllib.parse import quote
@@ -11,7 +10,7 @@ from fastapi.testclient import TestClient
 from omlx.engine_pool import EnginePool
 from omlx.model_settings import ModelSettings
 from omlx.server import ServerState, app
-from omlx.settings import DS4Settings, DS4_THINK_MAX_CONTEXT_TOKENS
+from omlx.settings import DS4Settings
 
 
 class _SettingsManager:
@@ -23,6 +22,9 @@ class _SettingsManager:
 
     def get_all_settings(self) -> dict[str, ModelSettings]:
         return self._settings
+
+    def list_exposed_profile_models(self) -> list[dict]:
+        return []
 
 
 def _ds4_pool(
@@ -48,7 +50,7 @@ def _client_for_pool(pool: EnginePool, settings_manager: _SettingsManager | None
             yield client
 
 
-def test_models_list_includes_ds4_base_and_per_model_aliases(tmp_path):
+def test_models_list_has_one_entry_for_each_ds4_model(tmp_path):
     pool = _ds4_pool(tmp_path)
     model_id = pool.get_model_ids()[0]
 
@@ -56,14 +58,10 @@ def test_models_list_includes_ds4_base_and_per_model_aliases(tmp_path):
         response = client.get("/v1/models")
 
     assert response.status_code == 200
-    ids = [model["id"] for model in response.json()["data"]]
-    assert model_id in ids
-    assert f"{model_id}-chat" in ids
-    assert f"{model_id}-reasoner" in ids
-    assert f"{model_id}-think-max" in ids
+    assert [model["id"] for model in response.json()["data"]] == [model_id]
 
 
-def test_models_list_advertises_ds4_variant_contexts(tmp_path):
+def test_models_list_advertises_only_the_engine_context(tmp_path):
     pool = _ds4_pool(
         tmp_path,
         ds4_settings=DS4Settings(context_default_tokens=100_000),
@@ -74,17 +72,15 @@ def test_models_list_advertises_ds4_variant_contexts(tmp_path):
         response = client.get("/v1/models")
 
     assert response.status_code == 200
-    models = {model["id"]: model for model in response.json()["data"]}
-    assert models[model_id]["max_model_len"] == 100_000
-    assert models[f"{model_id}-chat"]["max_model_len"] == 100_000
-    assert models[f"{model_id}-reasoner"]["max_model_len"] == 100_000
-    assert (
-        models[f"{model_id}-think-max"]["max_model_len"]
-        == DS4_THINK_MAX_CONTEXT_TOKENS
-    )
+    models = response.json()["data"]
+    assert len(models) == 1
+    assert models[0]["id"] == model_id
+    assert models[0]["object"] == "model"
+    assert models[0]["owned_by"] == "omlx"
+    assert models[0]["max_model_len"] == 100_000
 
 
-def test_models_list_uses_user_alias_as_ds4_alias_base(tmp_path):
+def test_models_list_uses_configured_alias_without_generated_variants(tmp_path):
     pool = _ds4_pool(tmp_path, filename="Foo.gguf")
     settings_manager = _SettingsManager({"foo": ModelSettings(model_alias="gpt-4o")})
 
@@ -92,34 +88,23 @@ def test_models_list_uses_user_alias_as_ds4_alias_base(tmp_path):
         response = client.get("/v1/models")
 
     assert response.status_code == 200
-    ids = [model["id"] for model in response.json()["data"]]
-    assert "gpt-4o" in ids
-    assert "gpt-4o-chat" in ids
-    assert "gpt-4o-reasoner" in ids
-    assert "gpt-4o-think-max" in ids
-    assert "deepseek-chat" not in ids
-    assert "deepseek-reasoner" not in ids
+    assert [model["id"] for model in response.json()["data"]] == ["gpt-4o"]
 
 
-def test_models_list_deduplicates_ds4_aliases_that_collide_with_real_models(tmp_path):
-    (tmp_path / "Foo.gguf").write_bytes(b"0" * 1000)
-    mlx_model = tmp_path / "foo-chat"
-    mlx_model.mkdir()
-    (mlx_model / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    pool = EnginePool()
-    pool.discover_models(str(tmp_path))
+def test_model_detail_requires_the_exact_published_identity(tmp_path):
+    pool = _ds4_pool(tmp_path, filename="Foo.gguf")
 
     with _client_for_pool(pool) as client:
-        response = client.get("/v1/models")
+        exact = client.get("/v1/models/foo")
+        removed = client.get("/v1/models/foo-" + "reasoner")
 
-    assert response.status_code == 200
-    ids = [model["id"] for model in response.json()["data"]]
-    assert "foo" in ids
-    assert "foo-chat" in ids
-    assert ids.count("foo-chat") == 1
+    assert exact.status_code == 200
+    assert exact.json()["id"] == "foo"
+    assert removed.status_code == 404
+    assert removed.json()["error"]["code"] == "model_not_found"
 
 
-def test_models_status_includes_ds4_aliases_for_ui(tmp_path):
+def test_models_status_has_no_generated_ds4_identity_list(tmp_path):
     pool = _ds4_pool(tmp_path, filename="Foo.gguf")
     settings_manager = _SettingsManager({"foo": ModelSettings(model_alias="gpt-4o")})
 
@@ -130,15 +115,11 @@ def test_models_status_includes_ds4_aliases_for_ui(tmp_path):
     model = response.json()["models"][0]
     assert model["id"] == "foo"
     assert model["model_alias"] == "gpt-4o"
-    assert model["ds4_aliases"] == [
-        "gpt-4o-chat",
-        "gpt-4o-reasoner",
-        "gpt-4o-think-max",
-    ]
+    assert f"ds4_{'aliases'}" not in model
 
 
 def test_public_load_resolves_ds4_source_filename(tmp_path):
-    """Manual load accepts a discovered source GGUF filename alias."""
+    """Manual load accepts a discovered source GGUF filename."""
     filename = "DeepSeek V4 Flash Q2_K.gguf"
     pool = _ds4_pool(tmp_path, filename=filename)
     model_id = "deepseek-v4-flash-q2-k"

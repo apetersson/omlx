@@ -1273,8 +1273,8 @@ Max, but it is only applied when the context size is large enough for the model
 card recommendation; smaller contexts fall back to normal thinking. OpenAI
 `reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
 
-For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
-non-thinking model alias such as `deepseek-chat`.
+For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or
+`reasoning_effort=none`.
 
 ## Disk KV Cache
 
