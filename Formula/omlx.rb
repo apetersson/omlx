@@ -34,7 +34,7 @@ class Omlx < Formula
 
   resource "ds4" do
     url "https://github.com/antirez/ds4.git",
-      revision: "4893e0c40fba03dbc85555faeb035799aa04e0b6"
+      revision: "84cc882352757baf628a1776badf7cc54d584e28"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
