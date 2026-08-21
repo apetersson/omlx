@@ -1573,6 +1573,17 @@ class VLMBatchedEngine(BaseEngine):
                     Path(self._model_name)
                 ),
             ):
+                from ..models.deepseek_v4_vision import (
+                    is_deepseek_v4_vision_path,
+                    load_deepseek_v4_vision,
+                )
+
+                if is_deepseek_v4_vision_path(self._model_name):
+                    return load_deepseek_v4_vision(
+                        self._model_name,
+                        model_settings=self._model_settings,
+                    )
+
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,
@@ -2630,6 +2641,157 @@ class VLMBatchedEngine(BaseEngine):
             if extra_model_inputs.get(key) is not None
         }
 
+    @staticmethod
+    def _deepseek_v4_vision_messages(
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Render OpenAI content parts with one literal DeepSeek image token."""
+        from ..models.deepseek_v4_vision import IMAGE_TOKEN
+
+        normalized: list[dict[str, Any]] = []
+        image_count = 0
+        for message in messages:
+            clean = {k: v for k, v in message.items() if k != "content"}
+            content = message.get("content", "")
+            if not isinstance(content, list):
+                clean["content"] = content or ""
+                normalized.append(clean)
+                continue
+
+            rendered: list[str] = []
+            for part in content:
+                part_type = (
+                    part.get("type")
+                    if isinstance(part, dict)
+                    else getattr(part, "type", None)
+                )
+                if part_type == "text":
+                    value = (
+                        part.get("text")
+                        if isinstance(part, dict)
+                        else getattr(part, "text", None)
+                    )
+                    if value:
+                        rendered.append(str(value))
+                elif part_type in ("image", "image_url", "input_image"):
+                    rendered.append(IMAGE_TOKEN)
+                    image_count += 1
+                elif part_type in ("input_audio", "audio"):
+                    raise InvalidRequestError(
+                        "DeepSeek-V4 + DeepEncoderV2 does not support audio input.",
+                        field="messages",
+                    )
+            clean["content"] = "\n".join(rendered)
+            normalized.append(clean)
+        return normalized, image_count
+
+    def _prepare_deepseek_v4_vision_inputs(
+        self,
+        messages: list[dict[str, Any]],
+        images: list[Any],
+        *,
+        audio: list | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        tools: list[dict] | None = None,
+        is_partial: bool | None = None,
+        control: str = "real",
+    ) -> Tuple[
+        List[int],
+        Optional[mx.array],
+        Optional[Dict[str, Any]],
+        Optional[str],
+        int,
+        List[Tuple[int, str]],
+    ]:
+        """Inject DeepEncoderV2 rows while retaining route-token identities."""
+        import hashlib
+
+        from ..models.deepseek_v4_vision import (
+            IMAGE_TOKEN_ID,
+            VISION_MODEL_TYPE,
+        )
+
+        if self.model_type != VISION_MODEL_TYPE:
+            raise RuntimeError("DeepSeek-V4 vision preparation used by another model")
+        if audio:
+            raise InvalidRequestError(
+                "DeepSeek-V4 + DeepEncoderV2 does not support audio input.",
+                field="messages",
+            )
+        normalized, marker_count = self._deepseek_v4_vision_messages(messages)
+        if marker_count != len(images):
+            raise InvalidRequestError(
+                "DeepSeek-V4 image marker count does not match decoded images.",
+                field="messages",
+            )
+        if len(images) > 1:
+            raise InvalidRequestError(
+                "DeepSeek-V4 + DeepEncoderV2 currently supports one image per request.",
+                field="messages",
+            )
+
+        prompt = self._apply_chat_template(
+            normalized,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+        token_ids = list(
+            self._tokenizer.encode(prompt, add_special_tokens=False)
+        )
+        marker_positions = [
+            idx for idx, token_id in enumerate(token_ids) if token_id == IMAGE_TOKEN_ID
+        ]
+        if len(marker_positions) != len(images):
+            raise InvalidRequestError(
+                "The DeepSeek-V4 chat template did not preserve exactly one image token.",
+                field="messages",
+            )
+        if not images:
+            return token_ids, None, None, None, 0, []
+
+        routes, embeddings, encoded_digest = self._vlm_model.encode_image(
+            images[0], control=control
+        )
+        if int(routes.shape[0]) not in (257, 769, 1281):
+            raise RuntimeError(
+                f"DeepEncoderV2 returned unsupported token layout {routes.shape[0]}"
+            )
+        marker = marker_positions[0]
+        route_ids = [int(token_id) for token_id in routes.tolist()]
+        expanded_ids = token_ids[:marker] + route_ids + token_ids[marker + 1 :]
+
+        receiver_ids = mx.array([expanded_ids], dtype=mx.uint32)
+        receiver_embeddings = self._vlm_model.language_model.model.embed_tokens(
+            receiver_ids
+        )
+        vision_embeddings = mx.array(embeddings).astype(receiver_embeddings.dtype)
+        merged = mx.concatenate(
+            [
+                receiver_embeddings[:, :marker, :],
+                vision_embeddings[None, :, :],
+                receiver_embeddings[:, marker + len(route_ids) :, :],
+            ],
+            axis=1,
+        )
+        mx.eval(merged)
+
+        image_hash = hashlib.sha256(encoded_digest.encode("ascii")).hexdigest()
+        logger.info(
+            "DeepSeek-V4 vision prefill: control=%s visual_tokens=%d route_id=%d",
+            control,
+            len(route_ids),
+            route_ids[0],
+        )
+        return (
+            expanded_ids,
+            merged,
+            None,
+            image_hash,
+            marker,
+            [(marker, image_hash)],
+        )
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
@@ -2638,6 +2800,7 @@ class VLMBatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         tools: list[dict] | None = None,
         is_partial: bool | None = None,
+        deepseek_v4_vision_control: str = "real",
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -2679,6 +2842,19 @@ class VLMBatchedEngine(BaseEngine):
             - image_cache_key_ranges: Per-image-turn cache key boundaries with
               cumulative image hashes
         """
+        from ..models.deepseek_v4_vision import VISION_MODEL_TYPE
+
+        if self.model_type == VISION_MODEL_TYPE:
+            return self._prepare_deepseek_v4_vision_inputs(
+                messages,
+                images,
+                audio=audio,
+                chat_template_kwargs=chat_template_kwargs,
+                tools=tools,
+                is_partial=is_partial,
+                control=deepseek_v4_vision_control,
+            )
+
         from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
         from mlx_vlm.utils import prepare_inputs
@@ -3850,12 +4026,30 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        deepseek_control = kwargs.pop("deepseek_v4_vision_control", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
         # on the first image-bearing turn and invalidates early prefix blocks.
         vlm_messages = self._apply_ocr_prompt(messages) if images else text_messages
         template_tools = convert_tools_for_template(tools) if tools else None
+        prepare_kwargs: dict[str, Any] = {
+            "audio": audio if audio else None,
+            "chat_template_kwargs": ct_kwargs,
+            "tools": template_tools,
+            "is_partial": partial,
+        }
+        from ..models.deepseek_v4_vision import VISION_MODEL_TYPE
+
+        if self.model_type == VISION_MODEL_TYPE:
+            prepare_kwargs["deepseek_v4_vision_control"] = deepseek_control or "real"
+        elif deepseek_control is not None:
+            raise InvalidRequestError(
+                "deepseek_v4_vision_control is only valid for the "
+                "DeepSeek-V4 DeepEncoderV2 bridge.",
+                field="deepseek_v4_vision_control",
+            )
+
         (
             token_ids,
             vlm_embeds,
@@ -3866,10 +4060,7 @@ class VLMBatchedEngine(BaseEngine):
         ) = self._prepare_vision_inputs(
             vlm_messages,
             images,
-            audio=audio if audio else None,
-            chat_template_kwargs=ct_kwargs,
-            tools=template_tools,
-            is_partial=partial,
+            **prepare_kwargs,
         )
 
         if images:

@@ -4377,6 +4377,11 @@ async def create_chat_completion(
         if request.seed is not None:
             chat_kwargs["seed"] = request.seed
 
+        if request.deepseek_v4_vision_control is not None:
+            chat_kwargs["deepseek_v4_vision_control"] = (
+                request.deepseek_v4_vision_control
+            )
+
         # Add thinking budget if applicable
         thinking_budget = _resolve_thinking_budget(request, request.model)
         if thinking_budget is not None:

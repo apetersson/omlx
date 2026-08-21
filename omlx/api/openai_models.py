@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -326,6 +326,12 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Diagnostic causal control for the DeepSeek-V4 DeepEncoderV2 bridge.
+    # Omitted/"real" serves the real image; the other modes are validation
+    # controls and intentionally not part of the OpenAI standard.
+    deepseek_v4_vision_control: Optional[
+        Literal["real", "zero", "shuffle"]
+    ] = None
 
     @field_validator("stop", mode="before")
     @classmethod

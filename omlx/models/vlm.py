@@ -129,6 +129,20 @@ class VLMModelAdapter(nn.Module):
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
 
+    def mtp_partial_rollback(
+        self, cache: List[Any], accepted: int, num_drafts: int
+    ) -> bool:
+        """Delegate native-MTP rollback through the vision adapter.
+
+        DeepSeek-V4/DSpark supplies this exact cache operation on its language
+        model.  BatchGenerator owns the adapter, so without this transparent
+        hop any partial draft acceptance would disable the speculative path.
+        """
+        rollback = getattr(self._language_model, "mtp_partial_rollback", None)
+        if not callable(rollback):
+            return False
+        return bool(rollback(cache, accepted, num_drafts))
+
     def set_pending_embeddings(
         self,
         inputs_embeds: mx.array,

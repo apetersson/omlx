@@ -124,6 +124,17 @@ class TestVLMModelAdapter:
         vlm.language_model.make_cache.assert_called_once()
         assert cache is vlm.language_model.make_cache.return_value
 
+    def test_mtp_partial_rollback_delegates(self):
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        vlm.language_model.mtp_partial_rollback.return_value = True
+        adapter = VLMModelAdapter(vlm)
+        cache = [MagicMock()]
+
+        assert adapter.mtp_partial_rollback(cache, 2, 4) is True
+        vlm.language_model.mtp_partial_rollback.assert_called_once_with(cache, 2, 4)
+
     def test_set_pending_embeddings(self):
         """Test set_pending_embeddings stores state."""
         from omlx.models.vlm import VLMModelAdapter

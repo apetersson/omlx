@@ -163,6 +163,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_deepseek_v4_deepencoder_sidecar_as_vlm(self, tmp_path):
+        config = {
+            "model_type": "deepseek_v4",
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "vision_config": {"model_type": "deepencoder_v2"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_embedding_model_by_type(self, tmp_path):
         """Test detection of embedding model by model_type."""
         config = {

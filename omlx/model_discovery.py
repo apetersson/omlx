@@ -591,6 +591,22 @@ def _has_vision_subconfig(config: dict) -> bool:
     )
 
 
+def _has_deepseek_v4_vision_sidecar(config: dict) -> bool:
+    """Recognize the external DeepEncoderV2 bridge supported by oMLX.
+
+    DeepSeek-V4 is otherwise an mlx-lm-only family.  Its sidecar deliberately
+    keeps the receiver's native config/weights and opts into the VLM engine
+    with this precise marker, rather than pretending to be an mlx-vlm model.
+    """
+    vision = config.get("vision_config")
+    return (
+        isinstance(vision, dict)
+        and vision.get("model_type") == "deepencoder_v2"
+        and str(config.get("model_type", "")).replace("-", "_").lower()
+        == "deepseek_v4"
+    )
+
+
 def _architecture_indicates_causal_lm(architectures: list[str]) -> bool:
     """True when ``architectures`` describe a text causal LM (not mlx-audio STS).
 
@@ -694,6 +710,12 @@ def detect_model_type(model_path: Path) -> ModelType:
         )
 
     if normalized_type in MLX_LM_TEXT_ONLY_MODEL_TYPES:
+        if _has_deepseek_v4_vision_sidecar(config):
+            logger.info(
+                "%s detected as VLM via the DeepEncoderV2 sidecar bridge",
+                model_type,
+            )
+            return "vlm"
         if _has_vision_subconfig(config):
             logger.warning(
                 "%s carries multimodal configuration, but the available mlx-lm "
