@@ -17,6 +17,7 @@ from omlx.models.deepseek_v4_vision import (
     HIDDEN_SIZE,
     IMAGE_TOKEN_ID,
     DeepEncoderV2Sidecar,
+    deepseek_v4_vision_prefill_step_size,
 )
 
 
@@ -150,3 +151,33 @@ def test_message_normalizer_preserves_image_text_order():
 
     assert normalized == [{"role": "user", "content": f"before\n{IMAGE_TOKEN}\nafter"}]
     assert count == 1
+
+
+def test_artifact_prefill_step_size_is_optional_and_scoped(tmp_path):
+    _sidecar(tmp_path)
+    assert deepseek_v4_vision_prefill_step_size(tmp_path) is None
+
+    path = tmp_path / "config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["vision_config"]["prefill_step_size"] = 32
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert deepseek_v4_vision_prefill_step_size(tmp_path) == 32
+
+    config["vision_config"]["model_type"] = "other"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert deepseek_v4_vision_prefill_step_size(tmp_path) is None
+
+
+def test_artifact_prefill_step_size_rejects_invalid_values(tmp_path):
+    _sidecar(tmp_path)
+    path = tmp_path / "config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["vision_config"]["prefill_step_size"] = 0
+    path.write_text(json.dumps(config), encoding="utf-8")
+
+    try:
+        deepseek_v4_vision_prefill_step_size(tmp_path)
+    except ValueError as exc:
+        assert "positive integer" in str(exc)
+    else:
+        raise AssertionError("invalid prefill marker was accepted")

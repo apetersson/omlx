@@ -61,6 +61,28 @@ def is_deepseek_v4_vision_path(model_path: str | Path) -> bool:
     return is_deepseek_v4_vision_config(_read_model_config(model_path))
 
 
+def deepseek_v4_vision_prefill_step_size(model_path: str | Path) -> int | None:
+    """Return an artifact-pinned prefill size for exact target/DSpark parity.
+
+    DeepSeek-V4's low-bit receiver can produce different greedy continuations
+    when the same long image prefix is evaluated as one chunk versus many
+    smaller chunks.  A vision artifact may therefore pin the chunk geometry
+    used by both target-only and speculative execution.  The marker is scoped
+    to DeepEncoderV2 configs so ordinary VLMs keep the server-wide setting.
+    """
+    config = _read_model_config(model_path)
+    if not is_deepseek_v4_vision_config(config):
+        return None
+    raw = config["vision_config"].get("prefill_step_size")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise ValueError(
+            "vision_config.prefill_step_size must be a positive integer"
+        )
+    return raw
+
+
 @dataclass(frozen=True)
 class DeepEncoderV2Sidecar:
     model_dir: Path

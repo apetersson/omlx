@@ -1745,6 +1745,20 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        from ..models.deepseek_v4_vision import (
+            deepseek_v4_vision_prefill_step_size,
+        )
+
+        artifact_prefill_step_size = deepseek_v4_vision_prefill_step_size(
+            self._model_name
+        )
+        if artifact_prefill_step_size is not None:
+            scheduler_config.prefill_step_size = artifact_prefill_step_size
+            logger.info(
+                "Using artifact-pinned VLM prefill step size %d for %s",
+                artifact_prefill_step_size,
+                self._model_name,
+            )
 
         engine_config = EngineConfig(
             model_name=self._model_name,
