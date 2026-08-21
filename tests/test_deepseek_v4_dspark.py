@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -151,6 +152,29 @@ def test_dspark_target_tap_and_parallel_draft_shapes(dsv4):
     assert draft_logits.shape == (1, 3, 32)
     assert draft_hidden.shape == (1, 3, 8)
     assert [cache.offset for cache in draft_cache] == [1, 1, 1]
+
+
+def test_multimodal_prefill_uses_embeds_and_preserves_token_ids(dsv4):
+    """Projected vision rows replace lookup values, never routing IDs."""
+    from omlx.patches.mlx_lm_mtp import set_mtp_active, set_mtp_depth
+
+    set_mtp_active(True)
+    set_mtp_depth(3)
+    try:
+        model = dsv4.Model(_tiny_config(dsv4))
+    finally:
+        set_mtp_active(False)
+
+    token_ids = mx.array([[1, 2, 3]], dtype=mx.uint32)
+    lookup = model.model.embed_tokens(token_ids)
+    baseline = model(token_ids)
+    injected_same = model(token_ids, inputs_embeds=lookup)
+    injected_zero = model(token_ids, inputs_embeds=mx.zeros_like(lookup))
+    mx.eval(baseline, injected_same, injected_zero)
+
+    assert mx.allclose(baseline, injected_same, rtol=0, atol=0).item()
+    assert not mx.allclose(baseline, injected_zero, rtol=0, atol=0).item()
+    assert "inputs_embeds" in inspect.signature(dsv4.Model.__call__).parameters
 
 
 def test_dspark_query_block_matches_requested_depth(dsv4, monkeypatch):

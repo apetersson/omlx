@@ -197,8 +197,12 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
         cache=None,
         return_raw_hidden: bool = False,
         return_dspark_hidden: bool = False,
+        inputs_embeds=None,
     ):
-        h = self.embed_tokens(inputs)
+        # Keep ``inputs`` intact for DeepSeek-V4's hash-routed MoE layers;
+        # only the initial embedding lookup is replaced for multimodal
+        # prefill.  Decode and DSpark draft steps continue to use token IDs.
+        h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
             h[:, :, None, :],
             (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
@@ -351,6 +355,7 @@ def _patch_model(dsv4: Any) -> None:
         return_hidden: bool = False,
         n_confirmed: int = 0,
         skip_lm_head: bool = False,
+        inputs_embeds=None,
     ):
         if skip_lm_head:
             # Chunked prefill discards per-chunk logits (the prompt's final
@@ -362,20 +367,30 @@ def _patch_model(dsv4: Any) -> None:
                 and not n_confirmed
                 and cache is not None
             ):
-                h, h_aux = self.model(inputs, cache, return_dspark_hidden=True)
+                h, h_aux = self.model(
+                    inputs,
+                    cache,
+                    return_dspark_hidden=True,
+                    inputs_embeds=inputs_embeds,
+                )
                 try:
                     deepseek_v4_dspark.capture_prompt(self, inputs, h_aux, cache)
                 except Exception:
                     logger.debug("DeepSeek DSpark prompt capture failed", exc_info=True)
                 return None
             if not n_confirmed and prompt_priming.capture_eligible(self, cache):
-                h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
+                h, h_raw = self.model(
+                    inputs,
+                    cache,
+                    return_raw_hidden=True,
+                    inputs_embeds=inputs_embeds,
+                )
                 try:
                     prompt_priming.maybe_capture(self, inputs, h_raw, cache)
                 except Exception:
                     logger.debug("MTP prompt-priming capture failed", exc_info=True)
                 return None
-            self.model(inputs, cache)
+            self.model(inputs, cache, inputs_embeds=inputs_embeds)
             return None
         # ``n_confirmed`` is part of the patched-backbone interface:
         # batch_generator._call_backbone passes n_confirmed=1 during MTP
@@ -387,16 +402,31 @@ def _patch_model(dsv4: Any) -> None:
         # _restore_or_trim_caches, so the argument is accepted and unused.
         if return_hidden:
             if getattr(self, "_omlx_dspark_decode_enabled", False):
-                h, h_aux = self.model(inputs, cache, return_dspark_hidden=True)
+                h, h_aux = self.model(
+                    inputs,
+                    cache,
+                    return_dspark_hidden=True,
+                    inputs_embeds=inputs_embeds,
+                )
                 return self.lm_head(h), h_aux
-            h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
+            h, h_raw = self.model(
+                inputs,
+                cache,
+                return_raw_hidden=True,
+                inputs_embeds=inputs_embeds,
+            )
             return self.lm_head(h), h_raw
         if (
             getattr(self, "_omlx_dspark_decode_enabled", False)
             and not n_confirmed
             and cache is not None
         ):
-            h, h_aux = self.model(inputs, cache, return_dspark_hidden=True)
+            h, h_aux = self.model(
+                inputs,
+                cache,
+                return_dspark_hidden=True,
+                inputs_embeds=inputs_embeds,
+            )
             try:
                 deepseek_v4_dspark.capture_prompt(self, inputs, h_aux, cache)
             except Exception:
@@ -406,13 +436,18 @@ def _patch_model(dsv4: Any) -> None:
             # Prompt-priming capture needs the head-input hidden (the raw 4D
             # Hyper-stream activation), which the stock branch discards
             # inside self.model — same compute, one extra returned tensor.
-            h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
+            h, h_raw = self.model(
+                inputs,
+                cache,
+                return_raw_hidden=True,
+                inputs_embeds=inputs_embeds,
+            )
             try:
                 prompt_priming.maybe_capture(self, inputs, h_raw, cache)
             except Exception:
                 logger.debug("MTP prompt-priming capture failed", exc_info=True)
             return self.lm_head(h)
-        h = self.model(inputs, cache)
+        h = self.model(inputs, cache, inputs_embeds=inputs_embeds)
         return self.lm_head(h)
 
     def make_mtp_cache(self):

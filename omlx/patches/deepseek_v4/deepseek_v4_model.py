@@ -2112,8 +2112,18 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        h = self.embed_tokens(inputs)
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+    ) -> mx.array:
+        # Multimodal callers inject projected image features through
+        # ``inputs_embeds`` while retaining the original token IDs in
+        # ``inputs``.  DeepSeek-V4 needs both: the embeddings carry vision
+        # information and the first ``num_hash_layers`` MoE gates route by
+        # token ID rather than hidden state.
+        h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
             h[:, :, None, :],
             (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
@@ -2168,8 +2178,15 @@ class Model(nn.Module):
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None):
-        return self.lm_head(self.model(inputs, cache))
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+    ):
+        return self.lm_head(
+            self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        )
 
     @property
     def layers(self):
