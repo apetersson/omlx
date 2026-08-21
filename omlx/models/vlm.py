@@ -129,6 +129,36 @@ class VLMModelAdapter(nn.Module):
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(self.layers))]
 
+    @property
+    def mtp(self):
+        """Expose an attached native MTP/DSpark head for eligibility checks."""
+        return getattr(self._language_model, "mtp", None)
+
+    def mtp_forward(self, *args, **kwargs):
+        """Transparently forward native MTP/DSpark drafting."""
+        return self._language_model.mtp_forward(*args, **kwargs)
+
+    def make_mtp_cache(self) -> List[Any]:
+        """Create the wrapped receiver's native MTP/DSpark cache."""
+        factory = getattr(self._language_model, "make_mtp_cache", None)
+        return factory() if callable(factory) else []
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        states: Any,
+        accepted: int,
+        block_size: int,
+    ) -> Any:
+        """Delegate state-space rollback for VLM families that expose it."""
+        rollback = getattr(self._language_model, "rollback_speculative_cache", None)
+        if not callable(rollback):
+            raise AttributeError(
+                f"{type(self._language_model).__name__} has no "
+                "rollback_speculative_cache"
+            )
+        return rollback(caches, states, accepted, block_size)
+
     def mtp_partial_rollback(
         self, cache: List[Any], accepted: int, num_drafts: int
     ) -> bool:

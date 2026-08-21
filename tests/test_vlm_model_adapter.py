@@ -135,6 +135,21 @@ class TestVLMModelAdapter:
         assert adapter.mtp_partial_rollback(cache, 2, 4) is True
         vlm.language_model.mtp_partial_rollback.assert_called_once_with(cache, 2, 4)
 
+    def test_native_mtp_methods_delegate(self):
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mock_vlm_model()
+        vlm.language_model.mtp = MagicMock()
+        vlm.language_model.mtp_forward.return_value = "logits"
+        vlm.language_model.make_mtp_cache.return_value = ["mtp-cache"]
+        vlm.language_model.rollback_speculative_cache.return_value = 2
+        adapter = VLMModelAdapter(vlm)
+
+        assert adapter.mtp is vlm.language_model.mtp
+        assert adapter.mtp_forward("hidden", "ids", ["cache"]) == "logits"
+        assert adapter.make_mtp_cache() == ["mtp-cache"]
+        assert adapter.rollback_speculative_cache(["kv"], ["state"], 2, 5) == 2
+
     def test_set_pending_embeddings(self):
         """Test set_pending_embeddings stores state."""
         from omlx.models.vlm import VLMModelAdapter
