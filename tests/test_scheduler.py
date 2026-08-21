@@ -5575,6 +5575,34 @@ class TestVLMPositionStateClearing:
         assert seeded.shape == (1, 1)
         assert seeded.item() == 0
 
+    def test_vlm_tail_chunk_is_clamped_after_minimum_floor(self, mock_tokenizer):
+        """A short VLM tail must keep token IDs and embeddings aligned."""
+        model = self._make_vlm_model()
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="vlm-tail-001",
+            prompt="describe this image",
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        tokens = [1, 2, 3, 4]
+        embeds = mx.zeros((1, len(tokens), 64))
+
+        with (
+            patch.object(scheduler, "_adaptive_chunk_size", return_value=32),
+            patch.object(scheduler, "_guard_prefill_chunk", return_value=32),
+        ):
+            scheduler._do_external_prefill(
+                request,
+                tokens=tokens,
+                existing_cache=[],
+                vlm_embeds=(embeds, {}, 0),
+            )
+
+        input_ids = model.call_args.args[0]
+        inputs_embeds = model.call_args.kwargs["inputs_embeds"]
+        assert input_ids.shape[1] == len(tokens) - 1
+        assert inputs_embeds.shape[1] == input_ids.shape[1]
+
 
 class TestBuildStateMachineStopStrings:
     """Tests for _build_state_machine stop-string tokenization.

@@ -3452,6 +3452,12 @@ class Scheduler:
                 loop_label="external",
                 request_id=request.request_id,
             )
+            # The adaptive/guard helpers enforce a minimum chunk size.  The
+            # final prompt tail can be shorter than that floor (for example,
+            # an 802-token VLM prefill leaves two tokens after 25x32).  Clamp
+            # again after both helpers so token IDs, inputs_embeds, and any
+            # prompt-aligned extras always receive the same tail length.
+            n_to_process = min(n_to_process, remaining)
             if getattr(request, "benchmark_trace", False):
                 request.benchmark_prefill_chunks.append(int(n_to_process))
                 request.benchmark_requested_steps.append(int(prefill_step_size))
