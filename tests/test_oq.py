@@ -35,6 +35,7 @@ from omlx.oq import (
     _build_streaming_proxy_for_sensitivity,
     _calibration_memory_budget,
     _checkpoint_storage_bytes,
+    _checkpoint_weight_files,
     _collect_imatrix_from_model,
     _commit_layer_forward_aux,
     _configure_minimax_shared_expert_layout,
@@ -2767,6 +2768,15 @@ class TestModelExceedsRamGuard:
 
         assert _checkpoint_storage_bytes([path]) == path.stat().st_size
         assert path.stat().st_size > expected_bytes
+
+    def test_checkpoint_weight_files_ignores_appledouble_sidecars(
+        self, sf_file
+    ):
+        path, _ = sf_file
+        sidecar = path.with_name(f"._{path.name}")
+        sidecar.write_bytes(b"not a safetensors header")
+
+        assert _checkpoint_weight_files(path.parent) == [path]
 
     def test_checkpoint_storage_counts_hidden_fp8_scales(self, tmp_path):
         weight = np.zeros((64, 64), dtype=np.uint8)

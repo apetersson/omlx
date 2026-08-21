@@ -1324,7 +1324,7 @@ def combine_gemma4_assistant_mtp(
         with open(index_path) as f:
             shards = sorted(set(json.load(f)["weight_map"].values()))
     else:
-        shards = sorted(p.name for p in assistant.glob("*.safetensors"))
+        shards = [p.name for p in _checkpoint_weight_files(assistant)]
     if not shards:
         raise ValueError(f"No safetensors found in assistant model: {assistant}")
 
@@ -1669,7 +1669,7 @@ def _shard_key_map(model_dir: Path) -> dict:
         with open(index_path) as f:
             return dict(json.load(f).get("weight_map") or {})
     key_map: dict = {}
-    for shard in sorted(model_dir.glob("*.safetensors")):
+    for shard in _checkpoint_weight_files(model_dir):
         with open(shard, "rb") as f:
             header_len = int.from_bytes(f.read(8), "little")
             header = json.loads(f.read(header_len))
@@ -3085,7 +3085,7 @@ def estimate_bpw_and_size(
     with open(config_path) as f:
         config = json.load(f)
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _checkpoint_weight_files(source)
     if not weight_files:
         return {
             "effective_bpw": float(oq_level),
@@ -3282,7 +3282,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
-    source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
+    source_total = _checkpoint_storage_bytes(_checkpoint_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -3356,6 +3356,15 @@ def _metal_available_memory_bytes() -> int:
     except Exception:
         active = 0
     return max(0, max_working_set - active)
+
+
+def _checkpoint_weight_files(directory: str | Path) -> list[Path]:
+    """Return real shards, excluding macOS AppleDouble metadata sidecars."""
+    return sorted(
+        path
+        for path in Path(directory).glob("*.safetensors")
+        if not path.name.startswith("._")
+    )
 
 
 def _checkpoint_storage_bytes(weight_files) -> int:
@@ -4796,7 +4805,7 @@ def _progress_total_bytes(all_weights, source: Path) -> int:
     lets progress exceed 100% and makes ETA negative.
     """
     candidates = [
-        sum(sf.stat().st_size for sf in source.glob("*.safetensors")),
+        _checkpoint_storage_bytes(_checkpoint_weight_files(source)),
     ]
 
     if hasattr(all_weights, "nbytes"):
@@ -4847,7 +4856,7 @@ def _source_imatrix_signature(
     stable_config = {k: v for k, v in config.items() if not str(k).startswith("_oq_")}
     cfg_bytes = json.dumps(stable_config, sort_keys=True, default=str).encode("utf-8")
     h = hashlib.sha256(cfg_bytes)
-    for sf in sorted(source.glob("*.safetensors")):
+    for sf in _checkpoint_weight_files(source):
         st = sf.stat()
         h.update(sf.name.encode("utf-8"))
         h.update(str(st.st_size).encode("ascii"))
@@ -5466,7 +5475,7 @@ def quantize_oq_streaming(
 
     cb("loading", 5.0, "Reading model config")
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _checkpoint_weight_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -6094,7 +6103,7 @@ def quantize_oq_streaming(
     cb("saving", 92.0, "Writing model metadata")
 
     if total_shards > 1:
-        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        total_size = _checkpoint_storage_bytes(_checkpoint_weight_files(output))
         index = {
             "metadata": {"total_size": total_size},
             "weight_map": dict(sorted(weight_map.items())),
@@ -7936,7 +7945,7 @@ def _build_streaming_proxy_for_sensitivity(
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _checkpoint_weight_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -8086,7 +8095,7 @@ def _build_streaming_proxy_for_sensitivity(
                     if value == old_name:
                         weight_map[key] = new_name
 
-        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        total_size = _checkpoint_storage_bytes(_checkpoint_weight_files(output))
         index = {
             "metadata": {"total_size": total_size},
             "weight_map": dict(sorted(weight_map.items())),
