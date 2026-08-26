@@ -4422,6 +4422,19 @@ class _LazyTensorIndex:
         meta = self._index.get(key)
         return None if meta is None else meta[4]
 
+    def plan_shape(self, key):
+        """Logical shape for a visible key without materializing it."""
+        if key in self._overrides:
+            return tuple(self._overrides[key].shape)
+        if key in self._virtual:
+            return self._virtual[key].shape
+        meta = self._index[key]
+        shape = meta[4]
+        info = self._src_quant.get(key)
+        if info is not None and info["kind"] == "mxfp4":
+            shape = (shape[0], shape[1] * 2)
+        return tuple(shape)
+
     def load_source(self, key):
         """Load an on-disk tensor verbatim, bypassing fp8 pairing."""
         return self._load_raw(key)
@@ -5643,19 +5656,13 @@ def quantize_oq_streaming(
         nonlocal _ram_safe_proxy_dir
         if _ram_safe_proxy_dir is None:
             proxy_bits = _proxy_quant_bits(config)
-            proxy_estimate = _estimate_streaming_proxy_bytes(
-                all_weights,
-                config,
-                base_bits=proxy_bits,
-                text_only=text_only,
-                preserve_mtp=preserve_mtp,
-            )
             model_limit = int(_calibration_budget["model_limit_bytes"])
-            if (
+            qwen4_exp_proxy = (
                 str(config.get("model_type", "")).lower() == "qwen4_exp"
-                and proxy_estimate > model_limit
-            ):
-                proxy_bits = 2
+            )
+            proxy_estimate = None
+            proxy_bits_override = None
+            if qwen4_exp_proxy:
                 proxy_estimate = _estimate_streaming_proxy_bytes(
                     all_weights,
                     config,
@@ -5663,49 +5670,82 @@ def quantize_oq_streaming(
                     text_only=text_only,
                     preserve_mtp=preserve_mtp,
                 )
-            if model_limit > 0 and proxy_estimate > model_limit:
-                raise RuntimeError(
-                    "smallest supported calibration proxy exceeds the live "
-                    f"memory limit (estimated proxy={_format_size(proxy_estimate)}, "
-                    f"limit={_format_size(model_limit)})"
-                )
+                if proxy_estimate > model_limit:
+                    proxy_bits = 2
+                    proxy_estimate = _estimate_streaming_proxy_bytes(
+                        all_weights,
+                        config,
+                        base_bits=proxy_bits,
+                        text_only=text_only,
+                        preserve_mtp=preserve_mtp,
+                    )
+                if model_limit > 0 and proxy_estimate > model_limit:
+                    raise RuntimeError(
+                        "smallest supported calibration proxy exceeds the live "
+                        f"memory limit (estimated proxy={_format_size(proxy_estimate)}, "
+                        f"limit={_format_size(model_limit)})"
+                    )
+                proxy_bits_override = proxy_bits
+            estimate_note = (
+                f" (estimated size={_format_size(proxy_estimate)})."
+                if proxy_estimate is not None
+                else "."
+            )
             logger.warning(
                 f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
                 "full-model calibration limit. Building a compact "
-                f"{proxy_bits}-bit proxy on disk for the calibration passes "
-                f"(estimated size={_format_size(proxy_estimate)})."
+                f"{proxy_bits}-bit proxy on disk for the calibration passes"
+                f"{estimate_note}"
             )
-            candidate = _build_proxy_for_sensitivity(
-                model_path,
-                config=config,
-                dtype=dtype,
-                working_dir=str(output.parent),
-                trust_remote_code=trust_remote_code,
-                preserve_mtp=preserve_mtp,
-                proxy_bits=proxy_bits,
-            )
+            proxy_kwargs = {
+                "config": config,
+                "dtype": dtype,
+                "working_dir": str(output.parent),
+                "trust_remote_code": trust_remote_code,
+                "preserve_mtp": preserve_mtp,
+            }
+            if proxy_bits_override is not None:
+                proxy_kwargs["proxy_bits"] = proxy_bits_override
+            candidate = _build_proxy_for_sensitivity(model_path, **proxy_kwargs)
             proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
             proxy_budget = _calibration_memory_budget(
                 proxy_bytes,
                 fallback_system_bytes=_system_ram,
             )
-            if int(proxy_budget["capacity_bytes"]) > 0 and bool(
-                proxy_budget["requires_proxy"]
-            ):
+            live_capacity = int(proxy_budget["capacity_bytes"])
+            initial_limit = int(_calibration_budget["model_limit_bytes"])
+            # Writing a 50+ GiB proxy warms macOS's reclaimable file cache and
+            # can temporarily reduce the post-build "available" reading by
+            # several GiB. Do not invalidate a proxy that passed the original
+            # 25% reserve merely because of that self-induced cache movement.
+            # Still require up to 8 GiB of live headroom at the second check
+            # so a genuinely competing allocation cannot slip through. The
+            # 10% bound keeps this rule meaningful for small test/checkpoint
+            # budgets too.
+            minimum_live_headroom = min(8 * 1024**3, live_capacity // 10)
+            proxy_too_large = (
+                proxy_bytes > initial_limit
+                or (
+                    live_capacity > 0
+                    and proxy_bytes + minimum_live_headroom > live_capacity
+                )
+            )
+            if proxy_too_large:
                 shutil.rmtree(candidate, ignore_errors=True)
                 raise RuntimeError(
                     "calibration proxy is still too large for the live memory "
                     f"budget (proxy={_format_size(proxy_bytes)}, "
-                    f"limit={_format_size(int(proxy_budget['model_limit_bytes']))}, "
-                    f"capacity={_format_size(int(proxy_budget['capacity_bytes']))})"
+                    f"initial limit={_format_size(initial_limit)}, "
+                    f"live capacity={_format_size(live_capacity)}, "
+                    f"required live headroom={_format_size(minimum_live_headroom)})"
                 )
             _ram_safe_proxy_dir = candidate
             logger.info(
                 f"oQ{oq_level:g}: calibration proxy size "
-                f"{_format_size(proxy_bytes)} within "
-                f"{_format_size(int(proxy_budget['model_limit_bytes']))} limit"
+                f"{_format_size(proxy_bytes)} admitted with "
+                f"{_format_size(max(0, live_capacity - proxy_bytes))} live headroom"
             )
         return _ram_safe_proxy_dir
 
@@ -8029,14 +8069,14 @@ def _build_proxy_for_sensitivity(
     # Reserve a unique temp name and let the streaming writer create it.
     proxy_dir = Path(tempfile.mkdtemp(prefix="omlx_oq_proxy_", dir=working_dir))
     shutil.rmtree(proxy_dir)
-    _build_streaming_proxy_for_sensitivity(
-        model_path,
-        proxy_dir,
-        dtype=dtype,
-        trust_remote_code=trust_remote_code,
-        preserve_mtp=preserve_mtp,
-        proxy_bits=proxy_bits,
-    )
+    build_kwargs = {
+        "dtype": dtype,
+        "trust_remote_code": trust_remote_code,
+        "preserve_mtp": preserve_mtp,
+    }
+    if proxy_bits is not None:
+        build_kwargs["proxy_bits"] = proxy_bits
+    _build_streaming_proxy_for_sensitivity(model_path, proxy_dir, **build_kwargs)
     return proxy_dir
 
 
