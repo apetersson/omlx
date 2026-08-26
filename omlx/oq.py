@@ -12,6 +12,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import tempfile
@@ -50,11 +51,17 @@ _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
 
 _MAX_MODEL_RAM_FRACTION = 0.75
 
-# Auto-built proxy for sensitivity measurement when the source model
-# exceeds available RAM. Uniform 4-bit affine quant — same shape as a
-# user-supplied --sensitivity-model, but built on demand.
+# Auto-built proxy for sensitivity measurement when the source model exceeds
+# available RAM. Most models use uniform 4-bit affine quantization. Qwen4-Exp
+# uses 3-bit because its 51B-parameter PLE table makes even its text-only Q4
+# checkpoint too large for the calibration budget on a 128 GiB Mac.
 _PROXY_QUANT_BITS = 4
 _PROXY_QUANT_GROUP_SIZE = 64
+
+
+def _proxy_quant_bits(config: dict) -> int:
+    model_type = str(config.get("model_type", "")).lower().replace("-", "_")
+    return 3 if model_type == "qwen4_exp" else _PROXY_QUANT_BITS
 
 _LEVEL_BITS: dict[float, int] = {
     2: 2,
@@ -401,6 +408,35 @@ def universal_quant_predicate(
     # as fixed source-precision passthrough tensors.
     if "shared_expert" in path and not path.endswith("shared_expert_gate"):
         return bits(8)
+
+    # Qwen4-Exp uses learned hyper-connections and QSA token selection.  A
+    # small error in either changes every downstream residual stream or the
+    # discrete set of tokens visible to attention, so these projections get
+    # explicit floors.  The 51B PLE table itself remains in the byte-budgeted
+    # competition: raising all of it by one bit costs about 6.4 GB.
+    if str(config.get("model_type", "")).lower() == "qwen4_exp":
+        if ".ple.ple_embedding.ngram_embedding.groups." in path:
+            # Every PLE row is 160 values wide.  The ordinary 512-expert MoE
+            # rule chooses group size 128, which cannot divide 160 and would
+            # make the streaming loop silently retain this 95-GiB table in
+            # BF16.  Group size 32 is the only supported MLX size that fits.
+            return {
+                "bits": base_bits,
+                "group_size": 32,
+                "mode": _mode_for_bits(base_bits),
+            }
+        if ".self_attn.indexer.index_qk_proj" in path:
+            return bits(8)
+        if "hyper_connection." in path or "hyper_connection_mixer." in path:
+            if path.endswith("block_inject_weight"):
+                return bits(8)
+            if path.endswith(("input_mix_weight_down", "input_mix_weight_up")):
+                return bits(6)
+        if ".ple." in path:
+            if path.endswith(("key_proj", "value_proj")):
+                return bits(8)
+            if "conv1d" in path:
+                return False
 
     if _is_vision_tensor(path):
         return False
@@ -897,6 +933,19 @@ def _build_quant_plan(
         override = _glm_indexer_q8_override(path, config)
         if override is not None:
             boost_map[path] = override
+            continue
+        if (
+            str(config.get("model_type", "")).lower() == "qwen4_exp"
+            and ".ple.ple_embedding.ngram_embedding.groups." in path
+        ):
+            # Structural format constraint: Qwen4 PLE rows are width 160, so
+            # pricing them at the ordinary MoE group size 128 treats them as
+            # BF16 and makes the allocator believe it is already over budget.
+            boost_map[path] = {
+                "bits": base_bits,
+                "group_size": 32,
+                "mode": base_mode,
+            }
 
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
@@ -1669,7 +1718,7 @@ def _shard_key_map(model_dir: Path) -> dict:
         with open(index_path) as f:
             return dict(json.load(f).get("weight_map") or {})
     key_map: dict = {}
-    for shard in sorted(model_dir.glob("*.safetensors")):
+    for shard in _safetensor_files(model_dir):
         with open(shard, "rb") as f:
             header_len = int.from_bytes(f.read(8), "little")
             header = json.loads(f.read(header_len))
@@ -3063,6 +3112,7 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    text_only: bool = False,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3074,6 +3124,8 @@ def estimate_bpw_and_size(
         preserve_mtp: When True, mtp.* tensors are kept (counted toward
             output size) instead of being skipped. Mirrors the matching
             argument in ``quantize_oq_streaming``.
+        text_only: Exclude vision/audio tensors. Automatically enabled for
+            multimodal families whose vendored runtime is text-only.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
 
@@ -3084,8 +3136,16 @@ def estimate_bpw_and_size(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    normalized_model_type = str(config.get("model_type", "")).lower().replace(
+        "-", "_"
+    )
+    if (
+        normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
+        and _has_vision_subconfig(config)
+    ):
+        text_only = True
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _safetensor_files(source)
     if not weight_files:
         return {
             "effective_bpw": float(oq_level),
@@ -3121,7 +3181,7 @@ def estimate_bpw_and_size(
     # the raw header names when discovery is unavailable.
     plan_view = None
     try:
-        _sanitize_fn = _build_model_sanitizer(config)
+        _sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
         if _sanitize_fn is not None:
             _plan = _discover_sanitize_plan(_sanitize_fn, idx)
             if _plan:
@@ -3212,6 +3272,8 @@ def estimate_bpw_and_size(
     total_output_bytes = 0
 
     for name, (shape, _dtype) in logical.items():
+        if text_only and (_is_vision_tensor(name) or _is_audio_tensor(name)):
+            continue
         n_elements = 1
         for d in shape:
             n_elements *= d
@@ -3282,7 +3344,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
-    source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
+    source_total = sum(sf.stat().st_size for sf in _safetensor_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
@@ -3358,6 +3420,15 @@ def _metal_available_memory_bytes() -> int:
     return max(0, max_working_set - active)
 
 
+def _safetensor_files(root: str | Path) -> list[Path]:
+    """List real checkpoint shards, excluding macOS AppleDouble sidecars."""
+    return sorted(
+        path
+        for path in Path(root).glob("*.safetensors")
+        if not path.name.startswith("._")
+    )
+
+
 def _checkpoint_storage_bytes(weight_files) -> int:
     """Return the complete on-disk size of checkpoint weight shards.
 
@@ -3368,6 +3439,8 @@ def _checkpoint_storage_bytes(weight_files) -> int:
     """
     total = 0
     for path in weight_files:
+        if Path(path).name.startswith("._"):
+            continue
         try:
             total += int(Path(path).stat().st_size)
         except OSError:
@@ -3696,6 +3769,19 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
         A function that takes a dict of weights and returns sanitized weights,
         or None if the model class can't be loaded.
     """
+    if str(config.get("model_type", "")).lower() == "qwen4_exp":
+        from .patches.qwen4_exp.sanitize import cast_predicate, sanitize_weights
+
+        def _qwen4_sanitize(weights):
+            return sanitize_weights(weights, config, text_only=text_only)
+
+        _qwen4_sanitize._omlx_cast_predicate = cast_predicate
+        logger.info(
+            "Using vendored Qwen4-Exp streaming sanitizer (%s)",
+            "text-only" if text_only else "multimodal",
+        )
+        return _qwen4_sanitize
+
     architectures = config.get("architectures", [])
     # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
     # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
@@ -4811,7 +4897,7 @@ def _progress_total_bytes(all_weights, source: Path) -> int:
     lets progress exceed 100% and makes ETA negative.
     """
     candidates = [
-        sum(sf.stat().st_size for sf in source.glob("*.safetensors")),
+        sum(sf.stat().st_size for sf in _safetensor_files(source)),
     ]
 
     if hasattr(all_weights, "nbytes"):
@@ -4862,7 +4948,7 @@ def _source_imatrix_signature(
     stable_config = {k: v for k, v in config.items() if not str(k).startswith("_oq_")}
     cfg_bytes = json.dumps(stable_config, sort_keys=True, default=str).encode("utf-8")
     h = hashlib.sha256(cfg_bytes)
-    for sf in sorted(source.glob("*.safetensors")):
+    for sf in _safetensor_files(source):
         st = sf.stat()
         h.update(sf.name.encode("utf-8"))
         h.update(str(st.st_size).encode("ascii"))
@@ -5256,7 +5342,7 @@ def _row_chunks_with_bounds(t, max_elems):
     rpc = max(1, max_elems // epr)
     for r0 in range(0, rows, rpc):
         r1 = min(rows, r0 + rpc)
-        if isinstance(t, _LazyTensor):
+        if hasattr(t, "_load_rows"):
             chunk = t._load_rows(r0, r1)
         else:
             chunk = t[r0:r1]
@@ -5275,7 +5361,7 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
     if importance is not None and _importance_is_uniform(importance):
         importance = None
     if importance is not None and mode == "affine":
-        if not isinstance(w, _LazyTensor) and w.size <= max_elems:
+        if not hasattr(w, "_load_rows") and w.size <= max_elems:
             return _weighted_affine_quantize(w, group_size, bits, importance)
         orig = tuple(w.shape)
         qws, scs, bis = [], [], []
@@ -5310,7 +5396,7 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
             biases = biases.reshape(*orig[:-1], -1)
         return qw, scales, biases
 
-    if not isinstance(w, _LazyTensor) and w.size <= max_elems:
+    if not hasattr(w, "_load_rows") and w.size <= max_elems:
         qw, scales, *rest = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
         return qw, scales, (rest[0] if rest else None)
     orig = tuple(w.shape)
@@ -5393,7 +5479,7 @@ def quantize_oq_streaming(
             quantized model self-consistent.
         auto_proxy_sensitivity: When True (default) and the source checkpoint
             exceeds 75% of live system/Metal calibration capacity,
-            automatically build a temporary uniform 4-bit proxy on disk and
+            automatically build a temporary compact quantized proxy on disk and
             run sensitivity measurement on it,
             preserving oQ's data-driven mixed-precision allocation. When
             False, the quantization aborts on RAM-exceeding models with a
@@ -5481,7 +5567,7 @@ def quantize_oq_streaming(
 
     cb("loading", 5.0, "Reading model config")
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _safetensor_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
@@ -5556,13 +5642,40 @@ def quantize_oq_streaming(
     def _ensure_ram_safe_proxy() -> Path:
         nonlocal _ram_safe_proxy_dir
         if _ram_safe_proxy_dir is None:
+            proxy_bits = _proxy_quant_bits(config)
+            proxy_estimate = _estimate_streaming_proxy_bytes(
+                all_weights,
+                config,
+                base_bits=proxy_bits,
+                text_only=text_only,
+                preserve_mtp=preserve_mtp,
+            )
+            model_limit = int(_calibration_budget["model_limit_bytes"])
+            if (
+                str(config.get("model_type", "")).lower() == "qwen4_exp"
+                and proxy_estimate > model_limit
+            ):
+                proxy_bits = 2
+                proxy_estimate = _estimate_streaming_proxy_bytes(
+                    all_weights,
+                    config,
+                    base_bits=proxy_bits,
+                    text_only=text_only,
+                    preserve_mtp=preserve_mtp,
+                )
+            if model_limit > 0 and proxy_estimate > model_limit:
+                raise RuntimeError(
+                    "smallest supported calibration proxy exceeds the live "
+                    f"memory limit (estimated proxy={_format_size(proxy_estimate)}, "
+                    f"limit={_format_size(model_limit)})"
+                )
             logger.warning(
                 f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
-                "full-model calibration limit. Building a uniform "
-                f"{_PROXY_QUANT_BITS}-bit proxy on disk for the calibration "
-                "passes."
+                "full-model calibration limit. Building a compact "
+                f"{proxy_bits}-bit proxy on disk for the calibration passes "
+                f"(estimated size={_format_size(proxy_estimate)})."
             )
             candidate = _build_proxy_for_sensitivity(
                 model_path,
@@ -5571,6 +5684,7 @@ def quantize_oq_streaming(
                 working_dir=str(output.parent),
                 trust_remote_code=trust_remote_code,
                 preserve_mtp=preserve_mtp,
+                proxy_bits=proxy_bits,
             )
             proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
             proxy_budget = _calibration_memory_budget(
@@ -5714,12 +5828,13 @@ def quantize_oq_streaming(
                 trust_remote_code=trust_remote_code,
             )
         elif _model_requires_proxy and auto_proxy_sensitivity:
+            proxy_bits = _proxy_quant_bits(config)
             logger.warning(
                 f"oQ{oq_level:g}: calibration footprint ({_format_size(_calibration_bytes)}) "
                 "exceeds the "
                 f"{_format_size(int(_calibration_budget['model_limit_bytes']))} "
-                "full-model calibration limit. Auto-building a uniform "
-                f"{_PROXY_QUANT_BITS}-bit proxy on disk so sensitivity "
+                "full-model calibration limit. Auto-building a compact "
+                f"{proxy_bits}-bit proxy on disk so sensitivity "
                 "measurement stays data-driven."
             )
             try:
@@ -6109,7 +6224,7 @@ def quantize_oq_streaming(
     cb("saving", 92.0, "Writing model metadata")
 
     if total_shards > 1:
-        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        total_size = sum(f.stat().st_size for f in _safetensor_files(output))
         index = {
             "metadata": {"total_size": total_size},
             "weight_map": dict(sorted(weight_map.items())),
@@ -7890,8 +8005,9 @@ def _build_proxy_for_sensitivity(
     working_dir: str | None = None,
     trust_remote_code: bool = False,
     preserve_mtp: bool = False,
+    proxy_bits: int | None = None,
 ) -> Path:
-    """Build a temporary uniform 4-bit proxy for calibration passes.
+    """Build a temporary compact quantized proxy for calibration passes.
 
     Used when the source model exceeds the live calibration budget and
     full-fp16 sensitivity measurement / oQe imatrix collection is not feasible. The
@@ -7919,8 +8035,61 @@ def _build_proxy_for_sensitivity(
         dtype=dtype,
         trust_remote_code=trust_remote_code,
         preserve_mtp=preserve_mtp,
+        proxy_bits=proxy_bits,
     )
     return proxy_dir
+
+
+def _estimate_streaming_proxy_bytes(
+    all_weights,
+    config: dict,
+    *,
+    base_bits: int,
+    text_only: bool,
+    preserve_mtp: bool,
+) -> int:
+    """Price a prospective calibration proxy without reading tensor data."""
+    sanitize_fn = _build_model_sanitizer(config, text_only=text_only)
+    view = all_weights
+    if sanitize_fn is not None:
+        plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+        view = _DiscoveredPlan(plan, all_weights)
+
+    proxy_config = {
+        **config,
+        "_oq_non_quantizable": _build_non_quantizable_set(config),
+        "_oq_use_budget_plan": False,
+        "_oq_boost_map": {},
+    }
+    total = 0
+    for tensor_name in view.keys():
+        shape = tuple(view.plan_shape(tensor_name))
+        if _should_skip_tensor(tensor_name, preserve_mtp=preserve_mtp):
+            continue
+        if text_only and (
+            _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
+        ):
+            continue
+        elements = math.prod(shape)
+        if _should_quantize_tensor(tensor_name, shape):
+            bits, group_size, mode = _get_predicate_bits(
+                tensor_name,
+                proxy_config,
+                base_bits,
+                _PROXY_QUANT_GROUP_SIZE,
+            )
+            if (
+                bits is not None
+                and len(shape) >= 2
+                and shape[-1] % group_size == 0
+            ):
+                total += _tensor_quantized_bytes(shape, bits, group_size, mode)
+                continue
+        # Passthroughs are BF16 in the released checkpoint except for tiny
+        # recurrent scalars. Two bytes is a deliberately close upper bound at
+        # the scale used for proxy admission.
+        total += elements * 2
+    return total
 
 
 def _build_streaming_proxy_for_sensitivity(
@@ -7930,14 +8099,17 @@ def _build_streaming_proxy_for_sensitivity(
     dtype: str,
     trust_remote_code: bool = False,
     preserve_mtp: bool = False,
+    proxy_bits: int | None = None,
 ) -> None:
-    """Build a loadable 4-bit sensitivity proxy without loading the source.
+    """Build a loadable sensitivity proxy without loading the source.
 
     This is the RAM-safe counterpart to ``mlx_lm.convert(..., quantize=True)``.
     It uses the same header-only tensor index, streaming sanitize discovery,
     FP8 dequantization, and chunked quantization path as oQ itself, but skips
     sensitivity measurement and dynamic boost planning. The proxy is only used
-    to rank layer sensitivity, so a compact uniform-ish 4-bit model is enough.
+    to rank layer sensitivity, so a compact low-bit model is enough. Most
+    architectures use Q4; Qwen4-Exp uses Q3 so its PLE table remains within
+    the calibration budget on a 128 GiB machine.
     """
     del trust_remote_code  # Kept for API symmetry; model code comes from config.
 
@@ -7951,12 +8123,16 @@ def _build_streaming_proxy_for_sensitivity(
     _validate_oq_dtype_for_model(config, dtype)
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
 
-    weight_files = sorted(source.glob("*.safetensors"))
+    weight_files = _safetensor_files(source)
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
 
     all_weights = _LazyTensorIndex(weight_files, config=config)
-    sanitize_fn = _build_model_sanitizer(config, text_only=False)
+    proxy_text_only = (
+        str(config.get("model_type", "")).lower().replace("-", "_")
+        in MLX_LM_TEXT_ONLY_MODEL_TYPES
+    )
+    sanitize_fn = _build_model_sanitizer(config, text_only=proxy_text_only)
     cast_predicate = getattr(sanitize_fn, "_omlx_cast_predicate", None)
     if sanitize_fn is not None:
         try:
@@ -7984,7 +8160,7 @@ def _build_streaming_proxy_for_sensitivity(
     weight_map = {}
     per_layer_config = {}
     tensor_names = list(all_weights.keys())
-    base_bits = _PROXY_QUANT_BITS
+    base_bits = proxy_bits if proxy_bits is not None else _proxy_quant_bits(config)
     base_gs = _PROXY_QUANT_GROUP_SIZE
     base_mode = "affine"
     quantization_config = {
@@ -8014,9 +8190,7 @@ def _build_streaming_proxy_for_sensitivity(
             if src_info is not None and _should_quantize_tensor(
                 tensor_name, all_weights.plan_shape(tensor_name)
             ):
-                pred = universal_quant_predicate(
-                    tensor_name, None, config, _PROXY_QUANT_BITS
-                )
+                pred = universal_quant_predicate(tensor_name, None, config, base_bits)
                 if pred is not False and base_bits >= src_info["bits"]:
                     qw, scales = all_weights.pop_packed(tensor_name)
                     base = tensor_name[: -len(".weight")]
@@ -8041,17 +8215,17 @@ def _build_streaming_proxy_for_sensitivity(
                 continue
 
             if _should_quantize_tensor(tensor_name, shape):
-                pred = universal_quant_predicate(
-                    tensor_name, None, config, _PROXY_QUANT_BITS
+                bits, gs, qmode = _get_predicate_bits(
+                    tensor_name, config, base_bits, base_gs
                 )
-                if pred is not False and len(shape) >= 2 and shape[-1] % base_gs == 0:
+                if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
                         and w_mx.dtype != target_dtype
                     ):
                         w_mx = w_mx.astype(target_dtype)
                     qw, scales, biases = _quantize_chunked(
-                        w_mx, base_gs, base_bits, base_mode
+                        w_mx, gs, bits, qmode
                     )
                     base = (
                         tensor_name[:-7]
@@ -8062,6 +8236,12 @@ def _build_streaming_proxy_for_sensitivity(
                     out_shard_data[f"{base}.scales"] = scales
                     if biases is not None:
                         out_shard_data[f"{base}.biases"] = biases
+                    if bits != base_bits or gs != base_gs or qmode != base_mode:
+                        per_layer_config[base] = {
+                            "bits": bits,
+                            "group_size": gs,
+                            "mode": qmode,
+                        }
                     del qw, scales, biases
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
@@ -8101,7 +8281,7 @@ def _build_streaming_proxy_for_sensitivity(
                     if value == old_name:
                         weight_map[key] = new_name
 
-        total_size = sum(f.stat().st_size for f in output.glob("*.safetensors"))
+        total_size = sum(f.stat().st_size for f in _safetensor_files(output))
         index = {
             "metadata": {"total_size": total_size},
             "weight_map": dict(sorted(weight_map.items())),
@@ -8119,6 +8299,8 @@ def _build_streaming_proxy_for_sensitivity(
         output_config.pop(temp_key, None)
     if not preserve_mtp:
         _normalize_mtp_in_config(output_config)
+    if proxy_text_only:
+        _normalize_text_only_in_config(output_config)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
@@ -8127,7 +8309,7 @@ def _build_streaming_proxy_for_sensitivity(
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
 
-    _copy_model_sidecars(source, output)
+    _copy_model_sidecars(source, output, text_only=proxy_text_only)
 
 
 def _measure_sensitivity_from_quantized_model(

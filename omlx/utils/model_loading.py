@@ -494,6 +494,12 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
+    if model_type == "qwen4_exp":
+        from ..patches.qwen4_exp import apply_qwen4_exp_patch
+
+        if apply_qwen4_exp_patch():
+            logger.info("Qwen4-Exp pre-load patch applied for %s", model_name)
+
     if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
