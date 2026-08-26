@@ -5800,6 +5800,7 @@ def quantize_oq_streaming(
                 progress_callback=cb,
                 progress_start=13.0,
                 progress_end=18.0,
+                require_mtp_entries=preserve_mtp,
                 load_path_factory=(
                     _imatrix_load_path if _model_requires_proxy else None
                 ),
@@ -7738,6 +7739,7 @@ def _load_or_collect_imatrix(
     progress_callback=None,
     progress_start: float = 13.0,
     progress_end: float = 18.0,
+    require_mtp_entries: bool = True,
     load_path_factory: Callable[[], str] | None = None,
 ) -> OQImatrixData:
     source = Path(model_path)
@@ -7752,7 +7754,7 @@ def _load_or_collect_imatrix(
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
         if _oqe_cache_matches(cache, expected):
-            if _oqe_cache_missing_mtp_entries(cache, config):
+            if require_mtp_entries and _oqe_cache_missing_mtp_entries(cache, config):
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
@@ -8491,6 +8493,16 @@ def _measure_sensitivity_from_quantized_model(
         if capped_samples != num_samples or capped_seq != seq_length:
             logger.info(
                 "GLM MoE DSA proxy sensitivity: capping calibration to "
+                f"{capped_samples} samples x {capped_seq} tokens"
+            )
+        num_samples = capped_samples
+        seq_length = capped_seq
+    elif config.get("model_type") == "qwen4_exp":
+        capped_samples = min(num_samples, 16)
+        capped_seq = min(seq_length, 128)
+        if capped_samples != num_samples or capped_seq != seq_length:
+            logger.info(
+                "Qwen4-Exp proxy sensitivity: capping calibration to "
                 f"{capped_samples} samples x {capped_seq} tokens"
             )
         num_samples = capped_samples
