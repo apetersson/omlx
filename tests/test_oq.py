@@ -2222,6 +2222,21 @@ class TestOQImatrixCollector:
         assert _imatrix_requires_expert_counts({"n_routed_experts": 256}, 0) is False
         assert _imatrix_requires_expert_counts({"n_routed_experts": 256}, 3) is True
 
+    def test_large_expert_set_allows_half_percent_cold_slots(self):
+        stats = {
+            "has_expert_counts": True,
+            "total_experts": 73_728,
+            "zero_count_experts": 300,
+            "p05_count": 16,
+        }
+        assert _imatrix_expert_coverage_sufficient(stats) is True
+
+        stats["zero_count_experts"] = 400
+        assert _imatrix_expert_coverage_sufficient(stats) is False
+
+        stats.update(total_experts=512, zero_count_experts=1)
+        assert _imatrix_expert_coverage_sufficient(stats) is False
+
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
     def test_quantized_switch_linear_capture_uses_logical_input_dims(self):
         class QuantizedSwitchLinear:

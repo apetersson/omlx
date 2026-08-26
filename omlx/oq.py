@@ -5171,8 +5171,19 @@ def _imatrix_expert_coverage_sufficient(
     if not stats.get("has_expert_counts", False):
         return not require_expert_counts
     required_key = f"p{_OQE_MIN_EXPERT_COUNT_PERCENTILE:02d}_count"
+    total = int(stats.get("total_experts", 0))
+    zero = int(stats.get("zero_count_experts", 0))
+    # Requiring literally every expert at every layer is appropriate for
+    # ordinary MoEs, but becomes a coupon-collector trap for Qwen4-Exp's
+    # 144 banks x 512 experts. For such large sets, permit at most 0.5% cold
+    # slots once the low-percentile count is healthy; their imatrix rows use
+    # the existing neutral fallback and do not distort observed experts.
+    zero_coverage_ok = zero == 0 or (
+        total >= _OQE_LARGE_EXPERT_SET
+        and zero / max(total, 1) <= _OQE_MAX_ZERO_EXPERT_FRACTION
+    )
     return (
-        int(stats.get("zero_count_experts", 0)) == 0
+        zero_coverage_ok
         and float(stats.get(required_key, 0.0)) >= _OQE_MIN_EXPERT_COUNT
     )
 
@@ -6352,6 +6363,8 @@ _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
+_OQE_LARGE_EXPERT_SET = 4096
+_OQE_MAX_ZERO_EXPERT_FRACTION = 0.005
 _OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
 _OQ_CODE_MULTILINGUAL_KEYS = (
     "code",
