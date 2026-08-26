@@ -5084,6 +5084,23 @@ class TestMeasureSensitivityQuantizedGroupSize:
         assert mx.array_equal(proj.scales, scales_before)
         assert mx.array_equal(proj.biases, biases_before)
 
+    def test_q2_proxy_is_perturbed_by_coarsening_group_size(self, monkeypatch):
+        model, proj = _toy_quantized_model(128, 64, 2, "affine")
+        weight_before, scales_before, biases_before = (
+            proj.weight,
+            proj.scales,
+            proj.biases,
+        )
+
+        result = self._measure(monkeypatch, model)
+
+        assert set(result) == {0}
+        assert result[0] > 0
+        assert (proj.group_size, proj.bits, proj.mode) == (64, 2, "affine")
+        assert mx.array_equal(proj.weight, weight_before)
+        assert mx.array_equal(proj.scales, scales_before)
+        assert mx.array_equal(proj.biases, biases_before)
+
     def test_row_no_affine_group_size_divides_is_skipped(self, monkeypatch):
         # 48 is a legal nvfp4 row (48 % 16 == 0) but no affine group size
         # divides it, so clamping alone would trade one mx.quantize ValueError

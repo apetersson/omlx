@@ -122,6 +122,40 @@ def test_cached_decode_matches_full_forward():
     )
 
 
+def test_calibration_layer_walk_matches_native_text_model():
+    from omlx.oq import _forward_layer_result, _prepare_layer_inputs
+
+    module = _load_module()
+    mx.random.seed(17)
+    model = module.Model(module.ModelArgs.from_dict(_tiny_config()))
+    model.eval()
+    tokens = mx.array([[5, 9, 3, 11]], dtype=mx.int32)
+
+    expected = model.model(tokens)
+    embedded = model.model.embed_tokens(tokens)
+    hidden, masks, state = _prepare_layer_inputs(
+        model, model.model.layers, tokens, embedded
+    )
+
+    assert state["kind"] == "qwen4_exp"
+    assert hidden.shape[-1] == embedded.shape[-1] * model.text_args.hc_count
+    for layer_idx, layer in enumerate(model.model.layers):
+        hidden, _ = _forward_layer_result(
+            layer,
+            hidden,
+            masks[layer_idx],
+            state,
+            layer_idx=layer_idx,
+        )
+        assert hidden is not None
+    actual = model.model.hyper_connection_mixer(hidden)
+    mx.eval(expected, actual)
+
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), rtol=2e-4, atol=2e-4
+    )
+
+
 def test_runtime_supports_continuous_batch_generation():
     module = _load_module()
     from mlx_lm.generate import BatchGenerator

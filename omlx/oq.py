@@ -6889,6 +6889,23 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
                 f"{type(block).__name__}: {e}"
             )
             return None, None
+    if isinstance(position_ids, dict) and position_ids.get("kind") == "qwen4_exp":
+        try:
+            result = block(
+                inputs,
+                position_ids["input_ids"],
+                mask=mask,
+                cache=None,
+            )
+            if isinstance(result, tuple):
+                return result[0], result[1] if len(result) > 1 else None
+            return result, None
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            logger.debug(
+                f"_forward_layer: Qwen4-Exp signature failed for "
+                f"{type(block).__name__}: {e}"
+            )
+            return None, None
 
     last_exc = None
     for call_args in [
@@ -7061,6 +7078,18 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
         # generic signature probe only lands on ``(inputs,)`` after four
         # caught exceptions per layer.
         return inputs, [None] * len(layers), {"kind": "inkling"}
+    if model_type == "qwen4_exp":
+        core = getattr(model, "model", model)
+        args = getattr(core, "args", None)
+        hc_count = int(getattr(args, "hc_count", 1))
+        # Qwen4 expands the embedding into its hyper-connection streams
+        # before decoder layer 0, and every block takes the original token
+        # ids as its second positional argument for PLE hashing.
+        inputs = mx.tile(inputs, (1, 1, hc_count))
+        return inputs, [None] * len(layers), {
+            "kind": "qwen4_exp",
+            "input_ids": calib_data,
+        }
     masks = _layer_masks_for_model(model, layers, inputs)
     position_ids = mx.arange(calib_data.shape[1])[None, :]
     return inputs, masks, position_ids
@@ -8526,7 +8555,7 @@ def _measure_sensitivity_from_quantized_model(
             # 8-bit module (7 is not a valid width), which made the whole
             # measurement a no-op on 8-bit-dominated checkpoints.
             perturb_bits = _perturb_bits_for(bits)
-            if perturb_bits is None:
+            if perturb_bits is None and bits != 2:
                 continue
             w_float = mx.dequantize(
                 m.weight,
@@ -8536,9 +8565,26 @@ def _measure_sensitivity_from_quantized_model(
                 bits=bits,
                 mode=mode,
             )
-            # Affine kernels only ship group sizes 32/64/128, so the module's
-            # own size cannot always be reused for the perturbation re-quant.
-            perturb_gs = _affine_perturb_group_size(gs, w_float.shape[-1])
+            if bits == 2:
+                # Q2 is MLX's lowest bit-width, so a lower-bit perturbation
+                # does not exist. Calibration-only Q2 proxies still need a
+                # data-driven ranking: coarsen their affine grouping instead
+                # (g32->g64 or g64->g128), which adds a small, repeatable QDQ
+                # error while keeping the proxy loadable in the same memory.
+                coarser = [
+                    candidate
+                    for candidate in _AFFINE_GROUP_SIZES
+                    if candidate > gs and w_float.shape[-1] % candidate == 0
+                ]
+                if not coarser:
+                    continue
+                perturb_bits = 2
+                perturb_gs = min(coarser)
+            else:
+                # Affine kernels only ship group sizes 32/64/128, so the
+                # module's own size cannot always be reused for the
+                # perturbation re-quant.
+                perturb_gs = _affine_perturb_group_size(gs, w_float.shape[-1])
             if perturb_gs is None:
                 logger.debug(
                     f"Sensitivity perturbation skipped for {p}: no affine group "
