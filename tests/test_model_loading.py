@@ -801,6 +801,38 @@ class TestExpandPerLayerQuantKeys:
 
 
 class TestMaterializeLazyState:
+    def test_batches_large_state_and_deduplicates_arrays(self, monkeypatch):
+        """Large lazy trees must not become one unbounded Metal command."""
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        from omlx.utils.model_loading import materialize_lazy_state
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = mx.arange(4, dtype=mx.uint8)
+                self.second = mx.arange(4, dtype=mx.uint8)
+                # Plain-object scanning sees this alias after tree_flatten;
+                # it must not schedule the same array twice.
+                self._alias = self.first
+
+        calls: list[list[mx.array]] = []
+        monkeypatch.setattr(mx, "eval", lambda values: calls.append(list(values)))
+
+        materialize_lazy_state(_Model(), max_batch_bytes=4)
+
+        assert [len(call) for call in calls] == [1, 1]
+        assert len({id(array) for call in calls for array in call}) == 2
+
+    def test_rejects_non_positive_batch_limit(self):
+        import mlx.nn as nn
+
+        from omlx.utils.model_loading import materialize_lazy_state
+
+        with pytest.raises(ValueError, match="must be positive"):
+            materialize_lazy_state(nn.Linear(2, 2), max_batch_bytes=0)
+
     def test_covers_arrays_in_plain_helper_objects(self):
         """Lazy arrays hidden in non-Module helpers must be materialized.
 

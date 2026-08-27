@@ -1,6 +1,7 @@
 import importlib
 import json
 import sys
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import numpy as np
@@ -82,6 +83,26 @@ def test_patch_is_idempotent():
     assert second is False
 
 
+def test_tokenizer_patch_avoids_unknown_model_config_warning(tmp_path, monkeypatch):
+    import mlx_lm.tokenizer_utils as tokenizer_utils
+    from transformers import PreTrainedConfig
+
+    import omlx.patches.qwen4_exp as qwen4_patch
+
+    (tmp_path / "config.json").write_text(json.dumps(_tiny_config()))
+    original = MagicMock()
+    original.from_pretrained.return_value = object()
+    monkeypatch.setattr(tokenizer_utils, "AutoTokenizer", original)
+    monkeypatch.setattr(qwen4_patch, "_TOKENIZER_PATCHED", False)
+
+    qwen4_patch._patch_tokenizer()
+    tokenizer_utils.AutoTokenizer.from_pretrained(tmp_path)
+
+    call = original.from_pretrained.call_args
+    assert isinstance(call.kwargs["config"], PreTrainedConfig)
+    assert call.kwargs["config"].model_type == ""
+
+
 def test_runtime_parameter_layout_matches_sanitized_checkpoint():
     module = _load_module()
     model = module.Model(module.ModelArgs.from_dict(_tiny_config()))
@@ -99,6 +120,18 @@ def test_runtime_parameter_layout_matches_sanitized_checkpoint():
         "lm_head.weight",
     }
     assert expected <= keys
+
+
+def test_runtime_does_not_resanitize_converted_checkpoint_norms():
+    module = _load_module()
+    config = _tiny_config()
+    config["omlx_qwen4_weights_sanitized"] = True
+    model = module.Model(module.ModelArgs.from_dict(config))
+    key = "model.layers.0.attn_hyper_connection.hc_norm.weight"
+
+    sanitized = model.sanitize({key: mx.ones((64,))})
+
+    assert mx.all(sanitized[key] == 1.0).item()
 
 
 def test_cached_decode_matches_full_forward():

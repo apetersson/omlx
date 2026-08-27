@@ -110,6 +110,7 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
     omlx_qwen4_ngram_groups: int = DEFAULT_RUNTIME_GROUPS
+    omlx_qwen4_weights_sanitized: bool = False
 
     @classmethod
     def from_dict(cls, params):
@@ -119,6 +120,9 @@ class ModelArgs(BaseModelArgs):
                 text_config=params,
                 omlx_qwen4_ngram_groups=int(
                     params.get("omlx_qwen4_ngram_groups", DEFAULT_RUNTIME_GROUPS)
+                ),
+                omlx_qwen4_weights_sanitized=bool(
+                    params.get("omlx_qwen4_weights_sanitized", False)
                 ),
             )
         return super().from_dict(params)
@@ -762,6 +766,7 @@ class Model(nn.Module):
                 "omlx_qwen4_ngram_groups": self.args.omlx_qwen4_ngram_groups,
             },
             text_only=True,
+            already_sanitized=self.args.omlx_qwen4_weights_sanitized,
         )
 
     @property

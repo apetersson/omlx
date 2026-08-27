@@ -38,12 +38,20 @@ _REMOTE_CODE_METADATA_PATTERNS = [
 def _mlx_lm_load_accepts_trust_remote_code() -> bool:
     try:
         import inspect
+
         from mlx_lm import load as _lm_load
+
         return "trust_remote_code" in inspect.signature(_lm_load).parameters
     except Exception:
         return False
 
 _LM_LOAD_ACCEPTS_TRC = _mlx_lm_load_accepts_trust_remote_code()
+
+# Keep a single materialization command comfortably below the multi-second
+# Metal watchdog window.  Arrays larger than this are evaluated alone; Qwen4-
+# Exp's largest oQ4e leaves are about 1.49 GiB, while the complete checkpoint
+# is about 97 GiB.
+_MATERIALIZE_BATCH_BYTES = 1 * 1024**3
 
 
 def ensure_model_code_trusted(
@@ -1033,7 +1041,9 @@ def load_text_model(
     )
 
 
-def materialize_lazy_state(model: Any) -> None:
+def materialize_lazy_state(
+    model: Any, *, max_batch_bytes: int = _MATERIALIZE_BATCH_BYTES
+) -> None:
     """Force-evaluate every mx.array in the model tree on the loader thread.
 
     mlx-vlm's load() runs `mx.eval(model.language_model.parameters())`, which
@@ -1080,8 +1090,58 @@ def materialize_lazy_state(model: Any) -> None:
             ):
                 _scan_plain_object(value)
 
-    if arrays:
-        mx.eval(arrays)
+    if not arrays:
+        return
+
+    if max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be positive")
+
+    # The tree and the plain-helper scan can expose the same array more than
+    # once.  Besides wasting work, duplicate leaves make the command-size
+    # accounting inaccurate, so preserve order while evaluating each object
+    # only once.
+    unique_arrays: list[mx.array] = []
+    seen: set[int] = set()
+    for array in arrays:
+        identity = id(array)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique_arrays.append(array)
+
+    batches = 0
+    batch: list[mx.array] = []
+    batch_bytes = 0
+
+    def _flush() -> None:
+        nonlocal batches, batch, batch_bytes
+        if not batch:
+            return
+        mx.eval(batch)
+        batches += 1
+        batch = []
+        batch_bytes = 0
+
+    for array in unique_arrays:
+        array_bytes = int(array.nbytes)
+        if batch and batch_bytes + array_bytes > max_batch_bytes:
+            _flush()
+        batch.append(array)
+        batch_bytes += array_bytes
+        # Evaluate an oversized leaf by itself instead of combining it with
+        # any following arrays.  The leaf cannot be subdivided without
+        # retaining a lazy parent operation.
+        if array_bytes >= max_batch_bytes:
+            _flush()
+
+    _flush()
+    if batches > 1:
+        logger.info(
+            "Materialized %d arrays in %d Metal batches (limit %.2f GiB)",
+            len(unique_arrays),
+            batches,
+            max_batch_bytes / 1024**3,
+        )
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:

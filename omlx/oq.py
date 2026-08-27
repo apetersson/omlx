@@ -5663,7 +5663,7 @@ def quantize_oq_streaming(
     # soon as the last calibration pass is done.
     _ram_safe_proxy_dir: Path | None = None
 
-    def _ensure_ram_safe_proxy() -> Path:
+    def _ensure_ram_safe_proxy(source_weights=all_weights) -> Path:
         nonlocal _ram_safe_proxy_dir
         if _ram_safe_proxy_dir is None:
             proxy_bits = _proxy_quant_bits(config)
@@ -5675,7 +5675,7 @@ def quantize_oq_streaming(
             proxy_bits_override = None
             if qwen4_exp_proxy:
                 proxy_estimate = _estimate_streaming_proxy_bytes(
-                    all_weights,
+                    source_weights,
                     config,
                     base_bits=proxy_bits,
                     text_only=text_only,
@@ -5684,7 +5684,7 @@ def quantize_oq_streaming(
                 if proxy_estimate > model_limit:
                     proxy_bits = 2
                     proxy_estimate = _estimate_streaming_proxy_bytes(
-                        all_weights,
+                        source_weights,
                         config,
                         base_bits=proxy_bits,
                         text_only=text_only,
@@ -6294,6 +6294,11 @@ def quantize_oq_streaming(
         output_config.pop(temp_key, None)
     if text_only:
         _normalize_text_only_in_config(output_config)
+    if normalized_model_type == "qwen4_exp":
+        # Qwen4's sanitizer converts zero-centered RMSNorm weights and Conv1d
+        # layout before tensors are quantized/saved.  Persist that fact so the
+        # runtime does not apply those non-idempotent transforms a second time.
+        output_config["omlx_qwen4_weights_sanitized"] = True
     if not preserve_mtp:
         # Default path: zero out MTP layer counts so the quantized model
         # doesn't claim to have an MTP head while its weights have been

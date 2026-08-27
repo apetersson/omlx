@@ -270,6 +270,13 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                # BatchedEngine materializes the complete model tree below on
+                # the global MLX loader thread.  Letting mlx-lm eagerly call
+                # mx.eval(model.parameters()) here creates one command buffer
+                # for the entire checkpoint.  Very large models (notably the
+                # 97 GiB Qwen4-Exp oQ4e checkpoint) can exceed the macOS Metal
+                # watchdog before oMLX gets a chance to batch that work.
+                lazy=True,
             )
 
         loop = asyncio.get_running_loop()

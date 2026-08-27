@@ -68,7 +68,13 @@ def _group_raw_ngram_shards(weights: dict, config: dict) -> dict:
     return weights
 
 
-def sanitize_weights(weights: dict, config: dict, *, text_only: bool = False) -> dict:
+def sanitize_weights(
+    weights: dict,
+    config: dict,
+    *,
+    text_only: bool = False,
+    already_sanitized: bool = False,
+) -> dict:
     """Map Hugging Face Qwen4-Exp weights onto oMLX module names."""
     weights = _group_raw_ngram_shards(dict(weights), config)
     text = config.get("text_config") or {}
@@ -105,9 +111,17 @@ def sanitize_weights(weights: dict, config: dict, *, text_only: bool = False) ->
             elif key.startswith("lm_head"):
                 key = key.replace("lm_head", "language_model.lm_head", 1)
 
-        if "conv1d.weight" in key and value.shape[-1] != 1:
+        if (
+            not already_sanitized
+            and "conv1d.weight" in key
+            and value.shape[-1] != 1
+        ):
             value = value.moveaxis(2, 1)
-        if _is_text_norm(key) and getattr(value, "ndim", 0) == 1:
+        if (
+            not already_sanitized
+            and _is_text_norm(key)
+            and getattr(value, "ndim", 0) == 1
+        ):
             value = value + 1.0
         sanitized[key] = value
 

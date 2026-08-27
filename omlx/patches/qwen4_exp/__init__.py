@@ -44,27 +44,24 @@ def _patch_tokenizer() -> None:
     class Qwen4AwareAutoTokenizer:
         @staticmethod
         def from_pretrained(model_path, *args, **kwargs):
+            config_path = Path(model_path) / "config.json"
             try:
-                return original.from_pretrained(model_path, *args, **kwargs)
-            except (AttributeError, ValueError) as exc:
-                config_path = Path(model_path) / "config.json"
-                try:
-                    is_qwen4 = (
-                        json.loads(config_path.read_text()).get("model_type")
-                        == "qwen4_exp"
-                    )
-                except Exception:
-                    is_qwen4 = False
-                if not is_qwen4 or "config" in kwargs:
-                    raise
-                logger.warning(
-                    "Transformers does not yet recognize qwen4_exp; using its "
-                    "published tokenizer files with a generic config (%s)",
-                    exc,
+                is_qwen4 = (
+                    json.loads(config_path.read_text()).get("model_type")
+                    == "qwen4_exp"
                 )
-                return original.from_pretrained(
-                    model_path, *args, config=PreTrainedConfig(), **kwargs
-                )
+            except Exception:
+                is_qwen4 = False
+
+            # Transformers 5 falls back to PreTrainedConfig for an unknown
+            # model type. Letting it discover that fallback itself emits a
+            # misleading architecture-mismatch warning because the generic
+            # config's model_type is the empty string. The tokenizer metadata
+            # already names Qwen2Tokenizer, so supply that same generic config
+            # explicitly until Transformers ships qwen4_exp.
+            if is_qwen4 and "config" not in kwargs:
+                kwargs["config"] = PreTrainedConfig()
+            return original.from_pretrained(model_path, *args, **kwargs)
 
     tokenizer_utils.AutoTokenizer = Qwen4AwareAutoTokenizer
     _TOKENIZER_PATCHED = True

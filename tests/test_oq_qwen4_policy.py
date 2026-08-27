@@ -101,6 +101,20 @@ def test_qwen4_gated_delta_norm_is_not_zero_centered():
     assert mx.all(got["model.layers.0.linear_attn.norm.weight"] == 1.0).item()
 
 
+def test_qwen4_already_sanitized_norm_is_not_shifted_again():
+    from omlx.patches.qwen4_exp.sanitize import sanitize_weights
+
+    key = "model.layers.0.attn_hyper_connection.hc_norm.weight"
+    got = sanitize_weights(
+        {key: mx.ones((128,))},
+        dict(CONFIG),
+        text_only=True,
+        already_sanitized=True,
+    )
+
+    assert mx.all(got[key] == 1.0).item()
+
+
 def test_qwen4_raw_ngram_shards_group_during_sanitize():
     weights = {}
     for shard in range(4):
