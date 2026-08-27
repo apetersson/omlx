@@ -36,12 +36,12 @@ def register_virtual_tensors(index, config) -> int:
     quantized silently.
     """
     from .mimo_v2.virtual_qkv import register as register_mimo_v2_qkv
-    from .qwen4_exp.virtual_ngram import register as register_qwen4_exp_ngram
+    from .mlx_vlm_qwen4_exp_compat.virtual_ple import (
+        register as register_qwen4_exp_ple,
+    )
 
     # Import errors are deliberately not caught. A registrar that fails to
     # load leaves its checkpoint in the layout the quantizer cannot read, so
     # swallowing that would turn a packaging fault into a silently wrong
     # quantization.
-    return register_mimo_v2_qkv(index, config) + register_qwen4_exp_ngram(
-        index, config
-    )
+    return register_mimo_v2_qkv(index, config) + register_qwen4_exp_ple(index, config)
