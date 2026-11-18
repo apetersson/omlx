@@ -7,6 +7,8 @@
 </p>
 
 <h1 align="center">oMLX</h1>
+
+**Fork feature:** [Hy4 Flash: oQh8 conversion and single-sequence text inference](docs/hy4-flash.md).
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
 
 <p align="center">

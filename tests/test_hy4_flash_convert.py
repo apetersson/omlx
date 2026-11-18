@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Offline synthetic tests of the pinned Hy4 Flash conversion path (no downloads)."""
 
 import hashlib
@@ -383,7 +384,10 @@ def test_no_overwrite_or_source_alias(snapshot):
         c.build(s.src, alias / "do-not-create")
 
 
-@pytest.mark.parametrize("field, bad", [("dtype", []), ("shape", [True]), ("shape", [1] * 1000), ("data_offsets", None)])
+@pytest.mark.parametrize(
+    "field, bad",
+    [("dtype", []), ("shape", [True]), ("shape", [1] * 1000), ("data_offsets", None)],
+)
 def test_malformed_header_fails_closed(tmp_path, field, bad):
     path = tmp_path / "malformed.header"
     entry = {"dtype": "I32", "shape": [1], "data_offsets": [0, 4], field: bad}

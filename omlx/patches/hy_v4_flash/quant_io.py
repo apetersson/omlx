@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Bounded little-endian safetensors I/O for Hy4 Flash (no model or mmap).
 
 The header reader is also usable by the runtime. It returns absolute byte

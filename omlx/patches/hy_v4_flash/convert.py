@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Convert the pinned public Tencent Hy4-flash BF16 instruct snapshot, offline.
 
     omlx hy4-flash convert --source SNAPSHOT --dry-run
@@ -22,6 +23,7 @@ One source and at most one destination shard open at a time, one row-aligned
 chunk on MLX; metadata scales with key count. A chunk bound is not a process
 RSS limit. MLX's free allocation cache is disabled for the packing loop. Core
 shards are read back before publishing the entire new directory atomically.
+The manifest is a local integrity record, not a signed distribution attestation.
 """
 
 from __future__ import annotations
