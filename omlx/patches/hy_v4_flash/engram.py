@@ -175,12 +175,20 @@ class EngramLayer(nn.Module):
             raise RuntimeError("bind a verified Engram table provider before inference")
         if streams.shape != (*ngram_tokens.shape[:2], self.hc_mult, self.hidden_size):
             raise ValueError("Engram hidden streams and n-gram positions disagree")
-        rows = self.hash_ngrams(ngram_tokens) + self._offsets
-        x = self._tables.gather(self.block, rows)
+        if hasattr(ngram_tokens, "tokens"):
+            from .prepared_engram import PreparedEngrams
+
+            if not isinstance(ngram_tokens, PreparedEngrams):
+                raise TypeError("unrecognized prepared Engram input")
+            x = ngram_tokens.take(self, streams)
+            ngram_tokens = ngram_tokens.tokens
+        else:
+            rows = self.hash_ngrams(ngram_tokens) + self._offsets
+            x = self._tables.gather(self.block, rows)
         if (
             not isinstance(x, mx.array)
             or x.dtype != mx.bfloat16
-            or x.shape != (*rows.shape, self.head_dim)
+            or x.shape != (*ngram_tokens.shape[:2], self.num_heads, self.head_dim)
         ):
             raise ValueError(
                 "Engram provider must return one original BF16 vector per requested row"

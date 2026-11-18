@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import defaultdict
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 from .artifact import Artifact, member
@@ -99,6 +99,28 @@ def load_weights(model, artifact, experts=None):
         del weights
 
 
+def prepare_fp32_head(model):
+    """Materialize the reference FP32 output weight once, never cast the embedding.
+
+    Hy4 stores its untied output head as BF16, but the reference matmul is FP32.
+    Replace the in-memory parameter (not the checkpoint); steady-state growth is
+    one original head. Fail closed if the model explicitly requests another mode.
+    """
+    import mlx.core as mx
+
+    if model.args.tie_word_embeddings or not model.args.enable_lm_head_fp32:
+        raise ValueError("precast requires an untied reference FP32 LM head")
+    old = model.lm_head.weight
+    if old.dtype == mx.float32:
+        return 0
+    if old.dtype != mx.bfloat16 or old.ndim != 2:
+        raise ValueError("expected an untied BF16 output matrix")
+    promoted = old.astype(mx.float32)
+    mx.eval(promoted)
+    model.lm_head.weight = promoted
+    return promoted.nbytes - old.nbytes
+
+
 def greedy(model, ids, *, eos, count, chunk):
     """Greedy generation with a fresh request cache and distinct prefill/decode timers."""
     import mlx.core as mx
@@ -153,6 +175,12 @@ def generate(args, artifact):
         or args.expert_cache_gib < 0
     ):
         raise ValueError("invalid token, prefill chunk, or expert cache bound")
+    cache_impl = getattr(args, "expert_cache_impl", "bounded")
+    prepare = getattr(args, "prepare_engrams", False)
+    if cache_impl not in ("bounded", "slots") or (
+        cache_impl == "slots" and not args.expert_cache_gib
+    ):
+        raise ValueError("slots require a positive --expert-cache-gib budget")
     tok, ids = render_user(
         artifact, args.prompt, args.raw_prompt, args.reasoning_effort
     )
@@ -172,9 +200,12 @@ def generate(args, artifact):
             previous_cache_limit = mx.set_cache_limit(0)
             stack.callback(mx.set_cache_limit, previous_cache_limit)
             mx.clear_cache()
-            from .bounded import install_bounded_experts
+            if cache_impl == "slots":
+                from .slot_cache import install_slot_experts as install
+            else:
+                from .bounded import install_bounded_experts as install
 
-            experts = install_bounded_experts(
+            experts = install(
                 model,
                 artifact.root,
                 artifact.config,
@@ -183,6 +214,8 @@ def generate(args, artifact):
             )
             stack.callback(experts.close)
         load_weights(model, artifact, experts)
+        precast = getattr(args, "precast_lm_head", False)
+        head_growth = prepare_fp32_head(model) if precast else 0
         with open_tables(
             artifact.root / "manifest.json",
             first_root=args.source,
@@ -190,10 +223,17 @@ def generate(args, artifact):
             receipt=args.receipt,
         ) as provider:
             model.set_engram_tables(provider)
-            setup_seconds = time.monotonic() - setup
-            tokens, metrics = greedy(
-                model, ids, eos=eos, count=args.max_tokens, chunk=args.prefill_chunk
-            )
+            if prepare:
+                from .prepared_engram import install_prepared_engram
+
+                preparation = install_prepared_engram(model)
+            else:
+                preparation = nullcontext()
+            with preparation:
+                setup_seconds = time.monotonic() - setup
+                tokens, metrics = greedy(
+                    model, ids, eos=eos, count=args.max_tokens, chunk=args.prefill_chunk
+                )
             text = tok.decode(tokens, skip_special_tokens=True)
             result = {
                 "text": text,
@@ -203,6 +243,10 @@ def generate(args, artifact):
                 "engram": provider.stats(),
                 "mlx_peak_bytes": mx.get_peak_memory(),
                 "expert_mode": "bounded" if experts else "resident",
+                "expert_cache_impl": cache_impl if experts else "resident",
+                "prepare_engrams": prepare,
+                "precast_lm_head": precast,
+                "lm_head_extra_resident_bytes": head_growth,
             }
             if experts:
                 result["expert_cache"] = experts.stats
@@ -289,7 +333,23 @@ def main(argv=None):
                 "--expert-cache-gib",
                 type=int,
                 default=0,
-                help="0: resident experts (fast); positive: bounded expert reads",
+                help="0: resident experts; positive: cache budget in GiB",
+            )
+            a.add_argument(
+                "--expert-cache-impl",
+                choices=["bounded", "slots"],
+                default="bounded",
+                help="bounded LRU (default) or preallocated expert slots (opt-in)",
+            )
+            a.add_argument(
+                "--prepare-engrams",
+                action="store_true",
+                help="prepare token-only Engram gathers before the decoder layers (opt-in)",
+            )
+            a.add_argument(
+                "--precast-lm-head",
+                action="store_true",
+                help="keep the reference FP32 vocabulary projection resident (+0.69 GiB)",
             )
             a.add_argument(
                 "--json",

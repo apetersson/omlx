@@ -388,7 +388,12 @@ class Model(nn.Module):
                 self.args.engram_max_ngram_size,
                 self.args.engram_pad_id,
             )
-        hidden = self.model(input_ids, ngrams, cache)
+        prep = getattr(self, "_engram_preparer", None)
+        if prep is not None and ngrams is not None:
+            with prep.batch(ngrams) as prepared:
+                hidden = self.model(input_ids, prepared, cache)
+        else:
+            hidden = self.model(input_ids, ngrams, cache)
         if cache is not None:
             cache.history = history
             cache.offset += length
