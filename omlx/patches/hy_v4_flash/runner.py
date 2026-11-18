@@ -84,7 +84,17 @@ def load_weights(model, artifact, experts=None):
                 or array.dtype != dtypes[header[n].spec.dtype]
             ):
                 raise ValueError(f"wrong tensor type or shape: {n}")
-        model.load_weights(list(weights.items()), strict=False)
+        # A shard may contain only item 3 of a list whose earlier items came
+        # from other shards. MLX tree_unflatten fills that sparse list with
+        # empty dicts: load_weights(strict=False) can overwrite live arrays.
+        # Replace validated leaves in the existing tree, never its containers.
+        for name, array in weights.items():
+            parent = model
+            parts = name.split(".")
+            for part in parts[:-1]:
+                parent = parent[int(part) if isinstance(parent, list) else part]
+            leaf = int(parts[-1]) if isinstance(parent, list) else parts[-1]
+            parent[leaf] = array
         mx.eval(list(weights.values()))
         del weights
 
@@ -214,6 +224,10 @@ def generate(args, artifact):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["stage-tables"]:
+        from .stage import main as stage
+
+        return stage(argv[1:])
     if argv[:1] == ["convert"]:
         from .convert import main as convert
 
@@ -221,6 +235,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="omlx hy4-flash", description=__doc__)
     subs = p.add_subparsers(dest="command", required=True)
     subs.add_parser("convert", help="stream and verify an oQh8 text export")
+    subs.add_parser("stage-tables", help="verify and stage only the three late tables")
     for cmd, helptext in [
         ("inspect", "check the local oQh export"),
         ("verify-tables", "authenticate the four BF16 source files"),

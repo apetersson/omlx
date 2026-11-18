@@ -98,6 +98,26 @@ def test_strict_physical_shape_loading(tmp_path):
         load_weights(layer, art)
 
 
+def test_shards_preserve_previously_assigned_array_list_entries(tmp_path):
+    class Four(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scales = [mx.zeros((1,)) for _ in range(4)]
+
+    model = Four()
+    index = {}
+    for i in range(4):
+        name = f"scales.{i}"
+        index[name] = f"shard-{i}.safetensors"
+        mx.save_safetensors(
+            str(tmp_path / index[name]),
+            {name: mx.array([float(i + 10)])},
+            metadata={"format": "mlx"},
+        )
+    load_weights(model, SimpleNamespace(root=tmp_path, weight_map=index))
+    assert mx.stack(model.scales).tolist() == [[10], [11], [12], [13]]
+
+
 def test_greedy_does_not_redecode_prompt_or_eos():
     class Next:
         def __init__(self):

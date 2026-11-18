@@ -20,6 +20,8 @@ The converted directory is **not standalone**. Keep the original first Engram sh
 
 ~~~sh
 umask 077
+# The parent of $SSD must exist. --check preflights without copying.
+python -m omlx.cli hy4-flash stage-tables --model "$OUT" --source "$SRC" --ssd-dir "$SSD"
 python -m omlx.cli hy4-flash verify-tables --model "$OUT" --source "$SRC" --ssd-dir "$SSD" --receipt "$RECEIPT"
 # Set MLX_ENABLE_TF32 before importing MLX for strict FP32 routing/indexer reproducibility.
 MLX_ENABLE_TF32=0 python -m omlx.cli hy4-flash generate \
