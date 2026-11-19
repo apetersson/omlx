@@ -221,6 +221,7 @@ def generate(args, artifact):
             first_root=args.source,
             late_root=args.ssd_dir,
             receipt=args.receipt,
+            first_mode=getattr(args, "first_engram", "mlock"),
         ) as provider:
             model.set_engram_tables(provider)
             if prepare:
@@ -345,6 +346,12 @@ def main(argv=None):
                 "--prepare-engrams",
                 action="store_true",
                 help="prepare token-only Engram gathers before the decoder layers (opt-in)",
+            )
+            a.add_argument(
+                "--first-engram",
+                choices=("mlock", "pread"),
+                default="mlock",
+                help="wire the first Engram table (default) or read its rows on demand",
             )
             a.add_argument(
                 "--precast-lm-head",

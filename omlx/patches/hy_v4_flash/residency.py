@@ -456,7 +456,7 @@ class EngramTables:
             unique, inverse = np.unique(ids.ravel(), return_inverse=True)
             try:
                 t.unchanged()
-                if block == _BLOCKS[0]:
+                if block == _BLOCKS[0] and self._hot is not None:
                     values = self._hot.read_rows(s, unique)
                 else:
                     values = np.empty((len(unique), s.width), dtype="<u2")
@@ -481,12 +481,13 @@ class EngramTables:
         """Logical demand counters, not physical SSD sector or VM-cache I/O."""
         with self._lock:
             live = self._release.alive
-            pages = self._hot.pages if live else 0
+            wired = self._hot is not None
+            pages = self._hot.pages if live and wired else 0
             blocks = {}
             for block, t in self._files.items():
                 s = t.spec
                 blocks[str(block)] = dict(
-                    mode="mlock" if block == _BLOCKS[0] else "pread",
+                    mode="mlock" if block == _BLOCKS[0] and wired else "pread",
                     source_shard=s.shard,
                     source_offset=s.offset,
                     byte_length=s.length,
@@ -504,17 +505,24 @@ class EngramTables:
                 page_size=mmap.PAGESIZE,
                 first_locked_bytes=pages * mmap.PAGESIZE,
                 first_pages=pages,
-                first_resident_pages=self._hot.check_residency() if live else 0,
+                first_mode="mlock" if wired else "pread",
+                first_resident_pages=self._hot.check_residency() if live and wired else 0,
                 blocks=blocks,
             )
 
 
-def open_tables(manifest, *, first_root, late_root, receipt) -> EngramTables:
+def open_tables(
+    manifest, *, first_root, late_root, receipt, first_mode="mlock"
+) -> EngramTables:
     """Reopen previously verified immutable inputs, then wire only the first file.
+
+    first_mode="pread" never maps or wires the first table either; it is read
+    row by row like the late tables, trading a little I/O for ~31.7 GB of RAM.
 
     No external path or identity hint in a converted artifact chooses a root.
     No fallback from a bad/missing receipt, failed lock or missing SSD shard.
     """
+    _require(first_mode in ("mlock", "pread"), "unknown first Engram table mode")
     doc, digest = _document(manifest)
     specs = _specs(doc)
     saved, _ = _document(receipt, private=True)
@@ -528,7 +536,7 @@ def open_tables(manifest, *, first_root, late_root, receipt) -> EngramTables:
             saved.get("files") == {str(b): t.stamp for b, t in files.items()},
             "stale table receipt: file identity changed",
         )
-        hot = _WiredMapping(stack, files[_BLOCKS[0]])
+        hot = _WiredMapping(stack, files[_BLOCKS[0]]) if first_mode == "mlock" else None
         for t in files.values():
             t.unchanged()
         return EngramTables(files, hot, stack)

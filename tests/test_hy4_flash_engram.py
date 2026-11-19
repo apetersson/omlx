@@ -380,6 +380,40 @@ def test_only_first_wired_late_reads_exact_rows_and_close(artifact, monkeypatch)
         np.testing.assert_array_equal(np.asarray(out.view(mx.uint16)), a.arrays[b][ids])
 
 
+def test_first_table_pread_mode_never_maps_and_reads_exact_rows(artifact, monkeypatch):
+    a = artifact
+    a.verify()
+    inodes = {p.stat().st_ino: b for b, p in a.paths.items()}
+    pread, reads, maps = os.pread, [], []
+
+    def spy_read(fd, n, offset):
+        b = inodes.get(os.fstat(fd).st_ino)
+        if b is not None:
+            reads.append((b, offset, n))
+        return pread(fd, n, offset)
+
+    monkeypatch.setattr(os, "pread", spy_read)
+    monkeypatch.setattr(mmap, "mmap", lambda *x, **k: maps.append(x))
+    with pytest.raises(ValueError, match="unknown first Engram"):
+        residency.open_tables(a.manifest, first_mode="wire", **a.kwargs)
+    provider = residency.open_tables(a.manifest, first_mode="pread", **a.kwargs)
+    ids = np.array([[13, 2, 13], [255, 2, 255]], dtype=np.int64)
+    with provider:
+        assert maps == []
+        s = provider.stats()
+        assert s["first_mode"] == "pread"
+        assert s["first_locked_bytes"] == s["first_pages"] == s["first_resident_pages"] == 0
+        assert all(v["mode"] == "pread" for v in s["blocks"].values())
+        reads.clear()
+        out = provider.gather(1, ids)
+        off = a.doc["external_tables"]["1"]["source_offset"]
+        assert reads == [(1, off + row * 192, 192) for row in [2, 13, 255]]
+        np.testing.assert_array_equal(np.asarray(out.view(mx.uint16)), a.arrays[1][ids])
+        v = provider.stats()["blocks"]["1"]
+        assert (v["pread_calls"], v["pread_bytes"]) == (3, 576)
+    assert maps == []
+
+
 def test_bad_row_refusal_and_empty_gather(artifact, monkeypatch):
     artifact.verify()
     with artifact.open() as p:

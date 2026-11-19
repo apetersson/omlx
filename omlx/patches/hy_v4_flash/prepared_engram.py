@@ -50,7 +50,7 @@ def _read_bits(tables, block, rows):
     spec = table.spec
     unique, inverse = np.unique(rows.ravel(), return_inverse=True)
     table.unchanged()
-    if block == residency._BLOCKS[0]:
+    if block == residency._BLOCKS[0] and tables._hot is not None:
         values = tables._hot.read_rows(spec, unique)
     else:
         values = np.empty((len(unique), spec.width), dtype="<u2")
